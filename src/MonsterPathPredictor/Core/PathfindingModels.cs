@@ -15,6 +15,29 @@ namespace MonsterPathPredictor.Core
         LinglingPush = 3
     }
 
+    /// <summary>
+    /// Controls how the X-step forecast behaves after passing a tile occupied by a living, targetable player.
+    /// </summary>
+    public enum PostCombatMode
+    {
+        /// <summary>
+        /// Strict replay-verified guide behavior ("之后再遇岔，看当时站位"):
+        /// marks the combat tile, continues drawing subsequent steps with a distinct muted continuation style,
+        /// and evaluates subsequent forks using living player positions.
+        /// </summary>
+        ContinueByGuide = 0,
+
+        /// <summary>
+        /// Truncates the forecast immediately at the first tile where the monster encounters a living player.
+        /// </summary>
+        StopAtFirstCombat = 1,
+
+        /// <summary>
+        /// After encountering a player once, treats subsequent forks in this forecast as non-targeting (Red > Blue).
+        /// </summary>
+        RedBlueAfterCombat = 2
+    }
+
     public enum ForkReasonKind
     {
         ForkStartRed,
@@ -38,7 +61,10 @@ namespace MonsterPathPredictor.Core
     {
         public long MonsterId { get; set; }
         public string Name { get; set; } = string.Empty;
+        public string DisplayName { get; set; } = string.Empty;
         public int HeroId { get; set; }
+        public int Hp { get; set; }
+        public int MaxHp { get; set; }
         public bool IsNormalAggressive { get; set; } = true;
         public int ActionWeight { get; set; }
 
@@ -47,31 +73,13 @@ namespace MonsterPathPredictor.Core
         public int[] FrontNodeIds { get; set; } = Array.Empty<int>();
         public int CanStep { get; set; }
 
-        /// <summary>
-        /// True when the monster is the active mover and has already stepped at least once in this turn
-        /// (arrived mid-walk at <see cref="CurrentLandId"/> rather than starting its turn here).
-        /// </summary>
         public bool IsCurrentlyMovingMidTurn { get; set; }
-
-        /// <summary>
-        /// True if the monster initiated combat while on <see cref="CurrentLandId"/> (a fork)
-        /// and has not yet stepped off this fork.
-        /// </summary>
         public bool JustFoughtOnCurrentFork { get; set; }
-
-        /// <summary>
-        /// True if the monster freshly spawned on a fork and has not moved yet,
-        /// so its first step follows the spawn arrow (<see cref="FrontNodeIds"/>).
-        /// </summary>
+        public bool HasLaunchedFightThisTurn { get; set; }
         public bool JustSpawnedOnFork { get; set; }
 
-        /// <summary>Recent skill displacement state until the monster leaves the tile.</summary>
         public SkillMoveKind SkillMoveKind { get; set; } = SkillMoveKind.None;
-
-        /// <summary>For Lingling push on a normal tile: target neighbor in push direction.</summary>
         public int SkillMovePushDirectionLandId { get; set; } = -1;
-
-        /// <summary>For Lingling push onto a fork: tile behind push direction to avoid U-turn.</summary>
         public int SkillMovePushFromLandId { get; set; } = -1;
     }
 
@@ -93,14 +101,13 @@ namespace MonsterPathPredictor.Core
         public int MaxSteps { get; set; } = 12;
         public double MinBranchProbability { get; set; } = 0.005;
         public bool SimulateCombatOnFork { get; set; } = true;
+        public PostCombatMode PostCombatMode { get; set; } = PostCombatMode.ContinueByGuide;
     }
 
     public sealed class ForkExitPrediction
     {
         public int NextLandId { get; set; }
-        /// <summary>Conditional probability of choosing this exit given the monster reaches this fork state.</summary>
         public double ConditionalProbability { get; set; }
-        /// <summary>Unconditional probability of taking this exit starting from Step 0.</summary>
         public double CumulativeProbability { get; set; }
         public bool IsGlobalRedArrow { get; set; }
 
@@ -114,6 +121,7 @@ namespace MonsterPathPredictor.Core
         public int IncomingLandId { get; set; }
         public int StepIndex { get; set; }
         public double ArrivalProbability { get; set; }
+        public bool IsAfterCombat { get; set; }
         public ForkReasonKind ReasonKind { get; set; }
         public string SummaryLabel { get; set; } = string.Empty;
         public List<ForkExitPrediction> Exits { get; } = new List<ForkExitPrediction>();
@@ -127,6 +135,15 @@ namespace MonsterPathPredictor.Core
         public int ToLandId { get; set; }
         public double Probability { get; set; }
         public int EarliestStep { get; set; }
+        public bool IsAfterCombat { get; set; }
+    }
+
+    public sealed class PredictedCombat
+    {
+        public int LandId { get; set; }
+        public int StepIndex { get; set; }
+        public double Probability { get; set; }
+        public string TargetLabel { get; set; } = string.Empty;
     }
 
     public sealed class PredictedEndpoint
@@ -135,6 +152,8 @@ namespace MonsterPathPredictor.Core
         public int StepIndex { get; set; }
         public double Probability { get; set; }
         public bool IsDeadEnd { get; set; }
+        public bool StoppedAtCombat { get; set; }
+        public bool IsAfterCombat { get; set; }
     }
 
     public sealed class PathPlan
@@ -148,6 +167,7 @@ namespace MonsterPathPredictor.Core
 
         public List<PredictedEdge> Edges { get; } = new List<PredictedEdge>();
         public List<PredictedFork> Forks { get; } = new List<PredictedFork>();
+        public List<PredictedCombat> Combats { get; } = new List<PredictedCombat>();
         public List<PredictedEndpoint> Endpoints { get; } = new List<PredictedEndpoint>();
     }
 

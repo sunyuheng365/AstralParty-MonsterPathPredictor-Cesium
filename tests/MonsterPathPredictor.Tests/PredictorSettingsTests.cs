@@ -13,10 +13,12 @@ namespace MonsterPathPredictor.Tests
                 PreviewSteps = 999,
                 DashLength = float.NaN,
                 GapLength = -5f,
+                DashSpeed = 999f,
                 LineWidth = 100f,
                 HeightOffset = float.PositiveInfinity,
                 FontSize = 4,
-                ClickRadius = 5f,
+                ClickRadius = 2f,
+                PickerHotkey = "",
                 ClearHotkey = "   "
             };
 
@@ -25,11 +27,24 @@ namespace MonsterPathPredictor.Tests
             Assert.Equal(30, s.PreviewSteps);
             Assert.Equal(12f, s.DashLength);
             Assert.Equal(2f, s.GapLength);
+            Assert.Equal(150f, s.DashSpeed);
             Assert.Equal(14f, s.LineWidth);
             Assert.Equal(0.45f, s.HeightOffset);
             Assert.Equal(12, s.FontSize);
-            Assert.Equal(20f, s.ClickRadius);
+            Assert.Equal(8f, s.ClickRadius);
+            Assert.Equal("F8", s.PickerHotkey);
             Assert.Equal("Escape", s.ClearHotkey);
+        }
+
+        [Theory]
+        [InlineData("continue", PostCombatMode.ContinueByGuide)]
+        [InlineData("stop", PostCombatMode.StopAtFirstCombat)]
+        [InlineData("redBlue", PostCombatMode.RedBlueAfterCombat)]
+        [InlineData("RED_BLUE", PostCombatMode.RedBlueAfterCombat)]
+        [InlineData("unknown", PostCombatMode.ContinueByGuide)]
+        public void ParsesPostCombatModeCleanly(string raw, PostCombatMode expected)
+        {
+            Assert.Equal(expected, PredictorSettings.ParsePostCombatMode(raw));
         }
 
         [Fact]

@@ -3,15 +3,19 @@
   "previewSteps": 12,
   "dashLength": 12.0,
   "gapLength": 8.0,
+  "dashSpeed": 26.0,
   "lineWidth": 4.5,
   "heightOffset": 0.45,
   "fontSize": 18,
-  "clickRadius": 48.0,
+  "clickRadius": 28.0,
   "clearOnEmptyClick": true,
   "showReasonTag": true,
   "showDeterministicPercent": false,
   "simulateCombatOnFork": true,
+  "postCombatMode": "continue",
   "allowNonAggressiveMonsters": true,
+  "pickerHotkey": "F8",
+  "closePickerOnSelect": false,
   "clearHotkey": "Escape",
   "excludedPlayerBuffIds": "",
   "_comments": {
@@ -31,6 +35,10 @@
       "zh-Hans": "虚线间隔长度（像素，范围 2-30）",
       "en": "Gap length between dash segments in UI pixels (2-30)"
     },
+    "dashSpeed": {
+      "zh-Hans": "虚线缓慢向前流动的速度（像素/秒，范围 0-150，0 为静态虚线）",
+      "en": "Forward marching animation speed of dashes in px/sec (0-150, 0 = static)"
+    },
     "lineWidth": {
       "zh-Hans": "虚线线条粗细（像素，范围 1.5-14）",
       "en": "Stroke thickness of dashed preview lines (1.5-14)"
@@ -44,32 +52,44 @@
       "en": "Font size for fork probability badges and tags (12-36)"
     },
     "clickRadius": {
-      "zh-Hans": "点击选中怪物时的屏幕命中半径（像素，20-120）",
-      "en": "Screen-space hit radius for clicking monsters (20-120)"
+      "zh-Hans": "点击怪物模型外缘时的容差半径（像素，8-120；点在模型内部直接命中）",
+      "en": "Near-miss tolerance radius outside monster sprite bounds in pixels (8-120)"
     },
     "clearOnEmptyClick": {
       "zh-Hans": "点击棋盘空白处时自动取消当前选中的怪物",
       "en": "Clear selected monster when clicking empty board space"
     },
     "showReasonTag": {
-      "zh-Hans": "在岔路口旁显示简短判定依据（如 红箭 / 追P1 / 掉头平分）",
-      "en": "Show concise decision tags at forks (e.g. Red / Chase P1 / 50-50)"
+      "zh-Hans": "在岔路口旁显示简短判定依据（如 起步·红箭 / →P1(2格) / 掉头平分）",
+      "en": "Show concise decision tags at forks"
     },
     "showDeterministicPercent": {
       "zh-Hans": "岔路口只有唯一确定方向时是否也显示 100%（多分支时始终显示百分比）",
       "en": "Also show 100% at deterministic forks (multi-branch forks always show percentages)"
     },
     "simulateCombatOnFork": {
-      "zh-Hans": "路径经过站有存活玩家的岔路口时，是否按战后续走（红蓝箭头）推演后续路线",
-      "en": "When a predicted path passes a fork occupied by a living player, apply post-combat Red>Blue priority"
+      "zh-Hans": "路径经过站有存活玩家的岔路口时，离开该岔路口按战后续走（红蓝箭头）推演",
+      "en": "Apply post-combat Red>Blue priority when leaving a fork occupied by a living player"
+    },
+    "postCombatMode": {
+      "zh-Hans": "路径遭遇存活玩家后的续行策略：continue（按攻略实测：标出交战点并以半透明虚线继续按站位预测后续岔路）/ stop（在首次遇敌格截断）/ redBlue（遇敌后后续岔路一律改按红蓝箭头）",
+      "en": "Behavior after encountering a living player: continue | stop | redBlue"
     },
     "allowNonAggressiveMonsters": {
       "zh-Hans": "允许点击小偷等非普通主动攻击怪（会在顶部提示非主动怪）",
       "en": "Allow selecting non-aggressive monsters (with an informational banner note)"
     },
+    "pickerHotkey": {
+      "zh-Hans": "打开/关闭怪物快速选择弹窗的热键（Unity KeyCode 名称，默认 F8）",
+      "en": "Hotkey to toggle the monster picker popup (Unity KeyCode name, default F8)"
+    },
+    "closePickerOnSelect": {
+      "zh-Hans": "在选怪弹窗中点击某个怪物后是否自动关闭弹窗（默认 false，方便连续切换对比不同怪物）",
+      "en": "Auto-close the monster picker popup after selecting a monster"
+    },
     "clearHotkey": {
-      "zh-Hans": "快速取消当前预览的快捷键（Unity KeyCode 名称，默认 Escape）",
-      "en": "Hotkey to clear active preview (Unity KeyCode name, default Escape)"
+      "zh-Hans": "快速关闭弹窗或取消当前预览的快捷键（Unity KeyCode 名称，默认 Escape）",
+      "en": "Hotkey to close popup or clear active preview (Unity KeyCode name, default Escape)"
     },
     "excludedPlayerBuffIds": {
       "zh-Hans": "额外排除出怪物追踪名单的玩家 Buff ID（逗号分隔，例如隐身类特殊 Buff）",

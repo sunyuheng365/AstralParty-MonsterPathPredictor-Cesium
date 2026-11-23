@@ -9,7 +9,6 @@ using GameLogic;
 using Tools;
 using UI;
 using UnityEngine;
-using UnityEngine.SceneManagement;
 using MonsterPathPredictor.Config;
 using MonsterPathPredictor.Core;
 
@@ -19,6 +18,7 @@ namespace MonsterPathPredictor.Runtime
     {
         private readonly MonsterStateTracker _tracker = new MonsterStateTracker();
         private readonly MonsterPicker _picker = new MonsterPicker();
+        private readonly MonsterPickerPopup _popup = new MonsterPickerPopup();
         private readonly DashedOverlayRenderer _renderer = new DashedOverlayRenderer();
 
         private PredictorSettings _settings = new PredictorSettings();
@@ -37,15 +37,21 @@ namespace MonsterPathPredictor.Runtime
         public override string Name => "怪物寻路预测";
         public override string Version => "1.0.0";
         public override string Author => "sunyuheng365";
-        public override string Description => "点击 PVE 怪物以虚线预览接下来 X 格的精确寻路规划，在岔路口展示走向与多分支概率百分比。";
+        public override string Description => "点击 PVE 怪物或按热键弹窗选择怪物，以动态虚线预览接下来 X 格的精确寻路规划，并在岔路口展示走向与多分支概率百分比。";
 
         public override void OnInitialize()
         {
             _settings = PredictorConfig.Load(Config, isInitial: true);
             _tracker.Start();
+
+            _popup.MonsterSelected += OnPopupMonsterSelected;
+            _popup.ClearRequested += OnPopupClearRequested;
+            _popup.StepsDeltaRequested += OnPopupStepsDelta;
+
             UpdateEvents.LateUpdate += DrawAndTrack;
             Context?.RegisterCleanup(Stop);
-            Log.Info("怪物寻路预测已启用：点击 PVE 怪物显示虚线规划（默认延伸 " + _settings.PreviewSteps + " 格，按 " + _settings.ClearHotkey + " 取消）。");
+            Log.Info("怪物寻路预测已启用：点击怪物模型任意处或按 " + _settings.PickerHotkey +
+                     " 弹窗选怪（延伸 " + _settings.PreviewSteps + " 格，按 " + _settings.ClearHotkey + " 取消）。");
         }
 
         public override void OnConfigChanged()
@@ -55,8 +61,13 @@ namespace MonsterPathPredictor.Runtime
             if (!_settings.Enabled)
             {
                 ClearSelectionAndOverlay();
+                _popup.Hide();
             }
-            Log.Info("配置已热重载：enabled=" + _settings.Enabled + ", previewSteps=" + _settings.PreviewSteps + ", fontSize=" + _settings.FontSize);
+            Log.Info("配置已热重载：enabled=" + _settings.Enabled +
+                     ", previewSteps=" + _settings.PreviewSteps +
+                     ", dashSpeed=" + _settings.DashSpeed +
+                     ", pickerHotkey=" + _settings.PickerHotkey +
+                     ", postCombatMode=" + PredictorSettings.FormatPostCombatMode(_settings.PostCombatMode));
         }
 
         public override void OnSceneUnloaded(UnityEngine.SceneManagement.Scene scene)
@@ -72,9 +83,49 @@ namespace MonsterPathPredictor.Runtime
         private void Stop()
         {
             UpdateEvents.LateUpdate -= DrawAndTrack;
+            _popup.MonsterSelected -= OnPopupMonsterSelected;
+            _popup.ClearRequested -= OnPopupClearRequested;
+            _popup.StepsDeltaRequested -= OnPopupStepsDelta;
             _tracker.Stop();
             ResetBattleState();
+            _popup.Dispose();
             _renderer.Dispose();
+        }
+
+        private void OnPopupMonsterSelected(long monsterId)
+        {
+            _selectedMonsterId = (_selectedMonsterId == monsterId) ? 0 : monsterId;
+            _forceReplan = true;
+            if (_selectedMonsterId != 0)
+            {
+                var picked = FindMonster(_selectedMonsterId);
+                if (picked != null)
+                {
+                    Log.Info("弹窗已锁定怪物：" + picked.State.DisplayName + "（地块 #" + picked.State.CurrentLandId + "）");
+                }
+            }
+        }
+
+        private void OnPopupClearRequested()
+        {
+            ClearSelectionAndOverlay();
+        }
+
+        private void OnPopupStepsDelta(int delta)
+        {
+            int nextSteps = PredictorSettings.ClampInt(_settings.PreviewSteps + delta, 1, 30);
+            if (nextSteps == _settings.PreviewSteps) return;
+            _settings.PreviewSteps = nextSteps;
+            _forceReplan = true;
+            try
+            {
+                if (Config != null)
+                {
+                    Config.Set("previewSteps", nextSteps);
+                    Config.Save();
+                }
+            }
+            catch { }
         }
 
         private void DrawAndTrack()
@@ -83,13 +134,12 @@ namespace MonsterPathPredictor.Runtime
             {
                 if (!_settings.Enabled || !TryGetPveBattleContext(out var battle, out var landManager, out var camera))
                 {
-                    if (_selectedMonsterId != 0 || _board != null) ResetBattleState();
+                    if (_selectedMonsterId != 0 || _board != null || _popup.IsOpen) ResetBattleState();
                     return;
                 }
 
                 var now = DateTime.UtcNow;
 
-                // Refresh board topology periodically (~0.5s)
                 if (_board == null || now >= _nextBoardScan)
                 {
                     _nextBoardScan = now.AddMilliseconds(500);
@@ -101,20 +151,18 @@ namespace MonsterPathPredictor.Runtime
                     }
                 }
 
-                // Sync monsters & players frequently (~120ms) so clicks and live board changes stay responsive
                 if (now >= _nextUnitSync || _forceReplan)
                 {
                     _nextUnitSync = now.AddMilliseconds(120);
-                    _tracker.SyncAndSnapshot(_board, battle, _settings, out _monsters, out _players);
+                    _tracker.SyncAndSnapshot(_board, battle, camera, _settings, out _monsters, out _players);
                     _forceReplan = true;
                 }
 
                 var layer = _renderer.EnsureLayer();
                 if (layer == null) return;
 
-                // Process click-to-select / clear hotkey every frame
                 long beforeSelection = _selectedMonsterId;
-                bool selectionChanged = _picker.ProcessInput(layer, camera, _monsters, _settings, ref _selectedMonsterId);
+                bool selectionChanged = _picker.ProcessInput(layer, camera, _monsters, _settings, _popup, ref _selectedMonsterId);
                 if (selectionChanged)
                 {
                     _forceReplan = true;
@@ -123,9 +171,14 @@ namespace MonsterPathPredictor.Runtime
                         var picked = FindMonster(_selectedMonsterId);
                         if (picked != null)
                         {
-                            Log.Info("已选中怪物：" + picked.State.Name + "（地块 " + picked.State.CurrentLandId + "），规划 " + _settings.PreviewSteps + " 格");
+                            Log.Info("已选中怪物：" + picked.State.DisplayName + "（地块 #" + picked.State.CurrentLandId + "），规划 " + _settings.PreviewSteps + " 格");
                         }
                     }
+                }
+
+                if (_popup.IsOpen)
+                {
+                    _popup.Refresh(_monsters, _selectedMonsterId, _settings);
                 }
 
                 if (_selectedMonsterId == 0)
@@ -138,7 +191,6 @@ namespace MonsterPathPredictor.Runtime
                 var selected = FindMonster(_selectedMonsterId);
                 if (selected == null)
                 {
-                    // Monster died or disappeared from board
                     ClearSelectionAndOverlay();
                     return;
                 }
@@ -153,7 +205,8 @@ namespace MonsterPathPredictor.Runtime
                         new PlanOptions
                         {
                             MaxSteps = _settings.PreviewSteps,
-                            SimulateCombatOnFork = _settings.SimulateCombatOnFork
+                            SimulateCombatOnFork = _settings.SimulateCombatOnFork,
+                            PostCombatMode = _settings.PostCombatMode
                         });
                 }
 
@@ -240,6 +293,7 @@ namespace MonsterPathPredictor.Runtime
         private void ResetBattleState()
         {
             ClearSelectionAndOverlay();
+            _popup.Hide();
             _board = null;
             _monsters.Clear();
             _players.Clear();

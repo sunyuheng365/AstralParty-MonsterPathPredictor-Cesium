@@ -6,16 +6,19 @@ namespace MonsterPathPredictor.Core
     /// <summary>
     /// Implements Astral Party PVE monster pathfinding prediction over X steps.
     ///
-    /// Canonical rule hierarchy (verified against BV1Kxsq67E9C replay analytics & 3.3.0-1.0.0 data):
-    /// 1. Skill-displaced monsters (垃圾桶/雪莉/玲玲) follow their specific displacement rules on the first step.
+    /// Canonical rule hierarchy (verified against BV1Kxsq67E9C replay analytics & 7 official 3.3.0+ maps):
+    /// 1. Skill-displaced monsters (垃圾箱/雪莉/玲玲) follow their specific displacement rules on the first step.
     /// 2. Freshly spawned monsters on a fork follow their spawn direction arrow (FrontNodeIds).
-    /// 3. Starting on a fork OR continuing after combat on a fork ("一步索敌"): ignores player positions;
+    /// 3. Starting on a fork OR continuing right after combat on that fork ("一步索敌"): ignores player positions;
     ///    follows Red > Blue > None (raw neighbor order) without U-turning.
-    /// 4. Mid-walk arrival at a fork: ranks all living, targetable players by full-board shortest road
-    ///    distance (including U-turn paths, unlimited distance), breaking ties by seat order P1 -> P4.
-    ///    For each candidate, draws uniformly from all equal-length shortest paths ("每条最短路=1支签").
-    ///    Probability mass that draws a U-turn cascades to the next candidate; any remaining mass after
-    ///    exhausting all candidates splits equally across forward exits (50% / 50%).
+    /// 4. Mid-walk arrival at a fork ("之后再遇岔，看当时站位"): ranks all living, targetable players by full-board
+    ///    shortest road distance (including U-turn paths, unlimited distance), breaking ties by seat order P1 -> P4.
+    ///    Draws uniformly from all equal-length shortest paths ("每条最短路=1支签"); U-turn probability cascades
+    ///    to the next candidate; remaining probability after all candidates splits equally across forward exits (50%/50%).
+    /// 5. Encountering a living player along the walk emits a PredictedCombat marker and honors PostCombatMode:
+    ///    - ContinueByGuide: follows "之后再遇岔，看当时站位", marking continuation edges/forks with IsAfterCombat=true
+    ///    - StopAtFirstCombat: truncates the forecast at the first encounter tile
+    ///    - RedBlueAfterCombat: switches subsequent forks after combat to Red > Blue priority
     /// </summary>
     public static class MonsterPathEngine
     {
@@ -33,16 +36,62 @@ namespace MonsterPathPredictor.Core
         {
             public int LandId;
             public int FromLandId;
+            public bool HasEncounteredPlayer;
 
-            public WalkStateKey(int landId, int fromLandId)
+            public WalkStateKey(int landId, int fromLandId, bool hasEncounteredPlayer)
             {
                 LandId = landId;
                 FromLandId = fromLandId;
+                HasEncounteredPlayer = hasEncounteredPlayer;
             }
 
-            public bool Equals(WalkStateKey other) => LandId == other.LandId && FromLandId == other.FromLandId;
+            public bool Equals(WalkStateKey other) =>
+                LandId == other.LandId &&
+                FromLandId == other.FromLandId &&
+                HasEncounteredPlayer == other.HasEncounteredPlayer;
+
             public override bool Equals(object obj) => obj is WalkStateKey other && Equals(other);
-            public override int GetHashCode() => (LandId * 397) ^ FromLandId;
+
+            public override int GetHashCode()
+            {
+                unchecked
+                {
+                    int h = LandId;
+                    h = (h * 397) ^ FromLandId;
+                    h = (h * 397) ^ (HasEncounteredPlayer ? 1 : 0);
+                    return h;
+                }
+            }
+        }
+
+        private struct ForkRecordKey : IEquatable<ForkRecordKey>
+        {
+            public int LandId;
+            public int FromLandId;
+            public bool AfterCombat;
+
+            public ForkRecordKey(int landId, int fromLandId, bool afterCombat)
+            {
+                LandId = landId;
+                FromLandId = fromLandId;
+                AfterCombat = afterCombat;
+            }
+
+            public bool Equals(ForkRecordKey other) =>
+                LandId == other.LandId && FromLandId == other.FromLandId && AfterCombat == other.AfterCombat;
+
+            public override bool Equals(object obj) => obj is ForkRecordKey other && Equals(other);
+
+            public override int GetHashCode()
+            {
+                unchecked
+                {
+                    int h = LandId;
+                    h = (h * 397) ^ FromLandId;
+                    h = (h * 397) ^ (AfterCombat ? 1 : 0);
+                    return h;
+                }
+            }
         }
 
         private struct EdgeKey : IEquatable<EdgeKey>
@@ -74,10 +123,11 @@ namespace MonsterPathPredictor.Core
             int maxSteps = Math.Max(1, Math.Min(60, options.MaxSteps));
             double minProb = Math.Max(0.0, options.MinBranchProbability);
 
+            string displayName = !string.IsNullOrEmpty(monster.DisplayName) ? monster.DisplayName : (monster.Name ?? string.Empty);
             var plan = new PathPlan
             {
                 MonsterId = monster.MonsterId,
-                MonsterName = monster.Name ?? string.Empty,
+                MonsterName = displayName,
                 StartLandId = monster.CurrentLandId,
                 StepsRequested = maxSteps,
                 IsNormalAggressive = monster.IsNormalAggressive
@@ -91,19 +141,18 @@ namespace MonsterPathPredictor.Core
 
             var activePlayers = FilterTrackablePlayers(board, players);
             var shortestPathCache = new Dictionary<int, ShortestPathField>();
-            var occupiedByLivingPlayer = new HashSet<int>();
-            for (int i = 0; i < activePlayers.Count; i++)
-            {
-                occupiedByLivingPlayer.Add(activePlayers[i].LandId);
-            }
+            var playersByLand = BuildPlayersByLand(activePlayers);
 
             var edgeMap = new Dictionary<EdgeKey, PredictedEdge>();
-            var forkMap = new Dictionary<WalkStateKey, PredictedFork>();
-            var endpointMap = new Dictionary<(int LandId, int Step, bool DeadEnd), double>();
+            var edgeHasPreCombat = new HashSet<EdgeKey>();
+            var forkMap = new Dictionary<ForkRecordKey, PredictedFork>();
+            var combatMap = new Dictionary<int, PredictedCombat>();
+            var endpointMap = new Dictionary<(int LandId, int Step, bool DeadEnd, bool StoppedAtCombat, bool AfterCombat), double>();
 
+            bool initialCombatState = monster.HasLaunchedFightThisTurn || monster.JustFoughtOnCurrentFork;
             var currentLayer = new Dictionary<WalkStateKey, double>
             {
-                [new WalkStateKey(monster.CurrentLandId, monster.FromLandId)] = 1.0
+                [new WalkStateKey(monster.CurrentLandId, monster.FromLandId, initialCombatState)] = 1.0
             };
 
             for (int step = 0; step < maxSteps && currentLayer.Count > 0; step++)
@@ -117,19 +166,46 @@ namespace MonsterPathPredictor.Core
                     if (arrivalProb <= Epsilon) continue;
                     if (step > 0 && arrivalProb < minProb) continue;
 
+                    bool postCombatNow = state.HasEncounteredPlayer;
+                    bool encounteredOnThisTile = false;
+
+                    // When stepping onto a tile occupied by living player(s) during the walk (step > 0),
+                    // an aggressive monster initiates combat on this tile (once per turn).
+                    if (step > 0 && monster.IsNormalAggressive && !postCombatNow &&
+                        playersByLand.TryGetValue(state.LandId, out var targetsHere))
+                    {
+                        encounteredOnThisTile = true;
+                        postCombatNow = true;
+                        RecordCombat(combatMap, state.LandId, step, arrivalProb, targetsHere);
+
+                        if (options.PostCombatMode == PostCombatMode.StopAtFirstCombat)
+                        {
+                            AccumulateEndpoint(endpointMap, state.LandId, step, false, true, true, arrivalProb);
+                            continue;
+                        }
+                    }
+
                     StepOutcome outcome = step == 0
-                        ? DecideFirstStep(board, monster, activePlayers, shortestPathCache)
-                        : DecideMidWalkStep(board, state.LandId, state.FromLandId, activePlayers, occupiedByLivingPlayer, shortestPathCache, options.SimulateCombatOnFork);
+                        ? DecideFirstStep(board, monster, activePlayers, shortestPathCache, options.PostCombatMode)
+                        : DecideMidWalkStep(
+                            board,
+                            state.LandId,
+                            state.FromLandId,
+                            activePlayers,
+                            encounteredOnThisTile,
+                            postCombatNow,
+                            shortestPathCache,
+                            options);
 
                     if (outcome.Transitions == null || outcome.Transitions.Count == 0)
                     {
-                        AccumulateEndpoint(endpointMap, state.LandId, step, true, arrivalProb);
+                        AccumulateEndpoint(endpointMap, state.LandId, step, true, false, postCombatNow, arrivalProb);
                         continue;
                     }
 
                     if (outcome.IsForkDecision)
                     {
-                        RecordFork(board, forkMap, state.LandId, state.FromLandId, step, arrivalProb, outcome);
+                        RecordFork(board, forkMap, state.LandId, state.FromLandId, step, arrivalProb, postCombatNow, outcome);
                         if (step == 0 && string.IsNullOrEmpty(plan.HeadlineNote))
                         {
                             plan.HeadlineNote = outcome.SummaryLabel;
@@ -151,14 +227,25 @@ namespace MonsterPathPredictor.Core
                                 FromLandId = state.LandId,
                                 ToLandId = nextId,
                                 Probability = 0.0,
-                                EarliestStep = step
+                                EarliestStep = step,
+                                IsAfterCombat = postCombatNow
                             };
                             edgeMap[ek] = pe;
                         }
+                        if (!postCombatNow)
+                        {
+                            edgeHasPreCombat.Add(ek);
+                            pe.IsAfterCombat = false;
+                        }
+                        else if (!edgeHasPreCombat.Contains(ek))
+                        {
+                            pe.IsAfterCombat = true;
+                        }
+
                         pe.Probability = Math.Min(1.0, pe.Probability + branchProb);
                         if (step < pe.EarliestStep) pe.EarliestStep = step;
 
-                        var nextKey = new WalkStateKey(nextId, state.LandId);
+                        var nextKey = new WalkStateKey(nextId, state.LandId, postCombatNow);
                         if (nextLayer.TryGetValue(nextKey, out double existing))
                             nextLayer[nextKey] = existing + branchProb;
                         else
@@ -169,10 +256,21 @@ namespace MonsterPathPredictor.Core
                 currentLayer = nextLayer;
             }
 
+            // Also record combat if the final step lands directly on a living player
             foreach (var finalState in currentLayer)
             {
                 if (finalState.Value <= Epsilon) continue;
-                AccumulateEndpoint(endpointMap, finalState.Key.LandId, maxSteps, false, finalState.Value);
+                bool stoppedCombat = false;
+                bool afterCombat = finalState.Key.HasEncounteredPlayer;
+                if (monster.IsNormalAggressive && !afterCombat &&
+                    playersByLand.TryGetValue(finalState.Key.LandId, out var endTargets))
+                {
+                    RecordCombat(combatMap, finalState.Key.LandId, maxSteps, finalState.Value, endTargets);
+                    afterCombat = true;
+                    stoppedCombat = (options.PostCombatMode == PostCombatMode.StopAtFirstCombat);
+                }
+
+                AccumulateEndpoint(endpointMap, finalState.Key.LandId, maxSteps, false, stoppedCombat, afterCombat, finalState.Value);
             }
 
             plan.Edges.AddRange(edgeMap.Values);
@@ -189,6 +287,9 @@ namespace MonsterPathPredictor.Core
                 return c != 0 ? c : b.ArrivalProbability.CompareTo(a.ArrivalProbability);
             });
 
+            plan.Combats.AddRange(combatMap.Values);
+            plan.Combats.Sort((a, b) => a.StepIndex.CompareTo(b.StepIndex));
+
             foreach (var ep in endpointMap)
             {
                 plan.Endpoints.Add(new PredictedEndpoint
@@ -196,6 +297,8 @@ namespace MonsterPathPredictor.Core
                     LandId = ep.Key.LandId,
                     StepIndex = ep.Key.Step,
                     IsDeadEnd = ep.Key.DeadEnd,
+                    StoppedAtCombat = ep.Key.StoppedAtCombat,
+                    IsAfterCombat = ep.Key.AfterCombat,
                     Probability = Math.Min(1.0, ep.Value)
                 });
             }
@@ -204,15 +307,17 @@ namespace MonsterPathPredictor.Core
             if (string.IsNullOrEmpty(plan.HeadlineNote))
             {
                 if (!monster.IsNormalAggressive)
-                    plan.HeadlineNote = "非普通主动怪(仅供参考)";
+                    plan.HeadlineNote = "非主动怪";
                 else if (plan.Forks.Count > 0)
                     plan.HeadlineNote = plan.Forks[0].SummaryLabel;
+                else if (plan.Combats.Count > 0)
+                    plan.HeadlineNote = "遇" + plan.Combats[0].TargetLabel;
                 else
                     plan.HeadlineNote = "沿路直行";
             }
             else if (!monster.IsNormalAggressive)
             {
-                plan.HeadlineNote = "非主动怪 · " + plan.HeadlineNote;
+                plan.HeadlineNote = "非主动 · " + plan.HeadlineNote;
             }
 
             return plan;
@@ -222,7 +327,8 @@ namespace MonsterPathPredictor.Core
             BoardGraph board,
             MonsterState monster,
             List<TrackedPlayer> activePlayers,
-            Dictionary<int, ShortestPathField> cache)
+            Dictionary<int, ShortestPathField> cache,
+            PostCombatMode postCombatMode)
         {
             int cur = monster.CurrentLandId;
             int from = monster.FromLandId;
@@ -246,7 +352,7 @@ namespace MonsterPathPredictor.Core
 
             // 3. Standing on a fork:
             //    - Turn start on fork OR post-combat on fork -> Red > Blue (ignores players)
-            //    - Already mid-walk at fork (without combat) -> Mid-walk queue & lottery
+            //    - Already mid-walk at fork (without combat on this fork) -> Mid-walk queue & lottery (or Red>Blue if configured)
             if (isFork)
             {
                 if (monster.JustFoughtOnCurrentFork || !monster.IsCurrentlyMovingMidTurn)
@@ -267,15 +373,26 @@ namespace MonsterPathPredictor.Core
                             ? (isGlobalRed ? ForkReasonKind.PostCombatRed : ForkReasonKind.PostCombatBlue)
                             : (isGlobalRed ? ForkReasonKind.ForkStartRed : ForkReasonKind.ForkStartBlue);
                         string label = monster.JustFoughtOnCurrentFork
-                            ? (isGlobalRed ? "战后·红箭" : "战后·走蓝")
-                            : (isGlobalRed ? "起步·红箭" : "起步·走蓝");
+                            ? (isGlobalRed ? "战后·红箭" : "战后·蓝箭")
+                            : (isGlobalRed ? "起步·红箭" : "起步·蓝箭");
                         return SingleTransition(nextId, isForkDecision: true, reason, label);
                     }
                     return EmptyOutcome();
                 }
 
-                // Mid-walk currently standing on a fork
-                return EvaluateMidWalkFork(board, cur, from, activePlayers, cache);
+                if (monster.HasLaunchedFightThisTurn && postCombatMode == PostCombatMode.RedBlueAfterCombat)
+                {
+                    if (board.TryGetPriorityForwardNeighbor(cur, from, out int nextId, out bool isGlobalRed))
+                    {
+                        return SingleTransition(
+                            nextId,
+                            isForkDecision: true,
+                            isGlobalRed ? ForkReasonKind.PostCombatRed : ForkReasonKind.PostCombatBlue,
+                            isGlobalRed ? "战后续行·红箭" : "战后续行·蓝箭");
+                    }
+                }
+
+                return EvaluateMidWalkFork(board, cur, from, activePlayers, cache, isAfterCombat: monster.HasLaunchedFightThisTurn);
             }
 
             // 4. Normal tile (non-fork, degree <= 2)
@@ -285,7 +402,6 @@ namespace MonsterPathPredictor.Core
                 return SingleTransition(forward[0], isForkDecision: false, ForkReasonKind.MidForkChasePlayer, string.Empty);
             }
 
-            // FromLandId missing or invalid on normal tile: fall back to FrontNodeIds
             var frontOnNormal = FilterValidNeighbors(board, cur, monster.FrontNodeIds);
             if (frontOnNormal.Count == 1)
             {
@@ -318,37 +434,27 @@ namespace MonsterPathPredictor.Core
             {
                 case SkillMoveKind.TrashcanPull:
                     if (isFork)
-                    {
-                        // 垃圾桶拉到岔路口 -> 一定走红
-                        return SingleTransition(all[0], isForkDecision: true, ForkReasonKind.SkillTrashcanRed, "垃圾桶·走红");
-                    }
-                    // 垃圾桶拉到普通格 -> 方向随机
-                    return UniformSplit(all, ForkReasonKind.SkillNormalRandom, "垃圾桶·随机");
+                        return SingleTransition(all[0], isForkDecision: true, ForkReasonKind.SkillTrashcanRed, "垃圾箱·红箭");
+                    return UniformSplit(all, ForkReasonKind.SkillNormalRandom, "垃圾箱·随机");
 
                 case SkillMoveKind.ShirleyThrow:
                     if (isFork)
-                    {
-                        // 雪莉扔到岔路口 -> 随机朝一个方向（不看红蓝）
                         return UniformSplit(all, ForkReasonKind.SkillShirleyRandom, "雪莉·随机");
-                    }
-                    // 雪莉扔到普通格 -> 方向随机
                     return UniformSplit(all, ForkReasonKind.SkillNormalRandom, "雪莉·随机");
 
                 case SkillMoveKind.LinglingPush:
                     if (isFork)
                     {
-                        // 玲玲推到岔路口 -> 有红走红，没红走蓝
                         int exclude = board.IsValidNeighbor(cur, monster.SkillMovePushFromLandId)
                             ? monster.SkillMovePushFromLandId
                             : -1;
                         if (board.TryGetPriorityForwardNeighbor(cur, exclude, out int nextId, out bool isGlobalRed))
                         {
-                            string tag = isGlobalRed ? "玲玲·红箭" : "玲玲·走蓝";
+                            string tag = isGlobalRed ? "玲玲·红箭" : "玲玲·蓝箭";
                             return SingleTransition(nextId, isForkDecision: true, ForkReasonKind.SkillLinglingRedBlue, tag);
                         }
                         return EmptyOutcome();
                     }
-                    // 玲玲推到普通格 -> 跟着玲玲推的方向
                     if (board.IsValidNeighbor(cur, monster.SkillMovePushDirectionLandId))
                     {
                         return SingleTransition(monster.SkillMovePushDirectionLandId, isForkDecision: true, ForkReasonKind.SkillLinglingPushDir, "玲玲·推向");
@@ -370,9 +476,10 @@ namespace MonsterPathPredictor.Core
             int landId,
             int fromLandId,
             List<TrackedPlayer> activePlayers,
-            HashSet<int> occupiedByLivingPlayer,
+            bool combatHappenedOnThisTile,
+            bool isAfterCombat,
             Dictionary<int, ShortestPathField> cache,
-            bool simulateCombatOnFork)
+            PlanOptions options)
         {
             var forward = board.GetForwardNeighbors(landId, fromLandId);
             if (forward.Count == 0) return EmptyOutcome();
@@ -381,10 +488,8 @@ namespace MonsterPathPredictor.Core
                 return SingleTransition(forward[0], isForkDecision: false, ForkReasonKind.MidForkChasePlayer, string.Empty);
             }
 
-            // Reached a fork mid-walk!
-            // If a living targetable player is standing directly on this fork, combat occurs here,
-            // and continuing from this fork follows post-combat Red > Blue priority.
-            if (simulateCombatOnFork && occupiedByLivingPlayer.Contains(landId))
+            // Combat occurred RIGHT ON this fork -> leaving this fork ALWAYS uses Red > Blue ("在岔路口打完架离开那一步")
+            if (combatHappenedOnThisTile && options.SimulateCombatOnFork)
             {
                 if (board.TryGetPriorityForwardNeighbor(landId, fromLandId, out int nextId, out bool isGlobalRed))
                 {
@@ -392,22 +497,34 @@ namespace MonsterPathPredictor.Core
                         nextId,
                         isForkDecision: true,
                         isGlobalRed ? ForkReasonKind.PostCombatRed : ForkReasonKind.PostCombatBlue,
-                        isGlobalRed ? "遇敌战后·红箭" : "遇敌战后·走蓝");
+                        isGlobalRed ? "战后·红箭" : "战后·蓝箭");
                 }
             }
 
-            return EvaluateMidWalkFork(board, landId, fromLandId, activePlayers, cache);
+            // Optional user mode: after combat anywhere, treat remaining forks as Red > Blue
+            if (isAfterCombat && options.PostCombatMode == PostCombatMode.RedBlueAfterCombat)
+            {
+                if (board.TryGetPriorityForwardNeighbor(landId, fromLandId, out int nextId, out bool isGlobalRed))
+                {
+                    return SingleTransition(
+                        nextId,
+                        isForkDecision: true,
+                        isGlobalRed ? ForkReasonKind.PostCombatRed : ForkReasonKind.PostCombatBlue,
+                        isGlobalRed ? "战后续行·红箭" : "战后续行·蓝箭");
+                }
+            }
+
+            // Canonical guide rule: "之后再遇岔，看当时站位"
+            return EvaluateMidWalkFork(board, landId, fromLandId, activePlayers, cache, isAfterCombat);
         }
 
-        /// <summary>
-        /// Evaluates a mid-walk fork using the canonical Bilibili-verified queue & shortest-path lottery rule.
-        /// </summary>
         private static StepOutcome EvaluateMidWalkFork(
             BoardGraph board,
             int forkLandId,
             int incomingLandId,
             List<TrackedPlayer> activePlayers,
-            Dictionary<int, ShortestPathField> cache)
+            Dictionary<int, ShortestPathField> cache,
+            bool isAfterCombat)
         {
             var forward = board.GetForwardNeighbors(forkLandId, incomingLandId);
             if (forward.Count == 0) return EmptyOutcome();
@@ -423,7 +540,7 @@ namespace MonsterPathPredictor.Core
             for (int i = 0; i < activePlayers.Count; i++)
             {
                 var p = activePlayers[i];
-                if (p.LandId == forkLandId) continue; // distance-0 combat case handled above
+                if (p.LandId == forkLandId) continue;
                 if (!cache.TryGetValue(p.LandId, out var field))
                 {
                     field = board.ComputeShortestPathsTo(p.LandId);
@@ -445,7 +562,7 @@ namespace MonsterPathPredictor.Core
 
             if (ranked.Count == 0)
             {
-                return UniformSplit(forward, ForkReasonKind.MidForkNoTargetFallback, "无目标·均分");
+                return UniformSplit(forward, ForkReasonKind.MidForkNoTargetFallback, isAfterCombat ? "续行·均分" : "无目标·均分");
             }
 
             double remainingProb = 1.0;
@@ -472,18 +589,13 @@ namespace MonsterPathPredictor.Core
 
                     totalLots += lots;
                     if (incomingIsNeighbor && nb == incomingLandId)
-                    {
                         uTurnLots += lots;
-                    }
                     else
-                    {
                         forwardLotExits++;
-                    }
                 }
 
                 if (totalLots <= 0.0) continue;
 
-                // Allocate forward lots
                 if (forwardLotExits > 0)
                 {
                     if (primaryTarget == null)
@@ -506,7 +618,6 @@ namespace MonsterPathPredictor.Core
                     }
                 }
 
-                // Probability mass that drew a U-turn lot skips this player and cascades to the next candidate
                 remainingProb *= (uTurnLots / totalLots);
             }
 
@@ -529,28 +640,29 @@ namespace MonsterPathPredictor.Core
                 if (p > Epsilon) transitions.Add((fwd, p));
             }
 
-            // Sort exits by probability descending, preserving raw priority order on ties
             transitions.Sort((a, b) => b.Prob.CompareTo(a.Prob));
 
+            string prefix = isAfterCombat ? "续行" : string.Empty;
             ForkReasonKind reason;
             string label;
             if (primaryTarget == null && usedUTurnFallback)
             {
                 reason = ForkReasonKind.MidForkAllUTurnFallback;
-                label = "掉头平分";
+                label = isAfterCombat ? "续行·平分" : "掉头平分";
             }
             else if (transitions.Count > 1)
             {
                 reason = ForkReasonKind.MidForkMultiShortestPath;
-                label = primaryTarget != null
-                    ? (usedMultiShortestPath ? "多路抽签(" + primaryTarget.SeatTag + ")" : "抽签(" + primaryTarget.SeatTag + ")")
-                    : "分流";
+                if (primaryTarget != null)
+                    label = (isAfterCombat ? "续行·多路(" : (usedMultiShortestPath ? "多路(" : "抽签(")) + primaryTarget.SeatTag + ")";
+                else
+                    label = isAfterCombat ? "续行·分流" : "分流";
             }
             else
             {
                 reason = ForkReasonKind.MidForkChasePlayer;
                 label = primaryTarget != null
-                    ? "追" + primaryTarget.SeatTag + "(" + primaryDist + "格)"
+                    ? prefix + "→" + primaryTarget.SeatTag + "(" + primaryDist + "格)"
                     : "直行";
             }
 
@@ -565,14 +677,15 @@ namespace MonsterPathPredictor.Core
 
         private static void RecordFork(
             BoardGraph board,
-            Dictionary<WalkStateKey, PredictedFork> forkMap,
+            Dictionary<ForkRecordKey, PredictedFork> forkMap,
             int forkLandId,
             int incomingLandId,
             int stepIndex,
             double arrivalProb,
+            bool isAfterCombat,
             StepOutcome outcome)
         {
-            var key = new WalkStateKey(forkLandId, incomingLandId);
+            var key = new ForkRecordKey(forkLandId, incomingLandId, isAfterCombat);
             var validAll = board.GetValidNeighbors(forkLandId);
             int globalRed = validAll.Count > 0 ? validAll[0] : -1;
 
@@ -584,6 +697,7 @@ namespace MonsterPathPredictor.Core
                     IncomingLandId = incomingLandId,
                     StepIndex = stepIndex,
                     ArrivalProbability = arrivalProb,
+                    IsAfterCombat = isAfterCombat,
                     ReasonKind = outcome.Reason,
                     SummaryLabel = outcome.SummaryLabel
                 };
@@ -604,12 +718,55 @@ namespace MonsterPathPredictor.Core
                 return;
             }
 
-            // If a loop revisits the exact same (fork, incoming), accumulate arrival probability
             pf.ArrivalProbability = Math.Min(1.0, pf.ArrivalProbability + arrivalProb);
             for (int i = 0; i < pf.Exits.Count; i++)
             {
                 pf.Exits[i].CumulativeProbability = Math.Min(1.0, pf.ArrivalProbability * pf.Exits[i].ConditionalProbability);
             }
+        }
+
+        private static void RecordCombat(
+            Dictionary<int, PredictedCombat> combatMap,
+            int landId,
+            int stepIndex,
+            double probability,
+            List<TrackedPlayer> targets)
+        {
+            if (!combatMap.TryGetValue(landId, out var c))
+            {
+                var seats = new List<string>(targets.Count);
+                for (int i = 0; i < targets.Count; i++) seats.Add(targets[i].SeatTag);
+                seats.Sort(StringComparer.Ordinal);
+                c = new PredictedCombat
+                {
+                    LandId = landId,
+                    StepIndex = stepIndex,
+                    Probability = probability,
+                    TargetLabel = string.Join("/", seats)
+                };
+                combatMap[landId] = c;
+            }
+            else
+            {
+                c.Probability = Math.Min(1.0, c.Probability + probability);
+                if (stepIndex < c.StepIndex) c.StepIndex = stepIndex;
+            }
+        }
+
+        private static Dictionary<int, List<TrackedPlayer>> BuildPlayersByLand(List<TrackedPlayer> activePlayers)
+        {
+            var dict = new Dictionary<int, List<TrackedPlayer>>();
+            for (int i = 0; i < activePlayers.Count; i++)
+            {
+                var p = activePlayers[i];
+                if (!dict.TryGetValue(p.LandId, out var list))
+                {
+                    list = new List<TrackedPlayer>();
+                    dict[p.LandId] = list;
+                }
+                list.Add(p);
+            }
+            return dict;
         }
 
         private static List<TrackedPlayer> FilterTrackablePlayers(BoardGraph board, IReadOnlyList<TrackedPlayer> players)
@@ -643,13 +800,15 @@ namespace MonsterPathPredictor.Core
         }
 
         private static void AccumulateEndpoint(
-            Dictionary<(int LandId, int Step, bool DeadEnd), double> map,
+            Dictionary<(int LandId, int Step, bool DeadEnd, bool StoppedAtCombat, bool AfterCombat), double> map,
             int landId,
             int step,
             bool deadEnd,
+            bool stoppedAtCombat,
+            bool afterCombat,
             double prob)
         {
-            var key = (landId, step, deadEnd);
+            var key = (landId, step, deadEnd, stoppedAtCombat, afterCombat);
             if (map.TryGetValue(key, out double existing))
                 map[key] = existing + prob;
             else

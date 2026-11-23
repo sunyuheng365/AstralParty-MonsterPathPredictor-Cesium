@@ -9,8 +9,8 @@ using MonsterPathPredictor.Core;
 namespace MonsterPathPredictor.Runtime
 {
     /// <summary>
-    /// Handles clicking a monster on the PVE board to select/toggle its path forecast,
-    /// using FairyGUI stage coordinates and camera projection without calling raw Unity ECalls.
+    /// Handles clicking anywhere on a monster's rendered sprite (with stacked-monster disambiguation)
+    /// and toggling the monster picker popup or clearing selection via hotkeys.
     /// </summary>
     internal sealed class MonsterPicker
     {
@@ -21,30 +21,50 @@ namespace MonsterPathPredictor.Runtime
             Camera camera,
             IReadOnlyList<LiveMonsterInfo> monsters,
             PredictorSettings settings,
+            MonsterPickerPopup popup,
             ref long selectedMonsterId)
         {
             int frame = UnityTime.FrameCount;
             if (frame == _lastProcessedFrame) return false;
             _lastProcessedFrame = frame;
 
-            // Check clear hotkey (default Escape)
-            if (selectedMonsterId != 0 && IsClearHotkeyDown(settings.ClearHotkey))
+            // 1. Toggle monster picker popup hotkey (default F8)
+            if (IsHotkeyDown(settings.PickerHotkey))
             {
-                selectedMonsterId = 0;
-                return true;
+                popup?.Toggle();
+                return false;
+            }
+
+            // 2. Clear hotkey (default Escape): close popup first if open, otherwise clear selection
+            if (IsHotkeyDown(settings.ClearHotkey))
+            {
+                if (popup != null && popup.IsOpen)
+                {
+                    popup.Hide();
+                    return false;
+                }
+                if (selectedMonsterId != 0)
+                {
+                    selectedMonsterId = 0;
+                    return true;
+                }
             }
 
             if (!InputService.IsMouseButtonPressed(0)) return false;
 
-            // Ignore clicks consumed by interactive UI buttons/panels/cards
-            if (IsPointerOverBlockingUi()) return false;
+            if (!TryGetStageAndLayerMouse(layer, out Vector2 stagePos, out Vector2 clickLocal))
+                return false;
 
-            if (!TryGetLayerMousePosition(layer, out Vector2 clickLocal)) return false;
+            // Never intercept clicks inside our own picker popup
+            if (popup != null && popup.IsOpen && popup.ContainsStagePoint(stagePos))
+                return false;
+
+            // Ignore clicks consumed by interactive game UI buttons/cards/windows
+            if (IsPointerOverBlockingUi()) return false;
 
             long hitMonsterId = HitTestMonsters(layer, camera, monsters, clickLocal, settings);
             if (hitMonsterId != 0)
             {
-                // Click same monster to toggle off; click another monster to switch immediately
                 selectedMonsterId = (selectedMonsterId == hitMonsterId) ? 0 : hitMonsterId;
                 return true;
             }
@@ -58,7 +78,7 @@ namespace MonsterPathPredictor.Runtime
             return false;
         }
 
-        private static bool IsClearHotkeyDown(string keyName)
+        private static bool IsHotkeyDown(string keyName)
         {
             if (string.IsNullOrWhiteSpace(keyName)) return false;
             if (Enum.TryParse(keyName.Trim(), ignoreCase: true, out KeyCode code) && code != KeyCode.None)
@@ -77,8 +97,6 @@ namespace MonsterPathPredictor.Runtime
                 var target = root.touchTarget;
                 if (target == null || ReferenceEquals(target, root)) return false;
 
-                // Allow clicking through full-screen non-blocking battle HUD container if needed,
-                // but block clicks that land on actual interactive buttons/lists/cards/windows.
                 string name = target.name ?? string.Empty;
                 if (name == "GRoot" || name == "Stage") return false;
                 return target.touchable;
@@ -89,20 +107,21 @@ namespace MonsterPathPredictor.Runtime
             }
         }
 
-        private static bool TryGetLayerMousePosition(GComponent layer, out Vector2 localPos)
+        private static bool TryGetStageAndLayerMouse(GComponent layer, out Vector2 stagePos, out Vector2 localPos)
         {
+            stagePos = Vector2.zero;
             localPos = Vector2.zero;
             if (layer == null) return false;
 
             try
             {
-                // Stage.inst.touchPosition is already in FairyGUI Stage top-left global coordinates
                 if (Stage.inst != null)
                 {
-                    Vector2 stagePos = Stage.inst.touchPosition;
-                    if (!float.IsNaN(stagePos.x) && !float.IsNaN(stagePos.y))
+                    Vector2 sp = Stage.inst.touchPosition;
+                    if (!float.IsNaN(sp.x) && !float.IsNaN(sp.y))
                     {
-                        localPos = layer.GlobalToLocal(stagePos);
+                        stagePos = sp;
+                        localPos = layer.GlobalToLocal(sp);
                         return !float.IsNaN(localPos.x) && !float.IsNaN(localPos.y);
                     }
                 }
@@ -116,7 +135,8 @@ namespace MonsterPathPredictor.Runtime
                     float stageHeight = Stage.inst != null ? Stage.inst.height : layer.height;
                     if (stageHeight > 1f)
                     {
-                        localPos = layer.GlobalToLocal(new Vector2(unityPos.x, stageHeight - unityPos.y));
+                        stagePos = new Vector2(unityPos.x, stageHeight - unityPos.y);
+                        localPos = layer.GlobalToLocal(stagePos);
                         return !float.IsNaN(localPos.x) && !float.IsNaN(localPos.y);
                     }
                 }
@@ -139,44 +159,83 @@ namespace MonsterPathPredictor.Runtime
             var camPos = TransformService.GetPosition(camTr);
             var camForward = TransformService.GetForward(camTr);
 
-            float maxDist = settings.ClickRadius;
-            float bestDist = maxDist;
-            long bestId = 0;
-
+            var boxes = new List<MonsterHitBox>(monsters.Count);
             for (int i = 0; i < monsters.Count; i++)
             {
                 var m = monsters[i];
                 if (m == null || m.State == null) continue;
                 if (!settings.AllowNonAggressiveMonsters && !m.State.IsNormalAggressive) continue;
 
-                // Test distance to both body center and tile feet (monster models stand above their tile)
-                float dBody = ProjectedDistance(layer, camera, camPos, camForward, m.BodyWorldPos, clickLocal);
-                float dFeet = ProjectedDistance(layer, camera, camPos, camForward, m.FeetWorldPos, clickLocal);
-                float d = Math.Min(dBody, dFeet);
+                // Refresh live visual bounds right on click so moving/stacked sprites are pixel-accurate
+                var bounds = m.CharacterRef != null
+                    ? SpriteBoundsReader.Capture(m.CharacterRef, m.FeetWorldPos, camera)
+                    : m.VisualBounds;
 
-                if (d < bestDist)
-                {
-                    bestDist = d;
-                    bestId = m.State.MonsterId;
-                }
+                if (!TryProjectHitBox(layer, camera, camPos, camForward, m.State.MonsterId, bounds, out var hitBox))
+                    continue;
+
+                boxes.Add(hitBox);
             }
 
-            return bestId;
+            return MonsterHitTester.PickMonster(new Point2(clickLocal.x, clickLocal.y), boxes, settings.ClickRadius);
         }
 
-        private static float ProjectedDistance(
+        private static bool TryProjectHitBox(
             GComponent layer,
             Camera camera,
             Vector3 camPos,
             Vector3 camForward,
-            Vector3 world,
-            Vector2 clickLocal)
+            long monsterId,
+            MonsterVisualBounds bounds,
+            out MonsterHitBox hitBox)
         {
-            if (Vector3.Dot(world - camPos, camForward) <= 0.1f) return float.MaxValue;
-            Vector2 pt = layer.WorldToLocal(world, camera);
-            if (float.IsNaN(pt.x) || float.IsInfinity(pt.x) || float.IsNaN(pt.y) || float.IsInfinity(pt.y))
-                return float.MaxValue;
-            return Vector2.Distance(pt, clickLocal);
+            hitBox = null;
+            if (bounds.Corners == null || bounds.Corners.Length < 4) return false;
+
+            float depth = Vector3.Dot(bounds.CenterWorld - camPos, camForward);
+            if (depth <= 0.1f) return false;
+
+            float minX = float.MaxValue, minY = float.MaxValue;
+            float maxX = float.MinValue, maxY = float.MinValue;
+            int valid = 0;
+
+            for (int i = 0; i < bounds.Corners.Length; i++)
+            {
+                Vector3 c = bounds.Corners[i];
+                if (Vector3.Dot(c - camPos, camForward) <= 0.05f) continue;
+                Vector2 p = layer.WorldToLocal(c, camera);
+                if (float.IsNaN(p.x) || float.IsInfinity(p.x) || float.IsNaN(p.y) || float.IsInfinity(p.y))
+                    continue;
+                if (p.x < minX) minX = p.x;
+                if (p.y < minY) minY = p.y;
+                if (p.x > maxX) maxX = p.x;
+                if (p.y > maxY) maxY = p.y;
+                valid++;
+            }
+
+            if (valid < 2) return false;
+
+            // Ensure a sensible minimum clickable box if monster is zoomed far away
+            if (maxX - minX < 28f)
+            {
+                float cx = (minX + maxX) * 0.5f;
+                minX = cx - 14f;
+                maxX = cx + 14f;
+            }
+            if (maxY - minY < 36f)
+            {
+                float cy = (minY + maxY) * 0.5f;
+                minY = cy - 18f;
+                maxY = cy + 18f;
+            }
+
+            hitBox = new MonsterHitBox
+            {
+                MonsterId = monsterId,
+                Rect = new HitRect2D(minX, minY, maxX, maxY),
+                CameraDepth = depth
+            };
+            return true;
         }
     }
 }

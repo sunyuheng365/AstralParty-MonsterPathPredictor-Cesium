@@ -14,14 +14,14 @@ namespace MonsterPathPredictor.Runtime
     internal sealed class LiveMonsterInfo
     {
         public MonsterState State;
+        public Character CharacterRef;
         public Vector3 FeetWorldPos;
-        public Vector3 BodyWorldPos;
+        public MonsterVisualBounds VisualBounds;
     }
 
     /// <summary>
-    /// Captures live board topology, active monsters, trackable players, and transient state
-    /// (turn-start vs mid-walk, fork combat, spawn-on-fork, and 垃圾桶/雪莉/玲玲 skill displacement).
-    /// All network callbacks enqueue lightweight records and are drained strictly on the main thread.
+    /// Captures live board topology, active monsters (with exact sprite world bounds and disambiguated names),
+    /// trackable players, and transient combat / spawn / skill-move states.
     /// </summary>
     internal sealed class MonsterStateTracker
     {
@@ -158,6 +158,7 @@ namespace MonsterPathPredictor.Runtime
         public void SyncAndSnapshot(
             BoardGraph board,
             BattleLogic battle,
+            Camera camera,
             PredictorSettings settings,
             out List<LiveMonsterInfo> monsters,
             out List<TrackedPlayer> players)
@@ -173,7 +174,6 @@ namespace MonsterPathPredictor.Runtime
             var allUnits = Players.All();
             if (allUnits == null || allUnits.Count == 0) return;
 
-            // Track currently active actor & whether it already stepped mid-turn
             var currentActor = SafeGetCurrentPlayer(battle);
             long curActorId = (currentActor != null && currentActor.player != null) ? currentActor.player.Id : 0;
             if (curActorId != _activeActorId)
@@ -191,7 +191,6 @@ namespace MonsterPathPredictor.Runtime
                 }
             }
 
-            // Build lookup of player positions (for skill displacement direction inference)
             var playerPositions = new Dictionary<long, int>();
             var aliveMonsterIds = new HashSet<long>();
 
@@ -214,7 +213,6 @@ namespace MonsterPathPredictor.Runtime
                 }
             }
 
-            // Process monsters
             for (int i = 0; i < allUnits.Count; i++)
             {
                 var pd = allUnits[i];
@@ -252,8 +250,6 @@ namespace MonsterPathPredictor.Runtime
                 }
                 else if (mem.LastLandId != landId)
                 {
-                    // Monster changed tile! Check whether it was displaced by a recent player skill
-                    // (non-adjacent jump or displacement during another player's turn)
                     bool isMonsterOwnTurn = (curActorId == mid);
                     bool movedNonAdjacently = mem.LastLandId >= 0 && !board.IsValidNeighbor(mem.LastLandId, landId);
 
@@ -263,7 +259,6 @@ namespace MonsterPathPredictor.Runtime
                     }
                     else
                     {
-                        // Normal monster walk off previous tile clears previous fork-spawn / combat / skill flags
                         mem.JustSpawnedOnFork = false;
                         if (mem.CombatForkLandId != landId)
                         {
@@ -283,21 +278,24 @@ namespace MonsterPathPredictor.Runtime
                     mem.LastFromLandId = fromLandId;
                 }
 
-                // Apply any queued combat records involving this monster on a fork
                 bool justFought = mem.JustFoughtOnFork && mem.CombatForkLandId == landId && board.IsFork(landId);
-                bool isMovingMidTurn = (curActorId == mid) && (_activeActorSteppedThisTurn || canStep > 0) && _activeActorSteppedThisTurn;
+                bool isMovingMidTurn = (curActorId == mid) && _activeActorSteppedThisTurn;
+                bool launchedFightThisTurn = (curActorId == mid) && SafeIsLaunchFight(pd);
 
-                // Determine monster name & AI type
                 int heroId = SafeHeroId(pd);
                 string monsterName = ResolveMonsterName(pd, heroId);
                 bool isNormalAggressive = IsNormalAggressiveMonster(pd);
                 int actionWeight = SafeActionWeight(pd);
+                SafeHp(pd, out int hp, out int maxHp);
 
                 var state = new MonsterState
                 {
                     MonsterId = mid,
                     Name = monsterName,
+                    DisplayName = monsterName,
                     HeroId = heroId,
+                    Hp = hp,
+                    MaxHp = maxHp,
                     IsNormalAggressive = isNormalAggressive,
                     ActionWeight = actionWeight,
                     CurrentLandId = landId,
@@ -306,6 +304,7 @@ namespace MonsterPathPredictor.Runtime
                     CanStep = canStep,
                     IsCurrentlyMovingMidTurn = isMovingMidTurn,
                     JustFoughtOnCurrentFork = justFought,
+                    HasLaunchedFightThisTurn = launchedFightThisTurn,
                     JustSpawnedOnFork = mem.JustSpawnedOnFork && board.IsFork(landId),
                     SkillMoveKind = mem.SkillMoveLandId == landId ? mem.SkillMoveKind : SkillMoveKind.None,
                     SkillMovePushDirectionLandId = mem.SkillMoveLandId == landId ? mem.SkillMovePushDirId : -1,
@@ -318,18 +317,46 @@ namespace MonsterPathPredictor.Runtime
                 else
                     feetPos = TransformService.GetPosition(UnityObject.GetTransform(ch));
 
-                Vector3 charPos = TransformService.GetPosition(UnityObject.GetTransform(ch));
-                Vector3 bodyPos = new Vector3(charPos.x, charPos.y + 0.9f, charPos.z);
+                var visualBounds = SpriteBoundsReader.Capture(ch, feetPos, camera);
 
                 monsters.Add(new LiveMonsterInfo
                 {
                     State = state,
+                    CharacterRef = ch,
                     FeetWorldPos = feetPos,
-                    BodyWorldPos = bodyPos
+                    VisualBounds = visualBounds
                 });
             }
 
-            // Prune dead/despawned monster memories
+            // Sort monsters by action order (ActionWeight ASC), then stable MonsterId ASC
+            monsters.Sort((a, b) =>
+            {
+                int w = a.State.ActionWeight.CompareTo(b.State.ActionWeight);
+                if (w != 0) return w;
+                return a.State.MonsterId.CompareTo(b.State.MonsterId);
+            });
+
+            // Disambiguate duplicate monster names ("迎宾燕 1", "迎宾燕 2") matching game convention
+            var nameCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+            for (int i = 0; i < monsters.Count; i++)
+            {
+                string n = monsters[i].State.Name;
+                nameCounts.TryGetValue(n, out int cnt);
+                nameCounts[n] = cnt + 1;
+            }
+            var seenIndex = new Dictionary<string, int>(StringComparer.Ordinal);
+            for (int i = 0; i < monsters.Count; i++)
+            {
+                string n = monsters[i].State.Name;
+                if (nameCounts[n] > 1)
+                {
+                    seenIndex.TryGetValue(n, out int idx);
+                    idx++;
+                    seenIndex[n] = idx;
+                    monsters[i].State.DisplayName = n + " " + idx;
+                }
+            }
+
             if (_memories.Count > aliveMonsterIds.Count)
             {
                 var stale = new List<long>();
@@ -396,7 +423,6 @@ namespace MonsterPathPredictor.Runtime
         {
             if (_recentSkills.Count == 0) return;
 
-            // Check most recent skill cast within window
             for (int i = _recentSkills.Count - 1; i >= 0; i--)
             {
                 var sk = _recentSkills[i];
@@ -459,7 +485,6 @@ namespace MonsterPathPredictor.Runtime
             }
             if (!board.Contains(origin) || !board.Contains(newLandId)) return;
 
-            // Shortest path from origin to newLandId gives the tile right before newLandId (the push incoming edge)
             var field = board.ComputeShortestPathsTo(origin);
             int d = field.GetDistance(newLandId);
             if (d > 0 && d < int.MaxValue)
@@ -488,12 +513,7 @@ namespace MonsterPathPredictor.Runtime
             {
                 var p = pd.player;
                 var prop = pd.Property;
-                int hp = 0, maxHp = 0;
-                try { hp = prop.HP.Value; maxHp = prop.maxHP; } catch { }
-                if (maxHp <= 0)
-                {
-                    try { hp = p.Hero.Hp; maxHp = p.Hero.MaxHp; } catch { }
-                }
+                SafeHp(pd, out int hp, out int maxHp);
 
                 bool dead = false;
                 try { dead = prop.HealthState == HealthState.Dead; } catch { }
@@ -548,6 +568,31 @@ namespace MonsterPathPredictor.Runtime
             }
         }
 
+        private static void SafeHp(BattlePlayerData pd, out int hp, out int maxHp)
+        {
+            hp = 0;
+            maxHp = 0;
+            try
+            {
+                var prop = pd.Property;
+                if (prop != null)
+                {
+                    if (prop.HP != null) hp = prop.HP.Value;
+                    maxHp = prop.maxHP;
+                }
+            }
+            catch { }
+            if (maxHp <= 0)
+            {
+                try
+                {
+                    var hero = pd.player != null ? pd.player.Hero : null;
+                    if (hero != null) { hp = hero.Hp; maxHp = hero.MaxHp; }
+                }
+                catch { }
+            }
+        }
+
         private static bool IsMonsterAliveAndActive(BattlePlayerData pd)
         {
             try
@@ -582,6 +627,12 @@ namespace MonsterPathPredictor.Runtime
             }
             catch { }
             return true;
+        }
+
+        private static bool SafeIsLaunchFight(BattlePlayerData pd)
+        {
+            try { return pd.player != null && pd.player.Hero != null && pd.player.Hero.IsLaunchFight; }
+            catch { return false; }
         }
 
         private static BattlePlayerData SafeGetCurrentPlayer(BattleLogic battle)

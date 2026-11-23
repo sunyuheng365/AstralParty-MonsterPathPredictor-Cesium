@@ -8,18 +8,22 @@ using MonsterPathPredictor.Core;
 namespace MonsterPathPredictor.Runtime
 {
     /// <summary>
-    /// Renders dashed path segments, directional fork arrowheads, probability percentage badges,
-    /// endpoint markers, and a selected-monster header tag on a non-touchable FairyGUI overlay layer.
-    /// Pools GGraph / GTextField objects across frames to avoid GC spikes during LateUpdate.
+    /// Renders animated forward-marching dashed path segments, guide-colored fork arrows (Red/Blue for
+    /// fork-start/post-combat, Cyan/Gold/Coral for mid-walk chases & probability splits), encounter markers
+    /// ("⚔遇P1"), distinct softer post-combat continuation styling, and a sprite-top monster header badge.
+    /// Pools GGraph / GTextField widgets across frames to avoid GC pressure during LateUpdate.
     /// </summary>
     internal sealed class DashedOverlayRenderer : IDisposable
     {
-        private static readonly Color DeterministicColor = new Color(0.24f, 0.90f, 1.00f, 0.96f);   // Bright cyan
-        private static readonly Color MajorBranchColor = new Color(1.00f, 0.82f, 0.22f, 0.96f);     // Bright gold
-        private static readonly Color MinorBranchColor = new Color(1.00f, 0.48f, 0.28f, 0.88f);     // Warm coral
-        private static readonly Color RingColor = new Color(1.00f, 0.88f, 0.25f, 0.95f);            // Selection ring
-        private static readonly Color BadgeBg = new Color(0.06f, 0.09f, 0.14f, 0.84f);              // Dark pill
-        private static readonly Color EndpointFill = new Color(0.24f, 0.90f, 1.00f, 0.95f);
+        private static readonly Color DeterministicColor = new Color(0.24f, 0.90f, 1.00f, 0.96f);      // Bright cyan
+        private static readonly Color PostCombatCyan = new Color(0.58f, 0.78f, 0.95f, 0.56f);          // Softer post-combat continuation
+        private static readonly Color MajorBranchColor = new Color(1.00f, 0.82f, 0.22f, 0.96f);        // Bright gold
+        private static readonly Color MinorBranchColor = new Color(1.00f, 0.48f, 0.28f, 0.88f);        // Warm coral
+        private static readonly Color GuideRedArrow = new Color(1.00f, 0.32f, 0.32f, 0.98f);           // Guide red arrow
+        private static readonly Color GuideBlueArrow = new Color(0.26f, 0.68f, 1.00f, 0.98f);          // Guide blue arrow
+        private static readonly Color CombatBadgeColor = new Color(1.00f, 0.40f, 0.34f, 0.98f);        // Encounter marker
+        private static readonly Color RingColor = new Color(1.00f, 0.88f, 0.25f, 0.95f);               // Selection ring
+        private static readonly Color BadgeBg = new Color(0.06f, 0.09f, 0.14f, 0.86f);                 // Dark pill
 
         private GComponent _layer;
         private readonly List<GGraph> _graphPool = new List<GGraph>();
@@ -79,7 +83,11 @@ namespace MonsterPathPredictor.Runtime
             var camForward = TransformService.GetForward(camTr);
             float hOffset = settings.HeightOffset;
 
-            // Project tile world positions once per frame
+            // Smooth forward-marching dash phase (px)
+            float phaseOffset = settings.DashSpeed > 0.01f
+                ? UnityTime.RealtimeSinceStartup * settings.DashSpeed
+                : 0f;
+
             var screenCache = new Dictionary<int, Point2>();
             bool TryProjectTile(int landId, out Point2 pt)
             {
@@ -95,23 +103,24 @@ namespace MonsterPathPredictor.Runtime
                 return true;
             }
 
-            // 1. Highlight ring around the selected monster's starting tile
+            // 1. Highlight dot on the selected monster's starting tile
             if (TryProjectTile(plan.StartLandId, out var startPt))
             {
-                DrawDot(startPt, 9f, RingColor);
+                DrawDot(startPt, 8.5f, RingColor);
             }
 
-            // 2. Dashed lines for all predicted edges
+            // 2. Animated forward-marching dashed lines for all predicted edges
             for (int i = 0; i < plan.Edges.Count; i++)
             {
                 var edge = plan.Edges[i];
                 if (!TryProjectTile(edge.FromLandId, out var pFrom)) continue;
                 if (!TryProjectTile(edge.ToLandId, out var pTo)) continue;
 
-                Color color = PickEdgeColor(edge.Probability);
+                Color color = PickEdgeColor(edge.Probability, edge.IsAfterCombat);
+                float baseWidth = edge.IsAfterCombat ? Math.Max(2.2f, settings.LineWidth * 0.78f) : settings.LineWidth;
                 float width = edge.Probability >= 0.999
-                    ? settings.LineWidth
-                    : Math.Max(2.2f, settings.LineWidth * (0.65f + 0.35f * (float)edge.Probability));
+                    ? baseWidth
+                    : Math.Max(2.0f, baseWidth * (0.65f + 0.35f * (float)edge.Probability));
 
                 var quads = DashGeometry.BuildDashedSegments(
                     pFrom, pTo,
@@ -119,14 +128,15 @@ namespace MonsterPathPredictor.Runtime
                     settings.GapLength,
                     width,
                     trimStart: edge.EarliestStep == 0 ? 10f : 3f,
-                    trimEnd: 3f);
+                    trimEnd: 3f,
+                    phaseOffset: phaseOffset);
 
                 for (int q = 0; q < quads.Count; q++)
                 {
                     DrawPolygon(quads[q], color);
                 }
 
-                // Draw directional chevron on the very first step out of the monster so facing is unmistakable
+                // Draw directional chevron on the very first step out of the monster
                 if (edge.EarliestStep == 0)
                 {
                     var head = DashGeometry.BuildArrowHead(pFrom, pTo, Math.Max(12f, width * 3.1f), Math.Max(6f, width * 1.6f), 0.60f);
@@ -134,82 +144,127 @@ namespace MonsterPathPredictor.Runtime
                 }
             }
 
-            // 3. Fork arrowheads & probability percentage badges (plus optional reason tag)
+            // 3. Fork directional arrows & probability percentage badges (guide-aligned colors)
             for (int i = 0; i < plan.Forks.Count; i++)
             {
                 var fork = plan.Forks[i];
                 if (!TryProjectTile(fork.ForkLandId, out var forkPt)) continue;
 
-                // Highlight fork node
-                DrawDot(forkPt, 5.5f, fork.HasMultipleBranches ? MajorBranchColor : DeterministicColor);
+                Color forkAccent = PickForkAccentColor(fork);
+                DrawDot(forkPt, 5.5f, forkAccent);
 
                 for (int e = 0; e < fork.Exits.Count; e++)
                 {
                     var exit = fork.Exits[e];
                     if (!TryProjectTile(exit.NextLandId, out var exitPt)) continue;
 
-                    Color exitColor = PickEdgeColor(exit.ConditionalProbability);
-
-                    // Bold directional arrow pointing into the chosen exit at the fork
+                    Color exitColor = PickForkExitColor(fork, exit);
                     float arrowLen = Math.Max(14f, settings.LineWidth * 3.5f);
                     float arrowHalfW = Math.Max(7f, settings.LineWidth * 1.8f);
                     var arrow = DashGeometry.BuildArrowHead(forkPt, exitPt, arrowLen, arrowHalfW, 0.56f);
                     if (arrow.Length >= 3) DrawPolygon(arrow, exitColor);
 
-                    // Show percentage when multiple possibilities exist (or always if configured)
                     if (fork.HasMultipleBranches || settings.ShowDeterministicPercent)
                     {
                         string pctText = exit.FormatConditionalPercent();
-                        var anchor = DashGeometry.ComputeEdgeLabelAnchor(forkPt, exitPt, alongRatio: 0.56f, lateralOffset: e == 0 ? -14f : 14f);
+                        var anchor = DashGeometry.ComputeEdgeLabelAnchor(forkPt, exitPt, alongRatio: 0.56f, lateralOffset: e == 0 ? -15f : 15f);
                         DrawPillLabel(anchor, pctText, settings.FontSize, exitColor);
                     }
                 }
 
-                // Optional short reason tag above the fork tile
                 if (settings.ShowReasonTag && !string.IsNullOrEmpty(fork.SummaryLabel))
                 {
                     var tagPos = new Point2(forkPt.X, forkPt.Y - settings.FontSize - 14f);
-                    Color tagColor = fork.HasMultipleBranches ? MajorBranchColor : DeterministicColor;
-                    DrawPillLabel(tagPos, fork.SummaryLabel, Math.Max(12, settings.FontSize - 3), tagColor);
+                    DrawPillLabel(tagPos, fork.SummaryLabel, Math.Max(12, settings.FontSize - 3), forkAccent);
                 }
             }
 
-            // 4. Endpoint markers at the end of X steps
+            // 4. Encounter / combat markers on tiles occupied by living players
+            for (int i = 0; i < plan.Combats.Count; i++)
+            {
+                var combat = plan.Combats[i];
+                if (!TryProjectTile(combat.LandId, out var cPt)) continue;
+
+                DrawDot(cPt, 7.5f, CombatBadgeColor);
+                string cLabel = "⚔遇" + combat.TargetLabel + "(" + combat.StepIndex + "格)";
+                DrawPillLabel(new Point2(cPt.X, cPt.Y + 18f), cLabel, Math.Max(12, settings.FontSize - 3), CombatBadgeColor);
+            }
+
+            // 5. Endpoint markers at the end of X steps (skip if a combat marker already sits on that exact tile)
+            var combatLands = new HashSet<int>();
+            for (int i = 0; i < plan.Combats.Count; i++) combatLands.Add(plan.Combats[i].LandId);
+
             for (int i = 0; i < plan.Endpoints.Count; i++)
             {
                 var ep = plan.Endpoints[i];
+                if (ep.StoppedAtCombat && combatLands.Contains(ep.LandId)) continue;
                 if (!TryProjectTile(ep.LandId, out var epPt)) continue;
 
-                Color epColor = ep.Probability >= 0.999 ? EndpointFill : PickEdgeColor(ep.Probability);
+                Color epColor = PickEdgeColor(ep.Probability, ep.IsAfterCombat);
                 DrawDot(epPt, 6.5f, epColor);
 
                 string epLabel = ep.IsDeadEnd ? "终点" : (ep.StepIndex + "格");
-                DrawPillLabel(new Point2(epPt.X, epPt.Y + 16f), epLabel, Math.Max(12, settings.FontSize - 4), epColor);
+                float yOff = combatLands.Contains(ep.LandId) ? -22f : 16f;
+                DrawPillLabel(new Point2(epPt.X, epPt.Y + yOff), epLabel, Math.Max(12, settings.FontSize - 4), epColor);
             }
 
-            // 5. Compact header badge above the selected monster
-            var headerWorld = new Vector3(
-                selectedMonster.BodyWorldPos.x,
-                selectedMonster.BodyWorldPos.y + 0.85f,
-                selectedMonster.BodyWorldPos.z);
+            // 6. Selected monster header badge cleanly above the actual sprite top
+            var bounds = selectedMonster.CharacterRef != null
+                ? SpriteBoundsReader.Capture(selectedMonster.CharacterRef, selectedMonster.FeetWorldPos, camera)
+                : selectedMonster.VisualBounds;
+            Vector3 headerWorld = new Vector3(bounds.TopWorld.x, bounds.TopWorld.y + 0.18f, bounds.TopWorld.z);
             if (TryProjectWorld(layer, camera, camPos, camForward, headerWorld, out var headerPt))
             {
                 string headerText = plan.MonsterName + " · " + plan.StepsRequested + "格";
                 if (!string.IsNullOrEmpty(plan.HeadlineNote))
                     headerText += " (" + plan.HeadlineNote + ")";
-                DrawPillLabel(new Point2(headerPt.X, headerPt.Y - 10f), headerText, Math.Max(13, settings.FontSize - 2), RingColor);
+                DrawPillLabel(new Point2(headerPt.X, headerPt.Y - 12f), headerText, Math.Max(13, settings.FontSize - 2), RingColor);
             }
 
-            // Hide unused pooled widgets
             for (int i = _usedGraphs; i < _graphPool.Count; i++) _graphPool[i].visible = false;
             for (int i = _usedTexts; i < _textPool.Count; i++) _textPool[i].visible = false;
         }
 
-        private static Color PickEdgeColor(double probability)
+        private static Color PickEdgeColor(double probability, bool isAfterCombat)
         {
+            if (isAfterCombat)
+            {
+                if (probability >= 0.999) return PostCombatCyan;
+                var c = probability >= 0.50 ? MajorBranchColor : MinorBranchColor;
+                return new Color(c.r, c.g, c.b, 0.55f);
+            }
             if (probability >= 0.999) return DeterministicColor;
             if (probability >= 0.50) return MajorBranchColor;
             return MinorBranchColor;
+        }
+
+        private static Color PickForkAccentColor(PredictedFork fork)
+        {
+            switch (fork.ReasonKind)
+            {
+                case ForkReasonKind.ForkStartRed:
+                case ForkReasonKind.PostCombatRed:
+                case ForkReasonKind.SkillTrashcanRed:
+                    return GuideRedArrow;
+                case ForkReasonKind.ForkStartBlue:
+                case ForkReasonKind.PostCombatBlue:
+                    return GuideBlueArrow;
+                case ForkReasonKind.SkillLinglingRedBlue:
+                    return (fork.Exits.Count > 0 && fork.Exits[0].IsGlobalRedArrow) ? GuideRedArrow : GuideBlueArrow;
+                default:
+                    if (fork.HasMultipleBranches)
+                        return fork.IsAfterCombat ? new Color(MajorBranchColor.r, MajorBranchColor.g, MajorBranchColor.b, 0.72f) : MajorBranchColor;
+                    return fork.IsAfterCombat ? PostCombatCyan : DeterministicColor;
+            }
+        }
+
+        private static Color PickForkExitColor(PredictedFork fork, ForkExitPrediction exit)
+        {
+            if (!fork.HasMultipleBranches)
+            {
+                return PickForkAccentColor(fork);
+            }
+            return PickEdgeColor(exit.ConditionalProbability, fork.IsAfterCombat);
         }
 
         private static bool TryProjectWorld(
@@ -225,7 +280,6 @@ namespace MonsterPathPredictor.Runtime
             Vector2 local = layer.WorldToLocal(world, camera);
             if (float.IsNaN(local.x) || float.IsInfinity(local.x) || float.IsNaN(local.y) || float.IsInfinity(local.y))
                 return false;
-            // Allow modest margin outside screen edges so lines clipping off-screen still draw cleanly
             if (local.x < -300f || local.x > layer.width + 300f || local.y < -300f || local.y > layer.height + 300f)
                 return false;
             pt = new Point2(local.x, local.y);
@@ -296,7 +350,6 @@ namespace MonsterPathPredictor.Runtime
             bg.DrawRoundRect(w, h, BadgeBg, new[] { 6f, 6f, 6f, 6f });
             bg.visible = true;
 
-            // Keep text strictly above its pill background
             _layer.SetChildIndex(tf, _layer.numChildren - 1);
             tf.SetXY(left + padX, top + padY);
             tf.visible = true;

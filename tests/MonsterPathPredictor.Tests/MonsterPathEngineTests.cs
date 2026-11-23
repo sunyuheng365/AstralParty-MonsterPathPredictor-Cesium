@@ -448,5 +448,77 @@ namespace MonsterPathPredictor.Tests
             Assert.Single(fork.Exits);
             Assert.Equal(22, fork.Exits[0].NextLandId);
         }
+
+        [Fact]
+        public void PostCombatModesHandleEncounterOnNormalTileBeforeSecondFork()
+        {
+            // Reproduces in-game screenshot scenario:
+            //   1 -> 2 -> Fork1(3) -> 4(P1 stands here!) -> 5 -> Fork2(6)
+            //   Fork2(6) raw neighbors: [7 (Red), 8 (Blue), 5 (incoming)]
+            //   P2 stands on Blue branch (tile 9 via 8).
+            var board = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(1, new[] { 2 }),
+                new LandNodeSnapshot(2, new[] { 1, 3 }),
+                new LandNodeSnapshot(3, new[] { 4, 10, 2 }),
+                new LandNodeSnapshot(10, new[] { 3 }),
+                new LandNodeSnapshot(4, new[] { 3, 5 }),
+                new LandNodeSnapshot(5, new[] { 4, 6 }),
+                new LandNodeSnapshot(6, new[] { 7, 8, 5 }), // Red=7, Blue=8
+                new LandNodeSnapshot(7, new[] { 6, 11 }),
+                new LandNodeSnapshot(11, new[] { 7 }),
+                new LandNodeSnapshot(8, new[] { 6, 9 }),
+                new LandNodeSnapshot(9, new[] { 8 })
+            });
+
+            var players = new List<TrackedPlayer>
+            {
+                new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = 4, IsAlive = true, IsTargetable = true },
+                new TrackedPlayer { PlayerId = 2, Slot = 1, LandId = 9, IsAlive = true, IsTargetable = true }
+            };
+
+            var monster = new MonsterState { MonsterId = 301, CurrentLandId = 2, FromLandId = 1 };
+
+            // 1. ContinueByGuide (default): marks combat at tile 4, continues past it with IsAfterCombat=true,
+            //    and at Fork2(6) skips behind-player P1 to follow P2 on Blue(8) with "续行→P2(2格)"
+            var planContinue = MonsterPathEngine.Plan(board, monster, players, new PlanOptions
+            {
+                MaxSteps = 6,
+                PostCombatMode = PostCombatMode.ContinueByGuide
+            });
+            Assert.Single(planContinue.Combats);
+            Assert.Equal(4, planContinue.Combats[0].LandId);
+            Assert.Equal("P1", planContinue.Combats[0].TargetLabel);
+            var fork2Continue = planContinue.Forks.Single(f => f.ForkLandId == 6);
+            Assert.True(fork2Continue.IsAfterCombat);
+            Assert.Equal(8, fork2Continue.Exits[0].NextLandId);
+            Assert.StartsWith("续行→P2", fork2Continue.SummaryLabel);
+            Assert.True(planContinue.Edges.Single(e => e.FromLandId == 6 && e.ToLandId == 8).IsAfterCombat);
+            Assert.False(planContinue.Edges.Single(e => e.FromLandId == 2 && e.ToLandId == 3).IsAfterCombat);
+
+            // 2. StopAtFirstCombat: truncates right at tile 4 (zero edges past tile 4, Fork2 never evaluated)
+            var planStop = MonsterPathEngine.Plan(board, monster, players, new PlanOptions
+            {
+                MaxSteps = 6,
+                PostCombatMode = PostCombatMode.StopAtFirstCombat
+            });
+            Assert.Single(planStop.Combats);
+            Assert.Equal(4, planStop.Combats[0].LandId);
+            Assert.DoesNotContain(planStop.Forks, f => f.ForkLandId == 6);
+            Assert.Single(planStop.Endpoints);
+            Assert.True(planStop.Endpoints[0].StoppedAtCombat);
+            Assert.Equal(4, planStop.Endpoints[0].LandId);
+
+            // 3. RedBlueAfterCombat: at Fork2(6) ignores P2 on Blue(8) and takes Red(7)
+            var planRedBlue = MonsterPathEngine.Plan(board, monster, players, new PlanOptions
+            {
+                MaxSteps = 6,
+                PostCombatMode = PostCombatMode.RedBlueAfterCombat
+            });
+            var fork2Red = planRedBlue.Forks.Single(f => f.ForkLandId == 6);
+            Assert.True(fork2Red.IsAfterCombat);
+            Assert.Equal(ForkReasonKind.PostCombatRed, fork2Red.ReasonKind);
+            Assert.Equal(7, fork2Red.Exits[0].NextLandId);
+        }
     }
 }

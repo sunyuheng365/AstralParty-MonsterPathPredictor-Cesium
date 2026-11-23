@@ -23,14 +23,175 @@ namespace MonsterPathPredictor.Core
     }
 
     /// <summary>
-    /// Pure 2D screen-space dashed line & directional arrowhead polygon generator.
+    /// Screen-space axis-aligned bounding rectangle of a monster's rendered sprite model.
+    /// </summary>
+    public struct HitRect2D
+    {
+        public float MinX;
+        public float MinY;
+        public float MaxX;
+        public float MaxY;
+
+        public HitRect2D(float minX, float minY, float maxX, float maxY)
+        {
+            MinX = Math.Min(minX, maxX);
+            MinY = Math.Min(minY, maxY);
+            MaxX = Math.Max(minX, maxX);
+            MaxY = Math.Max(minY, maxY);
+        }
+
+        public float Width => Math.Max(1f, MaxX - MinX);
+        public float Height => Math.Max(1f, MaxY - MinY);
+        public Point2 Center => new Point2((MinX + MaxX) * 0.5f, (MinY + MaxY) * 0.5f);
+
+        public bool Contains(Point2 p, float margin = 0f)
+        {
+            return p.X >= MinX - margin && p.X <= MaxX + margin &&
+                   p.Y >= MinY - margin && p.Y <= MaxY + margin;
+        }
+
+        public float DistanceToPoint(Point2 p)
+        {
+            float dx = 0f;
+            if (p.X < MinX) dx = MinX - p.X;
+            else if (p.X > MaxX) dx = p.X - MaxX;
+
+            float dy = 0f;
+            if (p.Y < MinY) dy = MinY - p.Y;
+            else if (p.Y > MaxY) dy = p.Y - MaxY;
+
+            return (float)Math.Sqrt(dx * dx + dy * dy);
+        }
+
+        /// <summary>
+        /// Normalized squared distance from the rectangle's center (0 at center, 1 at edge midpoints, 2 at corners).
+        /// </summary>
+        public float NormalizedCenterDistanceSq(Point2 p)
+        {
+            var c = Center;
+            float halfW = Math.Max(1f, Width * 0.5f);
+            float halfH = Math.Max(1f, Height * 0.5f);
+            float nx = (p.X - c.X) / halfW;
+            float ny = (p.Y - c.Y) / halfH;
+            return nx * nx + ny * ny;
+        }
+    }
+
+    public sealed class MonsterHitBox
+    {
+        public long MonsterId;
+        public HitRect2D Rect;
+        /// <summary>Camera-forward world depth (smaller = visually in front).</summary>
+        public float CameraDepth;
+    }
+
+    /// <summary>
+    /// Pure managed full-sprite hit tester with accurate disambiguation for stacked/overlapping monsters.
+    /// </summary>
+    public static class MonsterHitTester
+    {
+        private const float CoplanarDepthThreshold = 0.35f;
+
+        /// <summary>
+        /// Picks the monster clicked at <paramref name="click"/>.
+        /// 1. Direct hits inside a monster's projected sprite rectangle always beat near-misses.
+        /// 2. When multiple stacked/overlapping monsters contain <paramref name="click"/>:
+        ///    - If their camera depths differ significantly (&gt;= 0.35 world units), the front (closer) sprite wins.
+        ///    - If they stand side-by-side on the same tile (nearly co-planar), the one whose sprite center
+        ///      is closer to the click point wins cleanly.
+        /// 3. If no sprite rect directly contains <paramref name="click"/>, falls back to nearest sprite boundary
+        ///    within <paramref name="nearMissRadius"/>.
+        /// </summary>
+        public static long PickMonster(Point2 click, IReadOnlyList<MonsterHitBox> boxes, float nearMissRadius)
+        {
+            if (boxes == null || boxes.Count == 0) return 0;
+
+            var directHits = new List<MonsterHitBox>();
+            for (int i = 0; i < boxes.Count; i++)
+            {
+                var box = boxes[i];
+                if (box == null) continue;
+                if (box.Rect.Contains(click, margin: 3f))
+                {
+                    directHits.Add(box);
+                }
+            }
+
+            if (directHits.Count == 1)
+            {
+                return directHits[0].MonsterId;
+            }
+
+            if (directHits.Count > 1)
+            {
+                MonsterHitBox best = directHits[0];
+                for (int i = 1; i < directHits.Count; i++)
+                {
+                    var cand = directHits[i];
+                    float depthDiff = cand.CameraDepth - best.CameraDepth;
+                    if (depthDiff <= -CoplanarDepthThreshold)
+                    {
+                        // Candidate is clearly closer to camera (rendered in front)
+                        best = cand;
+                    }
+                    else if (Math.Abs(depthDiff) < CoplanarDepthThreshold)
+                    {
+                        // Side-by-side / stacked on same tile: pick whichever sprite center the click is closer to
+                        float candCenterDist = cand.Rect.NormalizedCenterDistanceSq(click);
+                        float bestCenterDist = best.Rect.NormalizedCenterDistanceSq(click);
+                        if (candCenterDist < bestCenterDist - 0.001f ||
+                            (Math.Abs(candCenterDist - bestCenterDist) <= 0.001f && cand.CameraDepth < best.CameraDepth))
+                        {
+                            best = cand;
+                        }
+                    }
+                }
+                return best.MonsterId;
+            }
+
+            // Near-miss fallback: closest distance to any sprite bounding box boundary
+            float maxDist = Math.Max(0f, nearMissRadius);
+            if (maxDist <= 0f) return 0;
+
+            MonsterHitBox nearest = null;
+            float bestEdgeDist = maxDist;
+            for (int i = 0; i < boxes.Count; i++)
+            {
+                var box = boxes[i];
+                if (box == null) continue;
+                float edgeDist = box.Rect.DistanceToPoint(click);
+                if (edgeDist > bestEdgeDist) continue;
+
+                if (nearest == null || edgeDist < bestEdgeDist - 1.5f)
+                {
+                    bestEdgeDist = edgeDist;
+                    nearest = box;
+                }
+                else if (Math.Abs(edgeDist - bestEdgeDist) <= 1.5f)
+                {
+                    float dCand = box.Rect.Center.DistanceTo(click);
+                    float dBest = nearest.Rect.Center.DistanceTo(click);
+                    if (dCand < dBest || (Math.Abs(dCand - dBest) < 1f && box.CameraDepth < nearest.CameraDepth))
+                    {
+                        bestEdgeDist = edgeDist;
+                        nearest = box;
+                    }
+                }
+            }
+
+            return nearest != null ? nearest.MonsterId : 0;
+        }
+    }
+
+    /// <summary>
+    /// Pure 2D screen-space animated dashed line & directional arrowhead polygon generator.
     /// Guarantees positive signed area on all polygons for FairyGUI PolygonMesh ear-clipping.
     /// </summary>
     public static class DashGeometry
     {
         /// <summary>
-        /// Generates a sequence of 4-vertex dash quads along the segment from <paramref name="start"/>
-        /// to <paramref name="end"/>.
+        /// Generates a sequence of 4-vertex dash quads along <paramref name="start"/> -&gt; <paramref name="end"/>.
+        /// Increasing <paramref name="phaseOffset"/> smoothly marches the dashes forward in the travel direction.
         /// </summary>
         public static List<Point2[]> BuildDashedSegments(
             Point2 start,
@@ -39,7 +200,8 @@ namespace MonsterPathPredictor.Core
             float gapLength,
             float thickness,
             float trimStart = 0f,
-            float trimEnd = 0f)
+            float trimEnd = 0f,
+            float phaseOffset = 0f)
         {
             var quads = new List<Point2[]>();
             if (dashLength <= 0.5f || thickness <= 0.25f) return quads;
@@ -66,26 +228,36 @@ namespace MonsterPathPredictor.Core
             float period = dashLength + gapLength;
             if (period <= 0.5f) return quads;
 
-            float cursor = usableStart;
+            float shift = 0f;
+            if (!float.IsNaN(phaseOffset) && !float.IsInfinity(phaseOffset))
+            {
+                shift = phaseOffset % period;
+                if (shift < 0f) shift += period;
+            }
+
+            // Start one period before usableStart so emerging dashes slide smoothly in from the start
+            float cursor = usableStart + shift - period;
             int safety = 0;
             while (cursor < usableEnd - 0.5f && safety++ < 256)
             {
+                float segStart = Math.Max(usableStart, cursor);
                 float segEnd = Math.Min(usableEnd, cursor + dashLength);
-                if (segEnd - cursor < 1.5f) break;
-
-                float x0 = start.X + ux * cursor;
-                float y0 = start.Y + uy * cursor;
-                float x1 = start.X + ux * segEnd;
-                float y1 = start.Y + uy * segEnd;
-
-                var quad = EnsurePositiveWinding(new[]
+                if (segEnd - segStart >= 1.5f)
                 {
-                    new Point2(x0 + nx, y0 + ny),
-                    new Point2(x1 + nx, y1 + ny),
-                    new Point2(x1 - nx, y1 - ny),
-                    new Point2(x0 - nx, y0 - ny)
-                });
-                quads.Add(quad);
+                    float x0 = start.X + ux * segStart;
+                    float y0 = start.Y + uy * segStart;
+                    float x1 = start.X + ux * segEnd;
+                    float y1 = start.Y + uy * segEnd;
+
+                    var quad = EnsurePositiveWinding(new[]
+                    {
+                        new Point2(x0 + nx, y0 + ny),
+                        new Point2(x1 + nx, y1 + ny),
+                        new Point2(x1 - nx, y1 - ny),
+                        new Point2(x0 - nx, y0 - ny)
+                    });
+                    quads.Add(quad);
+                }
 
                 cursor += period;
             }
@@ -93,9 +265,6 @@ namespace MonsterPathPredictor.Core
             return quads;
         }
 
-        /// <summary>
-        /// Generates a crisp 3-vertex directional arrowhead positioned along <paramref name="start"/> -> <paramref name="end"/>.
-        /// </summary>
         public static Point2[] BuildArrowHead(
             Point2 start,
             Point2 end,
@@ -131,9 +300,6 @@ namespace MonsterPathPredictor.Core
             });
         }
 
-        /// <summary>
-        /// Computes a screen-space label anchor offset slightly perpendicular to the edge so fork exit labels never overlap.
-        /// </summary>
         public static Point2 ComputeEdgeLabelAnchor(Point2 from, Point2 to, float alongRatio = 0.52f, float lateralOffset = 0f)
         {
             float dx = to.X - from.X;

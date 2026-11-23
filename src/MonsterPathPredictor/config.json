@@ -1,0 +1,79 @@
+{
+  "enabled": true,
+  "previewSteps": 12,
+  "dashLength": 12.0,
+  "gapLength": 8.0,
+  "lineWidth": 4.5,
+  "heightOffset": 0.45,
+  "fontSize": 18,
+  "clickRadius": 48.0,
+  "clearOnEmptyClick": true,
+  "showReasonTag": true,
+  "showDeterministicPercent": false,
+  "simulateCombatOnFork": true,
+  "allowNonAggressiveMonsters": true,
+  "clearHotkey": "Escape",
+  "excludedPlayerBuffIds": "",
+  "_comments": {
+    "enabled": {
+      "zh-Hans": "是否启用怪物寻路预测模组",
+      "en": "Enable the Monster Path Predictor mod"
+    },
+    "previewSteps": {
+      "zh-Hans": "点击怪物后向前延伸预测的格数 X（范围 1-30，默认 12）",
+      "en": "Number of tiles (X) to forecast ahead from the selected monster (1-30, default 12)"
+    },
+    "dashLength": {
+      "zh-Hans": "虚线单段长度（像素，范围 4-40）",
+      "en": "Length of each dash segment in UI pixels (4-40)"
+    },
+    "gapLength": {
+      "zh-Hans": "虚线间隔长度（像素，范围 2-30）",
+      "en": "Gap length between dash segments in UI pixels (2-30)"
+    },
+    "lineWidth": {
+      "zh-Hans": "虚线线条粗细（像素，范围 1.5-14）",
+      "en": "Stroke thickness of dashed preview lines (1.5-14)"
+    },
+    "heightOffset": {
+      "zh-Hans": "路线与标签相对地块的 3D 高度偏移（0-5）",
+      "en": "3D world Y height offset above tiles (0-5)"
+    },
+    "fontSize": {
+      "zh-Hans": "岔路口概率百分比与说明标签字号（12-36）",
+      "en": "Font size for fork probability badges and tags (12-36)"
+    },
+    "clickRadius": {
+      "zh-Hans": "点击选中怪物时的屏幕命中半径（像素，20-120）",
+      "en": "Screen-space hit radius for clicking monsters (20-120)"
+    },
+    "clearOnEmptyClick": {
+      "zh-Hans": "点击棋盘空白处时自动取消当前选中的怪物",
+      "en": "Clear selected monster when clicking empty board space"
+    },
+    "showReasonTag": {
+      "zh-Hans": "在岔路口旁显示简短判定依据（如 红箭 / 追P1 / 掉头平分）",
+      "en": "Show concise decision tags at forks (e.g. Red / Chase P1 / 50-50)"
+    },
+    "showDeterministicPercent": {
+      "zh-Hans": "岔路口只有唯一确定方向时是否也显示 100%（多分支时始终显示百分比）",
+      "en": "Also show 100% at deterministic forks (multi-branch forks always show percentages)"
+    },
+    "simulateCombatOnFork": {
+      "zh-Hans": "路径经过站有存活玩家的岔路口时，是否按战后续走（红蓝箭头）推演后续路线",
+      "en": "When a predicted path passes a fork occupied by a living player, apply post-combat Red>Blue priority"
+    },
+    "allowNonAggressiveMonsters": {
+      "zh-Hans": "允许点击小偷等非普通主动攻击怪（会在顶部提示非主动怪）",
+      "en": "Allow selecting non-aggressive monsters (with an informational banner note)"
+    },
+    "clearHotkey": {
+      "zh-Hans": "快速取消当前预览的快捷键（Unity KeyCode 名称，默认 Escape）",
+      "en": "Hotkey to clear active preview (Unity KeyCode name, default Escape)"
+    },
+    "excludedPlayerBuffIds": {
+      "zh-Hans": "额外排除出怪物追踪名单的玩家 Buff ID（逗号分隔，例如隐身类特殊 Buff）",
+      "en": "Extra comma-separated player Buff IDs excluded from monster tracking"
+    }
+  }
+}

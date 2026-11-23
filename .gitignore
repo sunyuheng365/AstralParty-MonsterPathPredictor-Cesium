@@ -1,0 +1,17 @@
+# IDE / build outputs
+.vs/
+.vscode/
+.idea/
+bin/
+obj/
+**/bin/
+**/obj/
+dist/
+*.user
+*.suo
+*.pdb
+*.cache
+*.zip
+
+# Proprietary game & SDK reference DLLs (not committed to GitHub)
+refs/

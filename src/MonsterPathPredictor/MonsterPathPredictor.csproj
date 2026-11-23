@@ -1,0 +1,47 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <AssemblyName>MonsterPathPredictor</AssemblyName>
+    <RootNamespace>MonsterPathPredictor</RootNamespace>
+    <Version>1.0.0</Version>
+    <RefsDir Condition="'$(RefsDir)' == ''">$(MSBuildThisFileDirectory)..\..\refs\</RefsDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="CesiumLoader.SDK">
+      <HintPath>$(RefsDir)CesiumLoader.SDK.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="AstralParty.Runtime">
+      <HintPath>$(RefsDir)AstralParty.Runtime.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(RefsDir)UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UniTask">
+      <HintPath>$(RefsDir)UniTask.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Google.Protobuf.Runtime">
+      <HintPath>$(RefsDir)Google.Protobuf.Runtime.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="MonsterPathPredictor.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="config.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <Target Name="VerifyRefs" BeforeTargets="PrepareForBuild">
+    <ItemGroup>
+      <_MissingRef Include="@(Reference)" Condition="'%(Reference.HintPath)' != '' and !Exists('%(Reference.HintPath)')" />
+    </ItemGroup>
+    <Error Condition="'@(_MissingRef)' != ''"
+           Text="Missing compile-time references in $(RefsDir): @(_MissingRef->'%(HintPath)', '; '). Place CesiumLoader.SDK.dll and game ref DLLs into refs/ before building." />
+  </Target>
+</Project>

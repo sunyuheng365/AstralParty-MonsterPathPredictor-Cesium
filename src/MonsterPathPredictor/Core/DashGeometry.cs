@@ -323,9 +323,9 @@ namespace MonsterPathPredictor.Core
         }
 
         /// <summary>
-        /// Liang-Barsky 2D segment clipping against an axis-aligned viewport rectangle.
-        /// Returns false if the segment lies completely outside the rectangle; otherwise outputs the clipped
-        /// endpoints plus the exact distance clipped from <paramref name="a"/> so dash phase stays steady.
+        /// Liang-Barsky 2D segment clipping against an axis-aligned viewport rectangle in double precision
+        /// (prevents float cancellation on extreme off-screen projections like (-2^36, 50) -> (2^36, 50))
+        /// and snaps clipped endpoints onto the hit boundary edge.
         /// </summary>
         public static bool TryClipSegmentToRect(
             Point2 a,
@@ -342,38 +342,108 @@ namespace MonsterPathPredictor.Core
             clippedB = b;
             startTrimPx = 0f;
 
-            float dx = b.X - a.X;
-            float dy = b.Y - a.Y;
-            float t0 = 0f;
-            float t1 = 1f;
+            double ax = a.X, ay = a.Y;
+            double bx = b.X, by = b.Y;
+            double dx = bx - ax;
+            double dy = by - ay;
+            double dMinX = minX, dMinY = minY, dMaxX = maxX, dMaxY = maxY;
+            double t0 = 0.0;
+            double t1 = 1.0;
+            int hitStartEdge = 0; // 1=minX, 2=maxX, 3=minY, 4=maxY
+            int hitEndEdge = 0;
 
-            bool ClipEdge(float p, float q)
+            bool ClipEdge(double p, double q, int edgeId)
             {
-                if (Math.Abs(p) < 1e-6f) return q >= 0f;
-                float r = q / p;
-                if (p < 0f)
+                if (Math.Abs(p) < 1e-12) return q >= 0.0;
+                double r = q / p;
+                if (p < 0.0)
                 {
                     if (r > t1) return false;
-                    if (r > t0) t0 = r;
+                    if (r > t0) { t0 = r; hitStartEdge = edgeId; }
                 }
                 else
                 {
                     if (r < t0) return false;
-                    if (r < t1) t1 = r;
+                    if (r < t1) { t1 = r; hitEndEdge = edgeId; }
                 }
                 return true;
             }
 
-            if (!ClipEdge(-dx, a.X - minX)) return false;
-            if (!ClipEdge(dx, maxX - a.X)) return false;
-            if (!ClipEdge(-dy, a.Y - minY)) return false;
-            if (!ClipEdge(dy, maxY - a.Y)) return false;
+            if (!ClipEdge(-dx, ax - dMinX, 1)) return false;
+            if (!ClipEdge(dx, dMaxX - ax, 2)) return false;
+            if (!ClipEdge(-dy, ay - dMinY, 3)) return false;
+            if (!ClipEdge(dy, dMaxY - ay, 4)) return false;
 
-            float fullLen = (float)Math.Sqrt(dx * dx + dy * dy);
-            startTrimPx = t0 * fullLen;
-            clippedA = new Point2(a.X + t0 * dx, a.Y + t0 * dy);
-            clippedB = new Point2(a.X + t1 * dx, a.Y + t1 * dy);
+            double fullLen = Math.Sqrt(dx * dx + dy * dy);
+            startTrimPx = (float)(t0 * fullLen);
+
+            double x0 = hitStartEdge == 1 ? dMinX : (hitStartEdge == 2 ? dMaxX : (ax + t0 * dx));
+            double y0 = hitStartEdge == 3 ? dMinY : (hitStartEdge == 4 ? dMaxY : (ay + t0 * dy));
+            double x1 = hitEndEdge == 1 ? dMinX : (hitEndEdge == 2 ? dMaxX : (ax + t1 * dx));
+            double y1 = hitEndEdge == 3 ? dMinY : (hitEndEdge == 4 ? dMaxY : (ay + t1 * dy));
+
+            clippedA = new Point2((float)x0, (float)y0);
+            clippedB = new Point2((float)x1, (float)y1);
             return true;
+        }
+
+        /// <summary>
+        /// Clips a 3D world-space segment against the camera near plane defined by
+        /// <c>Dot(P - planeOrigin, planeNormal) >= nearDist</c>.
+        /// Returns false only when both endpoints lie strictly behind the near plane.
+        /// </summary>
+        public static bool TryClipSegmentToNearPlane(
+            float ax, float ay, float az,
+            float bx, float by, float bz,
+            float camX, float camY, float camZ,
+            float fwdX, float fwdY, float fwdZ,
+            float nearDist,
+            out float outAx, out float outAy, out float outAz,
+            out float outBx, out float outBy, out float outBz,
+            out bool clippedStart,
+            out bool clippedEnd)
+        {
+            double dA = ((double)ax - camX) * fwdX + ((double)ay - camY) * fwdY + ((double)az - camZ) * fwdZ - nearDist;
+            double dB = ((double)bx - camX) * fwdX + ((double)by - camY) * fwdY + ((double)bz - camZ) * fwdZ - nearDist;
+
+            clippedStart = false;
+            clippedEnd = false;
+            outAx = ax; outAy = ay; outAz = az;
+            outBx = bx; outBy = by; outBz = bz;
+
+            if (dA < 0.0 && dB < 0.0) return false;
+
+            if (dA < 0.0)
+            {
+                double denom = dB - dA;
+                if (denom <= 1e-12) return false;
+                double t = -dA / denom;
+                outAx = (float)(ax + t * ((double)bx - ax));
+                outAy = (float)(ay + t * ((double)by - ay));
+                outAz = (float)(az + t * ((double)bz - az));
+                clippedStart = true;
+            }
+            else if (dB < 0.0)
+            {
+                double denom = dA - dB;
+                if (denom <= 1e-12) return false;
+                double t = dA / denom;
+                outBx = (float)(ax + t * ((double)bx - ax));
+                outBy = (float)(ay + t * ((double)by - ay));
+                outBz = (float)(az + t * ((double)bz - az));
+                clippedEnd = true;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Computes the dash phase offset for a viewport-clipped sub-segment so the static dash pattern
+        /// aligns pixel-for-pixel with the unclipped edge (independent of camera panning).
+        /// </summary>
+        public static float ComputeClippedDashPhase(float phaseOffset, float origTrimStart, float clippedFromStartPx, float newTrimStart)
+        {
+            return phaseOffset + origTrimStart - clippedFromStartPx - newTrimStart;
         }
 
         private static DashQuad MakePositiveWinding(Point2 a, Point2 b, Point2 c, Point2 d)

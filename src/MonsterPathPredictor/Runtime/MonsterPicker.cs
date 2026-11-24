@@ -43,9 +43,11 @@ namespace MonsterPathPredictor.Runtime
                 return false;
             }
 
-            // 2. Clear hotkey (default Escape): close popup first if open, otherwise clear selection
+            // 2. Clear hotkey (default Escape): cancel any in-flight pointer gesture so releasing the mouse
+            //    cannot immediately re-select a monster, then close popup first if open, otherwise clear selection.
             if (IsHotkeyDown(settings.ClearHotkey))
             {
+                CancelPendingPointer();
                 if (popup != null && popup.IsOpen)
                 {
                     popup.Hide();
@@ -56,6 +58,7 @@ namespace MonsterPathPredictor.Runtime
                     selectedMonsterId = 0;
                     return true;
                 }
+                return false;
             }
 
             bool isDown = InputService.IsMouseButtonPressed(0);

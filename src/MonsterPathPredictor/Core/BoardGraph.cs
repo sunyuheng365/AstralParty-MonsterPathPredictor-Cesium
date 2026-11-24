@@ -35,14 +35,20 @@ namespace MonsterPathPredictor.Core
     public sealed class ShortestPathField
     {
         private readonly Dictionary<int, int> _distances;
+        private readonly Dictionary<int, double> _exactPathCounts;
         private readonly Dictionary<int, double> _logPathCounts;
 
         public int TargetLandId { get; }
 
-        internal ShortestPathField(int targetLandId, Dictionary<int, int> distances, Dictionary<int, double> logPathCounts)
+        internal ShortestPathField(
+            int targetLandId,
+            Dictionary<int, int> distances,
+            Dictionary<int, double> exactPathCounts,
+            Dictionary<int, double> logPathCounts)
         {
             TargetLandId = targetLandId;
             _distances = distances;
+            _exactPathCounts = exactPathCounts;
             _logPathCounts = logPathCounts;
         }
 
@@ -62,9 +68,14 @@ namespace MonsterPathPredictor.Core
             return _logPathCounts.TryGetValue(fromLandId, out double logCount) ? logCount : double.NegativeInfinity;
         }
 
+        /// <summary>
+        /// Exact shortest-path count for all integers representable in IEEE-754 double (exact up to 2^53,
+        /// avoiding log/exp round-trip error such as 7.999999999999998 for 8). Overflows to +Infinity
+        /// beyond double.MaxValue; use <see cref="GetLogPathCount"/> for overflow-free ratio math.
+        /// </summary>
         public double GetPathCount(int fromLandId)
         {
-            return _logPathCounts.TryGetValue(fromLandId, out double logCount) ? Math.Exp(logCount) : 0.0;
+            return _exactPathCounts.TryGetValue(fromLandId, out double count) ? count : 0.0;
         }
     }
 
@@ -164,6 +175,17 @@ namespace MonsterPathPredictor.Core
         public bool IsFork(int landId) => GetValidNeighbors(landId).Count >= 3;
 
         /// <summary>
+        /// Context-aware fork predicate shared by planning and replay certification:
+        /// true on standard junctions (&gt;= 3 neighbors) AND on directed mid-turn splits where
+        /// arriving from <paramref name="fromLandId"/> leaves at least 2 forward exits.
+        /// </summary>
+        public bool IsForkForContext(int landId, int fromLandId, bool isCurrentlyMovingMidTurn)
+        {
+            if (IsFork(landId)) return true;
+            return isCurrentlyMovingMidTurn && GetForwardNeighbors(landId, fromLandId).Count >= 2;
+        }
+
+        /// <summary>
         /// Forward neighbors from <paramref name="landId"/> excluding <paramref name="fromLandId"/> (no U-turn),
         /// preserving the exact raw priority order (first remaining = red priority, second = blue priority).
         /// </summary>
@@ -238,7 +260,7 @@ namespace MonsterPathPredictor.Core
             return false;
         }
 
-        private static double LogAddExp(double a, double b)
+        internal static double LogAddExp(double a, double b)
         {
             if (double.IsNegativeInfinity(a)) return b;
             if (double.IsNegativeInfinity(b)) return a;
@@ -248,21 +270,23 @@ namespace MonsterPathPredictor.Core
         }
 
         /// <summary>
-        /// Computes full-board shortest road distances and overflow-free log-scale equal-length shortest-path counts
-        /// from every reachable tile to <paramref name="targetLandId"/> (including paths that require U-turning).
+        /// Computes full-board shortest road distances and both exact integer (up to 2^53) and overflow-free
+        /// log-scale equal-length shortest-path counts from every reachable tile to <paramref name="targetLandId"/>.
         /// </summary>
         public ShortestPathField ComputeShortestPathsTo(int targetLandId)
         {
             var distances = new Dictionary<int, int>();
+            var exactCounts = new Dictionary<int, double>();
             var logCounts = new Dictionary<int, double>();
 
             if (!Contains(targetLandId))
             {
-                return new ShortestPathField(targetLandId, distances, logCounts);
+                return new ShortestPathField(targetLandId, distances, exactCounts, logCounts);
             }
 
             var queue = new Queue<int>();
             distances[targetLandId] = 0;
+            exactCounts[targetLandId] = 1.0;
             logCounts[targetLandId] = 0.0; // ln(1) = 0
             queue.Enqueue(targetLandId);
 
@@ -270,6 +294,7 @@ namespace MonsterPathPredictor.Core
             {
                 int cur = queue.Dequeue();
                 int curDist = distances[cur];
+                double curExact = exactCounts[cur];
                 double curLogCount = logCounts[cur];
 
                 if (!_reverseAdjacency.TryGetValue(cur, out var predecessors)) continue;
@@ -279,17 +304,19 @@ namespace MonsterPathPredictor.Core
                     if (!distances.TryGetValue(prev, out int prevDist))
                     {
                         distances[prev] = curDist + 1;
+                        exactCounts[prev] = curExact;
                         logCounts[prev] = curLogCount;
                         queue.Enqueue(prev);
                     }
                     else if (prevDist == curDist + 1)
                     {
+                        exactCounts[prev] += curExact;
                         logCounts[prev] = LogAddExp(logCounts[prev], curLogCount);
                     }
                 }
             }
 
-            return new ShortestPathField(targetLandId, distances, logCounts);
+            return new ShortestPathField(targetLandId, distances, exactCounts, logCounts);
         }
 
         public bool SameTopology(BoardGraph other)

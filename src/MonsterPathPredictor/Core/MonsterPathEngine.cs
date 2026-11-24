@@ -22,9 +22,23 @@ namespace MonsterPathPredictor.Core
     /// </summary>
     public static class MonsterPathEngine
     {
+        private readonly struct StepTransition
+        {
+            public readonly int NextLandId;
+            public readonly double Prob;
+            public readonly double LogProb;
+
+            public StepTransition(int nextLandId, double prob, double logProb)
+            {
+                NextLandId = nextLandId;
+                Prob = prob;
+                LogProb = logProb;
+            }
+        }
+
         private struct StepOutcome
         {
-            public List<(int NextLandId, double Prob)> Transitions;
+            public List<StepTransition> Transitions;
             public bool IsForkDecision;
             public ForkReasonKind Reason;
             public string SummaryLabel;
@@ -221,6 +235,12 @@ namespace MonsterPathPredictor.Core
                                 encounteredOnThisTile = true;
                                 postCombatNow = true;
                                 RecordCombat(combatMap, state.LandId, step, arrivalProb, stealTargets, isSteal: true);
+
+                                if (options.PostCombatMode == PostCombatMode.StopAtFirstCombat)
+                                {
+                                    AccumulateEndpoint(endpointMap, state.LandId, step, false, true, true, arrivalProb);
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -329,6 +349,7 @@ namespace MonsterPathPredictor.Core
                         {
                             RecordCombat(combatMap, finalState.Key.LandId, maxSteps, finalState.Value, stealTargets, isSteal: true);
                             afterCombat = true;
+                            stoppedCombat = (options.PostCombatMode == PostCombatMode.StopAtFirstCombat);
                         }
                     }
                 }
@@ -422,14 +443,14 @@ namespace MonsterPathPredictor.Core
             int cur = monster.CurrentLandId;
             int from = monster.FromLandId;
             var forward = board.GetForwardNeighbors(cur, from);
-            bool isFork = board.IsFork(cur) || (monster.IsCurrentlyMovingMidTurn && forward.Count >= 2);
+            bool isFork = board.IsForkForContext(cur, from, monster.IsCurrentlyMovingMidTurn);
 
             // 0. Taunt override (嘲讽 — allows overriding facing / U-turning before combat at turn start or forks;
             //    matches DecideMidWalkStep so straight-road continuation past an unattackable taunter never diverges).
             if ((!monster.IsCurrentlyMovingMidTurn || isFork) &&
                 !monster.JustFoughtOnCurrentFork && !monster.HasLaunchedFightThisTurn &&
                 monster.IsTaunted && monster.TauntTargetPlayerId != 0 &&
-                TryDecideTauntStep(board, cur, monster.TauntTargetPlayerId, activePlayers, cache, out var tauntOutcome))
+                TryDecideTauntStep(board, cur, isFork, monster.TauntTargetPlayerId, activePlayers, cache, out var tauntOutcome))
             {
                 return tauntOutcome;
             }
@@ -450,6 +471,7 @@ namespace MonsterPathPredictor.Core
                     TryDecideMarkedTargetTurnStartStep(
                         board,
                         cur,
+                        isFork,
                         excludedTurnStartLand,
                         marked,
                         cache,
@@ -668,7 +690,7 @@ namespace MonsterPathPredictor.Core
             // Ongoing taunt override at mid-walk forks before combat (consistent with DecideFirstStep)
             if (!isAfterCombat && !combatHappenedOnThisTile && monster != null &&
                 monster.IsTaunted && monster.TauntTargetPlayerId != 0 &&
-                TryDecideTauntStep(board, landId, monster.TauntTargetPlayerId, activePlayers, cache, out var midTauntOutcome))
+                TryDecideTauntStep(board, landId, isForkDecision: true, monster.TauntTargetPlayerId, activePlayers, cache, out var midTauntOutcome))
             {
                 return midTauntOutcome;
             }
@@ -685,6 +707,7 @@ namespace MonsterPathPredictor.Core
                     TryDecideMarkedTargetTurnStartStep(
                         board,
                         landId,
+                        isForkDecision: true,
                         excludedTurnStartLand,
                         marked,
                         cache,
@@ -713,8 +736,8 @@ namespace MonsterPathPredictor.Core
             var forward = board.GetForwardNeighbors(forkLandId, incomingLandId);
             if (forward.Count == 0) return EmptyOutcome();
 
-            var exitProbs = new Dictionary<int, double>(forward.Count);
-            for (int i = 0; i < forward.Count; i++) exitProbs[forward[i]] = 0.0;
+            var exitLogProbs = new Dictionary<int, double>(forward.Count);
+            for (int i = 0; i < forward.Count; i++) exitLogProbs[forward[i]] = double.NegativeInfinity;
 
             var allNeighbors = board.GetValidNeighbors(forkLandId);
             bool incomingIsNeighbor = board.IsValidNeighbor(forkLandId, incomingLandId);
@@ -759,30 +782,20 @@ namespace MonsterPathPredictor.Core
             // their single top-ranked CrimeNum > 0 target (ranked[0]); if it lies strictly behind, no cascade occurs.
             bool restrictToTopTargetOnly = monster != null && monster.RequiresCrimeTarget;
 
-            double remainingProb = 1.0;
+            double logRemainingProb = 0.0; // ln(1.0) = 0; stays finite even when Exp underflows < 4.9e-324
             TrackedPlayer primaryTarget = null;
             int primaryDist = 0;
             bool usedMultiShortestPath = false;
 
-            for (int i = 0; i < ranked.Count && remainingProb > 0.0; i++)
+            for (int i = 0; i < ranked.Count && !double.IsNegativeInfinity(logRemainingProb); i++)
             {
                 if (restrictToTopTargetOnly && i > 0) break;
                 var item = ranked[i];
                 int targetDist = item.Dist;
                 var field = item.Field;
 
-                double maxLog = double.NegativeInfinity;
-                for (int j = 0; j < allNeighbors.Count; j++)
-                {
-                    int nb = allNeighbors[j];
-                    if (field.GetDistance(nb) != targetDist - 1) continue;
-                    double logC = field.GetLogPathCount(nb);
-                    if (logC > maxLog) maxLog = logC;
-                }
-                if (double.IsNegativeInfinity(maxLog)) continue;
-
-                double totalLots = 0.0;
-                double uTurnLots = 0.0;
+                double logTotalLots = double.NegativeInfinity;
+                double logUTurnLots = double.NegativeInfinity;
                 int forwardLotExits = 0;
 
                 for (int j = 0; j < allNeighbors.Count; j++)
@@ -791,17 +804,15 @@ namespace MonsterPathPredictor.Core
                     if (field.GetDistance(nb) != targetDist - 1) continue;
                     double logC = field.GetLogPathCount(nb);
                     if (double.IsNegativeInfinity(logC)) continue;
-                    double lots = Math.Exp(logC - maxLog);
-                    if (lots <= 0.0) continue;
 
-                    totalLots += lots;
+                    logTotalLots = BoardGraph.LogAddExp(logTotalLots, logC);
                     if (incomingIsNeighbor && nb == incomingLandId)
-                        uTurnLots += lots;
+                        logUTurnLots = BoardGraph.LogAddExp(logUTurnLots, logC);
                     else
                         forwardLotExits++;
                 }
 
-                if (totalLots <= 0.0) continue;
+                if (double.IsNegativeInfinity(logTotalLots)) continue;
 
                 if (forwardLotExits > 0)
                 {
@@ -810,7 +821,7 @@ namespace MonsterPathPredictor.Core
                         primaryTarget = item.Player;
                         primaryDist = targetDist;
                     }
-                    if (forwardLotExits > 1 || uTurnLots > 0.0)
+                    if (forwardLotExits > 1 || !double.IsNegativeInfinity(logUTurnLots))
                     {
                         usedMultiShortestPath = true;
                     }
@@ -821,35 +832,40 @@ namespace MonsterPathPredictor.Core
                         if (field.GetDistance(fwd) != targetDist - 1) continue;
                         double logC = field.GetLogPathCount(fwd);
                         if (double.IsNegativeInfinity(logC)) continue;
-                        double lots = Math.Exp(logC - maxLog);
-                        if (lots <= 0.0) continue;
-                        exitProbs[fwd] += remainingProb * (lots / totalLots);
+                        double logContrib = logRemainingProb + (logC - logTotalLots);
+                        exitLogProbs[fwd] = BoardGraph.LogAddExp(exitLogProbs[fwd], logContrib);
                     }
                 }
 
-                remainingProb *= (uTurnLots / totalLots);
+                logRemainingProb = double.IsNegativeInfinity(logUTurnLots)
+                    ? double.NegativeInfinity
+                    : logRemainingProb + (logUTurnLots - logTotalLots);
             }
 
             bool usedUTurnFallback = false;
-            if (remainingProb > 0.0)
+            if (!double.IsNegativeInfinity(logRemainingProb))
             {
                 usedUTurnFallback = true;
-                double share = remainingProb / forward.Count;
+                double logShare = logRemainingProb - Math.Log(forward.Count);
                 for (int i = 0; i < forward.Count; i++)
                 {
-                    exitProbs[forward[i]] += share;
+                    int fwd = forward[i];
+                    exitLogProbs[fwd] = BoardGraph.LogAddExp(exitLogProbs[fwd], logShare);
                 }
             }
 
-            var transitions = new List<(int NextLandId, double Prob)>(forward.Count);
+            var transitions = new List<StepTransition>(forward.Count);
             for (int i = 0; i < forward.Count; i++)
             {
                 int fwd = forward[i];
-                double p = exitProbs[fwd];
-                if (p > 0.0) transitions.Add((fwd, p));
+                double logP = exitLogProbs[fwd];
+                if (!double.IsNegativeInfinity(logP))
+                {
+                    transitions.Add(new StepTransition(fwd, Math.Min(1.0, Math.Exp(logP)), logP));
+                }
             }
 
-            transitions.Sort((a, b) => b.Prob.CompareTo(a.Prob));
+            transitions.Sort((a, b) => b.LogProb.CompareTo(a.LogProb));
 
             string prefix = isAfterCombat ? "续行" : string.Empty;
             ForkReasonKind reason;
@@ -919,6 +935,7 @@ namespace MonsterPathPredictor.Core
                     {
                         NextLandId = tr.NextLandId,
                         ConditionalProbability = tr.Prob,
+                        LogConditionalProbability = tr.LogProb,
                         CumulativeProbability = Math.Min(1.0, arrivalProb * tr.Prob),
                         IsGlobalRedArrow = (tr.NextLandId == globalRed)
                     });
@@ -928,13 +945,20 @@ namespace MonsterPathPredictor.Core
                 return;
             }
 
-            double newTotalArrival = pf.ArrivalProbability + arrivalProb;
+            double oldArrival = pf.ArrivalProbability;
+            double newTotalArrival = oldArrival + arrivalProb;
             pf.ArrivalProbability = Math.Min(1.0, newTotalArrival);
+            double oldLogArrival = oldArrival > 0.0 ? Math.Log(oldArrival) : double.NegativeInfinity;
+            double newLogArrival = arrivalProb > 0.0 ? Math.Log(arrivalProb) : double.NegativeInfinity;
+            double totalLogArrival = BoardGraph.LogAddExp(oldLogArrival, newLogArrival);
 
+            var updatedExitIds = new HashSet<int>();
             for (int i = 0; i < outcome.Transitions.Count; i++)
             {
                 var tr = outcome.Transitions[i];
+                updatedExitIds.Add(tr.NextLandId);
                 double addedMass = arrivalProb * tr.Prob;
+                double addedLogMass = newLogArrival + tr.LogProb;
                 ForkExitPrediction existing = null;
                 for (int j = 0; j < pf.Exits.Count; j++)
                 {
@@ -949,6 +973,7 @@ namespace MonsterPathPredictor.Core
                     pf.Exits.Add(new ForkExitPrediction
                     {
                         NextLandId = tr.NextLandId,
+                        LogConditionalProbability = double.IsNegativeInfinity(totalLogArrival) ? tr.LogProb : addedLogMass - totalLogArrival,
                         CumulativeProbability = Math.Min(1.0, addedMass),
                         IsGlobalRedArrow = (tr.NextLandId == globalRed)
                     });
@@ -956,6 +981,22 @@ namespace MonsterPathPredictor.Core
                 else
                 {
                     existing.CumulativeProbability = Math.Min(1.0, existing.CumulativeProbability + addedMass);
+                    if (!double.IsNegativeInfinity(totalLogArrival))
+                    {
+                        double prevLogMass = oldLogArrival + existing.LogConditionalProbability;
+                        existing.LogConditionalProbability = BoardGraph.LogAddExp(prevLogMass, addedLogMass) - totalLogArrival;
+                    }
+                }
+            }
+
+            if (!double.IsNegativeInfinity(totalLogArrival))
+            {
+                for (int j = 0; j < pf.Exits.Count; j++)
+                {
+                    if (!updatedExitIds.Contains(pf.Exits[j].NextLandId))
+                    {
+                        pf.Exits[j].LogConditionalProbability = (oldLogArrival + pf.Exits[j].LogConditionalProbability) - totalLogArrival;
+                    }
                 }
             }
 
@@ -965,7 +1006,11 @@ namespace MonsterPathPredictor.Core
                 {
                     pf.Exits[i].ConditionalProbability = Math.Min(1.0, pf.Exits[i].CumulativeProbability / newTotalArrival);
                 }
-                pf.Exits.Sort((a, b) => b.ConditionalProbability.CompareTo(a.ConditionalProbability));
+                pf.Exits.Sort((a, b) =>
+                {
+                    int lc = b.LogConditionalProbability.CompareTo(a.LogConditionalProbability);
+                    return lc != 0 ? lc : b.ConditionalProbability.CompareTo(a.ConditionalProbability);
+                });
             }
 
             if (outcome.Reason != pf.ReasonKind || !string.Equals(outcome.SummaryLabel, pf.SummaryLabel, StringComparison.Ordinal))
@@ -1007,6 +1052,7 @@ namespace MonsterPathPredictor.Core
         private static bool TryDecideTauntStep(
             BoardGraph board,
             int curLandId,
+            bool isForkDecision,
             long tauntTargetPlayerId,
             List<TrackedPlayer> activePlayers,
             Dictionary<int, ShortestPathField> cache,
@@ -1033,40 +1079,31 @@ namespace MonsterPathPredictor.Core
             if (dist == int.MaxValue || dist <= 0) return false;
 
             var all = board.GetValidNeighbors(curLandId);
-            double maxLog = double.NegativeInfinity;
-            for (int i = 0; i < all.Count; i++)
-            {
-                int nb = all[i];
-                if (field.GetDistance(nb) != dist - 1) continue;
-                double logC = field.GetLogPathCount(nb);
-                if (logC > maxLog) maxLog = logC;
-            }
-            if (double.IsNegativeInfinity(maxLog)) return false;
-
-            var bestExits = new List<(int NextLandId, double Lots)>();
-            double totalLots = 0.0;
+            var bestExits = new List<(int NextLandId, double LogC)>();
+            double logTotal = double.NegativeInfinity;
             for (int i = 0; i < all.Count; i++)
             {
                 int nb = all[i];
                 if (field.GetDistance(nb) != dist - 1) continue;
                 double logC = field.GetLogPathCount(nb);
                 if (double.IsNegativeInfinity(logC)) continue;
-                double lots = Math.Exp(logC - maxLog);
-                if (lots <= 0.0) continue;
-                bestExits.Add((nb, lots));
-                totalLots += lots;
+                bestExits.Add((nb, logC));
+                logTotal = BoardGraph.LogAddExp(logTotal, logC);
             }
-            if (bestExits.Count == 0 || totalLots <= 0.0) return false;
+            if (bestExits.Count == 0 || double.IsNegativeInfinity(logTotal)) return false;
 
-            var transitions = new List<(int NextLandId, double Prob)>(bestExits.Count);
+            var transitions = new List<StepTransition>(bestExits.Count);
             for (int i = 0; i < bestExits.Count; i++)
-                transitions.Add((bestExits[i].NextLandId, bestExits[i].Lots / totalLots));
-            transitions.Sort((a, b) => b.Prob.CompareTo(a.Prob));
+            {
+                double logP = bestExits[i].LogC - logTotal;
+                transitions.Add(new StepTransition(bestExits[i].NextLandId, Math.Min(1.0, Math.Exp(logP)), logP));
+            }
+            transitions.Sort((a, b) => b.LogProb.CompareTo(a.LogProb));
 
             outcome = new StepOutcome
             {
                 Transitions = transitions,
-                IsForkDecision = board.IsFork(curLandId),
+                IsForkDecision = isForkDecision,
                 Reason = ForkReasonKind.TauntChase,
                 SummaryLabel = "嘲讽·追" + target.SeatTag + "·距" + dist
             };
@@ -1138,6 +1175,7 @@ namespace MonsterPathPredictor.Core
         private static bool TryDecideMarkedTargetTurnStartStep(
             BoardGraph board,
             int curLandId,
+            bool isForkDecision,
             int excludeLandId,
             List<TrackedPlayer> markedPlayers,
             Dictionary<int, ShortestPathField> cache,
@@ -1175,40 +1213,31 @@ namespace MonsterPathPredictor.Core
             if (bestTarget == null || bestField == null) return false;
 
             var all = board.GetValidNeighbors(curLandId);
-            double maxLog = double.NegativeInfinity;
-            for (int i = 0; i < all.Count; i++)
-            {
-                int nb = all[i];
-                if (bestField.GetDistance(nb) != bestDist - 1) continue;
-                double logC = bestField.GetLogPathCount(nb);
-                if (logC > maxLog) maxLog = logC;
-            }
-            if (double.IsNegativeInfinity(maxLog)) return false;
-
-            var bestExits = new List<(int NextLandId, double Lots)>();
-            double totalLots = 0.0;
+            var bestExits = new List<(int NextLandId, double LogC)>();
+            double logTotal = double.NegativeInfinity;
             for (int i = 0; i < all.Count; i++)
             {
                 int nb = all[i];
                 if (bestField.GetDistance(nb) != bestDist - 1) continue;
                 double logC = bestField.GetLogPathCount(nb);
                 if (double.IsNegativeInfinity(logC)) continue;
-                double lots = Math.Exp(logC - maxLog);
-                if (lots <= 0.0) continue;
-                bestExits.Add((nb, lots));
-                totalLots += lots;
+                bestExits.Add((nb, logC));
+                logTotal = BoardGraph.LogAddExp(logTotal, logC);
             }
-            if (bestExits.Count == 0 || totalLots <= 0.0) return false;
+            if (bestExits.Count == 0 || double.IsNegativeInfinity(logTotal)) return false;
 
-            var transitions = new List<(int NextLandId, double Prob)>(bestExits.Count);
+            var transitions = new List<StepTransition>(bestExits.Count);
             for (int i = 0; i < bestExits.Count; i++)
-                transitions.Add((bestExits[i].NextLandId, bestExits[i].Lots / totalLots));
-            transitions.Sort((a, b) => b.Prob.CompareTo(a.Prob));
+            {
+                double logP = bestExits[i].LogC - logTotal;
+                transitions.Add(new StepTransition(bestExits[i].NextLandId, Math.Min(1.0, Math.Exp(logP)), logP));
+            }
+            transitions.Sort((a, b) => b.LogProb.CompareTo(a.LogProb));
 
             outcome = new StepOutcome
             {
                 Transitions = transitions,
-                IsForkDecision = board.IsFork(curLandId),
+                IsForkDecision = isForkDecision,
                 Reason = ForkReasonKind.MarkedTargetChase,
                 SummaryLabel = labelPrefix + "·" + bestTarget.SeatTag + "·距" + bestDist
             };
@@ -1376,13 +1405,13 @@ namespace MonsterPathPredictor.Core
                 map[key] = prob;
         }
 
-        private static StepOutcome EmptyOutcome() => new StepOutcome { Transitions = new List<(int, double)>(0) };
+        private static StepOutcome EmptyOutcome() => new StepOutcome { Transitions = new List<StepTransition>(0) };
 
         private static StepOutcome SingleTransition(int nextLandId, bool isForkDecision, ForkReasonKind reason, string label)
         {
             return new StepOutcome
             {
-                Transitions = new List<(int, double)>(1) { (nextLandId, 1.0) },
+                Transitions = new List<StepTransition>(1) { new StepTransition(nextLandId, 1.0, 0.0) },
                 IsForkDecision = isForkDecision,
                 Reason = reason,
                 SummaryLabel = label
@@ -1391,9 +1420,10 @@ namespace MonsterPathPredictor.Core
 
         private static StepOutcome UniformSplit(IReadOnlyList<int> exits, ForkReasonKind reason, string label)
         {
-            var list = new List<(int, double)>(exits.Count);
+            var list = new List<StepTransition>(exits.Count);
             double p = 1.0 / exits.Count;
-            for (int i = 0; i < exits.Count; i++) list.Add((exits[i], p));
+            double logP = -Math.Log(exits.Count);
+            for (int i = 0; i < exits.Count; i++) list.Add(new StepTransition(exits[i], p, logP));
             return new StepOutcome
             {
                 Transitions = list,

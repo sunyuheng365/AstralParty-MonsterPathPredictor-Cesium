@@ -39,12 +39,22 @@ namespace MonsterPathPredictor.ReplayCertifier
         }
 
         /// <summary>
-        /// Structural + lifecycle integrity check for a raw replay stream (no arbitrary byte-size cutoff).
-        /// Verifies non-truncated framing, valid 1003 -> 1016 lifecycle, non-empty state payloads, and optional
-        /// protocol decoding of boundary frames (1003/1016 and pre/post 1040).
+        /// Full structural, lifecycle, and state-frame decode integrity check (no arbitrary byte-size cutoff).
+        /// Verifies non-truncated framing, valid 1003 -> 1016 lifecycle, non-empty state payloads, decodability of
+        /// EVERY intermediate state frame (not just 1003/1016), and matching non-empty 1016.ReplayId.
         /// </summary>
         public static bool HasValidFrameStream(byte[] bytes, IProtocolDecoder decoder = null, string expectedReplayId = null)
         {
+            return HasValidFrameStream(bytes, decoder, expectedReplayId, out _);
+        }
+
+        public static bool HasValidFrameStream(
+            byte[] bytes,
+            IProtocolDecoder decoder,
+            string expectedReplayId,
+            out string verifiedReplayId)
+        {
+            verifiedReplayId = null;
             var (frames, isTruncated) = ReadFrames(bytes);
             if (isTruncated || frames.Count == 0) return false;
 
@@ -89,20 +99,50 @@ namespace MonsterPathPredictor.ReplayCertifier
                     {
                         dynamic fin = decoder.TryDecode("party.protocol.GameFinishS2C", payload);
                         if (fin == null) return false;
-                        if (!string.IsNullOrWhiteSpace(expectedReplayId))
+                        string finReplayId = null;
+                        try { finReplayId = (string)fin.ReplayId; } catch { }
+                        finReplayId = finReplayId?.Trim();
+                        if (!string.IsNullOrEmpty(finReplayId))
                         {
-                            string finReplayId = null;
-                            try { finReplayId = (string)fin.ReplayId; } catch { }
-                            finReplayId = finReplayId?.Trim();
-                            if (!string.IsNullOrEmpty(finReplayId) &&
+                            verifiedReplayId = finReplayId;
+                            if (!string.IsNullOrWhiteSpace(expectedReplayId) &&
                                 !string.Equals(finReplayId, expectedReplayId, StringComparison.Ordinal))
                                 return false;
                         }
                     }
                     state = StreamLifecycleState.Finished;
+                    continue;
+                }
+
+                // Decode EVERY intermediate state frame during Running so corrupt mid-stream payloads
+                // can never pass CDN preflight, block healthy backup CDNs, or hide under SkippedNonPve/MissingMap.
+                if (decoder != null && isState)
+                {
+                    if (!CanDecodeRunningStateFrame(cmd, payload, decoder)) return false;
                 }
             }
             return state == StreamLifecycleState.Finished;
+        }
+
+        private static bool CanDecodeRunningStateFrame(int cmd, byte[] payload, IProtocolDecoder decoder)
+        {
+            switch (cmd)
+            {
+                case 1113:
+                {
+                    dynamic snap = decoder.TryDecode("party.protocol.ReplaySnapshotS2C", payload);
+                    return snap?.Room != null;
+                }
+                case 1018: return decoder.TryDecode("party.protocol.MonsterRefreshS2C", payload) != null;
+                case 5022: return decoder.TryDecode("party.protocol.ThrowDiceS2C", payload) != null;
+                case 1040: return decoder.TryDecode("party.protocol.UpdateHeroAttrS2C", payload) != null;
+                case 1096: return decoder.TryDecode("party.protocol.HeroSkillMoveEffectS2C", payload) != null;
+                case 5214: return decoder.TryDecode("party.protocol.MonsterPursuitS2C", payload) != null;
+                case 1007: return decoder.TryDecode("party.protocol.BattleS2C", payload) != null;
+                case 1115: return decoder.TryDecode("party.protocol.ReplayDieS2C", payload) != null;
+                case 5028: return decoder.TryDecode("party.protocol.MoveS2C", payload) != null;
+                default: return true;
+            }
         }
 
         private static int[] ToIntArray(IEnumerable items)
@@ -305,10 +345,16 @@ namespace MonsterPathPredictor.ReplayCertifier
 
                     // Record displacement (From -> To) pair for BOTH 1040.Place and 1096.Place so subsequent
                     // MoveS2C echoes (standalone or prefix-merged) are stripped accurately without false illegal edges.
+                    // Leaving a tile ALWAYS clears any prior PendingSkillMove* tag immediately so returning to the old
+                    // tile via an ordinary Place can NEVER reactivate an expired skill tag.
                     if (tileChanged)
                     {
                         target.SkillDisplacedFromNode = oldNode;
                         target.SkillDisplacedToNode = newNode;
+                        target.PendingSkillMoveKind = SkillMoveKind.None;
+                        target.PendingSkillMoveLandId = -1;
+                        target.PendingSkillMovePushDirId = -1;
+                        target.PendingSkillMovePushFromId = -1;
                     }
 
                     if (target.IsMonster && displacementKind != SkillMoveKind.None && newNode >= 0)

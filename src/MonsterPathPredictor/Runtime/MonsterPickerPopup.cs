@@ -138,6 +138,10 @@ namespace MonsterPathPredictor.Runtime
             if (_pageIndex >= totalPages) _pageIndex = totalPages - 1;
             if (_pageIndex < 0) _pageIndex = 0;
 
+            // Always re-clamp position to current GRoot bounds BEFORE signature early-return so shrinking the
+            // game window immediately brings the popup back inside the visible viewport.
+            if (_positioned) ClampToStage();
+
             string sig = BuildSignature(visible, selectedMonsterId, settings, _pageIndex, totalPages);
             if (sig == _lastSignature) return;
             _lastSignature = sig;

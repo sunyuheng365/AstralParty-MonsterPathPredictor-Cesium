@@ -405,6 +405,7 @@ namespace MonsterPathPredictor.Runtime
             _selectedMissingSince = DateTime.MinValue;
             _cachedPlan = null;
             _renderer.HideAll();
+            _renderer.ClearStableHeaderCache();
         }
 
         private void ResetBattleState()

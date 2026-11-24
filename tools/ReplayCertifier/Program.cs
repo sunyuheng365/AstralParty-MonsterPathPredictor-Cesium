@@ -215,7 +215,49 @@ namespace MonsterPathPredictor.ReplayCertifier
                 return false;
             }
 
+            if (!opts.SelfTest && HasInputOutputPathConflict(opts, out string conflictErr))
+            {
+                error = conflictErr;
+                return false;
+            }
+
             return true;
+        }
+
+        private static bool HasInputOutputPathConflict(CliOptions opts, out string error)
+        {
+            error = null;
+            string[] outputs = { opts.JsonOut, opts.MdOut };
+            string[] outputFlags = { "--json-out", "--md-out" };
+            for (int i = 0; i < outputs.Length; i++)
+            {
+                string outPath = outputs[i];
+                if (string.IsNullOrWhiteSpace(outPath)) continue;
+                if (ReportWriter.AreSameOutputPath(outPath, opts.CorpusFile))
+                {
+                    error = $"ERROR: {outputFlags[i]} must not overwrite --corpus file \"{opts.CorpusFile}\".";
+                    return true;
+                }
+                for (int m = 0; m < opts.MapFiles.Count; m++)
+                {
+                    if (ReportWriter.AreSameOutputPath(outPath, opts.MapFiles[m]))
+                    {
+                        error = $"ERROR: {outputFlags[i]} must not overwrite --maps file \"{opts.MapFiles[m]}\".";
+                        return true;
+                    }
+                }
+                if (ReportWriter.IsPathInsideDirectory(outPath, opts.ProtocolDir))
+                {
+                    error = $"ERROR: {outputFlags[i]} must not write into --protocol-dir \"{opts.ProtocolDir}\".";
+                    return true;
+                }
+                if (ReportWriter.IsPathInsideDirectory(outPath, opts.CacheDir))
+                {
+                    error = $"ERROR: {outputFlags[i]} must not write into --cache-dir \"{opts.CacheDir}\".";
+                    return true;
+                }
+            }
+            return false;
         }
 
         public static async Task<int> Main(string[] args)
@@ -245,7 +287,28 @@ namespace MonsterPathPredictor.ReplayCertifier
 
             var decoder = new ProtocolDecoder(protocolDir);
             var catalog = new BoardCatalog();
-            foreach (var mf in mapFiles) catalog.LoadJsonFile(mf);
+            foreach (var mf in mapFiles)
+            {
+                if (!File.Exists(mf))
+                {
+                    Console.Error.WriteLine("ERROR: Specified --maps file not found: " + mf);
+                    return 1;
+                }
+                try
+                {
+                    int loaded = catalog.LoadJsonFile(mf);
+                    if (loaded <= 0)
+                    {
+                        Console.Error.WriteLine("ERROR: Specified --maps file contained no valid map definitions: " + mf);
+                        return 1;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"ERROR: Failed to load --maps file \"{mf}\": {ex.Message}");
+                    return 1;
+                }
+            }
             if (catalog.MapCount == 0)
             {
                 Console.Error.WriteLine("ERROR: No maps loaded from --maps arguments: " + string.Join(", ", mapFiles));
@@ -312,7 +375,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                     ct);
             }
 
-            await Parallel.ForEachAsync(replayIds, new ParallelOptions { MaxDegreeOfParallelism = concurrency }, async (id, ct) =>
+            async ValueTask ProcessOneAsync(string id, CancellationToken ct)
             {
                 byte[] bytes = null;
                 bool loadedFromCache = false;
@@ -358,26 +421,28 @@ namespace MonsterPathPredictor.ReplayCertifier
                 {
                     local = SafeEvaluateReplay(id, bytes, decoder, catalog);
 
-                    // If an existing cached file evaluated as corrupt/parse-error, allow ONE automatic CDN
-                    // recovery attempt before classifying as corrupt, and never overwrite cache with corrupt/missing-map payloads.
-                    if (loadedFromCache && (local.TruncatedOrCorrupt > 0 || local.ParseErrors > 0))
+                    // If an existing cached file has a stream integrity error (corrupt/parse-error/illegal move edges),
+                    // allow ONE automatic CDN recovery attempt. Adopt clean diagnostic results (including valid MissingMap)
+                    // separately from deciding whether to publish/overwrite the cache file.
+                    if (loadedFromCache && NeedsCacheRecovery(local))
                     {
                         var (refreshed, _) = await DownloadReplayAsync(id, ct);
                         if (refreshed != null)
                         {
                             var refreshedResult = SafeEvaluateReplay(id, refreshed, decoder, catalog);
-                            if (refreshedResult.ReplaysVerified == 1 || refreshedResult.SkippedNonPve == 1)
+                            if (ShouldAdoptRecoveryResult(refreshedResult))
                             {
                                 bytes = refreshed;
                                 local = refreshedResult;
-                                loadedFromCache = false; // Eligible to atomically overwrite corrupt cache below
+                                loadedFromCache = false; // Eligible for cache publish below ONLY if IsCacheableAndClean
                             }
                         }
                     }
 
-                    // Atomically publish to cache ONLY AFTER verifying full stream integrity and uniqueness
-                    // (never persist TruncatedOrCorrupt, ParseErrors, MissingMap, or duplicate replay copies).
-                    if (local.ReplaysVerified == 1 || local.SkippedNonPve == 1)
+                    // Register verified/non-PVE stream identity for cache dedup, and atomically publish ONLY
+                    // clean non-duplicate streams (never persist TruncatedOrCorrupt, ParseErrors, MissingMap,
+                    // IllegalMoveEdges > 0, or duplicate replay copies).
+                    if (IsCacheableAndClean(local))
                     {
                         bool uniqueForCache = true;
                         if (!string.IsNullOrEmpty(local.ContentSha256) && !cacheSeenSha.TryAdd(local.ContentSha256, 0))
@@ -395,13 +460,57 @@ namespace MonsterPathPredictor.ReplayCertifier
                 int done = Interlocked.Increment(ref processed);
                 if (done % 250 == 0 || done == replayIds.Count)
                     Console.WriteLine($"  progress: {done:N0}/{replayIds.Count:N0} ({sw.Elapsed.TotalSeconds:F1}s | cached={cacheHits:N0}, streamed={streamed:N0})");
-            });
+            }
+
+            // When --save-cache is active, evaluate already-cached IDs first so their SHA-256 and canonical
+            // VerifiedReplayId are registered BEFORE any newly downloaded duplicate ID can be written to disk.
+            if (saveCache && !string.IsNullOrWhiteSpace(cacheDir))
+            {
+                var (cachedIds, uncachedIds) = PartitionByCachePresence(replayIds, cacheDir);
+                if (cachedIds.Count > 0)
+                    await Parallel.ForEachAsync(cachedIds, new ParallelOptions { MaxDegreeOfParallelism = concurrency }, ProcessOneAsync);
+                if (uncachedIds.Count > 0)
+                    await Parallel.ForEachAsync(uncachedIds, new ParallelOptions { MaxDegreeOfParallelism = concurrency }, ProcessOneAsync);
+            }
+            else
+            {
+                await Parallel.ForEachAsync(replayIds, new ParallelOptions { MaxDegreeOfParallelism = concurrency }, ProcessOneAsync);
+            }
 
             sw.Stop();
             var total = DeduplicateAndMerge(perReplay);
 
             bool passed = ReportWriter.PrintAndExport(total, catalog, sw.Elapsed.TotalSeconds, thresholds, jsonOut, mdOut);
             return passed ? 0 : 2;
+        }
+
+        public static bool NeedsCacheRecovery(CertificationSummary s)
+        {
+            return s != null && (s.TruncatedOrCorrupt > 0 || s.ParseErrors > 0 || s.IllegalMoveEdges > 0);
+        }
+
+        public static bool ShouldAdoptRecoveryResult(CertificationSummary s)
+        {
+            return s != null && s.TruncatedOrCorrupt == 0 && s.ParseErrors == 0 && s.IllegalMoveEdges == 0 &&
+                   (s.ReplaysVerified == 1 || s.SkippedNonPve == 1 || s.MissingMap == 1);
+        }
+
+        public static bool IsCacheableAndClean(CertificationSummary s)
+        {
+            return s != null && (s.ReplaysVerified == 1 || s.SkippedNonPve == 1) &&
+                   s.TruncatedOrCorrupt == 0 && s.ParseErrors == 0 && s.IllegalMoveEdges == 0;
+        }
+
+        public static (List<string> CachedIds, List<string> UncachedIds) PartitionByCachePresence(IReadOnlyList<string> replayIds, string cacheDir)
+        {
+            var cached = new List<string>();
+            var uncached = new List<string>();
+            for (int i = 0; i < replayIds.Count; i++)
+            {
+                if (ResolveCachedReplayPath(cacheDir, replayIds[i]) != null) cached.Add(replayIds[i]);
+                else uncached.Add(replayIds[i]);
+            }
+            return (cached, uncached);
         }
 
         public static async Task<(byte[] Bytes, bool ReceivedCorruptPayload)> DownloadReplayFromUrlsAsync(
@@ -463,7 +572,9 @@ namespace MonsterPathPredictor.ReplayCertifier
             foreach (var (item, _) in ordered)
             {
                 if (item == null) continue;
-                if (item.ReplaysVerified > 0)
+                // Deduplicate BOTH verified PVE AND SkippedNonPve replays by content SHA-256 and canonical 1016.ReplayId
+                // so repeated non-PVE payloads can never inflate ReplaysAttempted or dilute DownloadFailRatio.
+                if (item.ReplaysVerified > 0 || item.SkippedNonPve > 0)
                 {
                     bool dupSha = !string.IsNullOrEmpty(item.ContentSha256) && !seenSha.Add(item.ContentSha256);
                     bool dupId = !string.IsNullOrEmpty(item.VerifiedReplayId) && !seenVerifiedId.Add(item.VerifiedReplayId);

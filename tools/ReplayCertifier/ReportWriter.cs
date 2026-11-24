@@ -86,15 +86,17 @@ namespace MonsterPathPredictor.ReplayCertifier
                 t.MinThiefSamples >= 0 &&
                 t.MinCalibratedBins >= 0;
 
+            bool hasHardIntegrityFailure =
+                s.MissingMap > 0 || s.ParseErrors > 0 || s.TruncatedOrCorrupt > 0 ||
+                s.MissingPredictions > 0 || s.OutOfSupportPredictions > 0 || s.IllegalMoveEdges > 0 ||
+                !bucketCountsConsistent ||
+                (s.ReplaysAttempted > 0 && dlFailRatio > t.MaxDownloadFailRatio);
+
             GateStatus coverageGate;
-            if (!thresholdsValid)
+            if (!thresholdsValid || hasHardIntegrityFailure)
                 coverageGate = GateStatus.Fail;
             else if (s.ReplaysAttempted <= 0 || s.ReplaysVerified <= 0)
                 coverageGate = GateStatus.InsufficientSample;
-            else if (s.MissingMap > 0 || s.ParseErrors > 0 || s.TruncatedOrCorrupt > 0 ||
-                     s.MissingPredictions > 0 || s.OutOfSupportPredictions > 0 || s.IllegalMoveEdges > 0 ||
-                     !bucketCountsConsistent || dlFailRatio > t.MaxDownloadFailRatio)
-                coverageGate = GateStatus.Fail;
             else
                 coverageGate = GateStatus.Pass;
 
@@ -138,8 +140,8 @@ namespace MonsterPathPredictor.ReplayCertifier
                 if (pb.Opp < 20) continue;
                 double pred = pb.SumPred / pb.Opp;
                 double obs = (double)pb.Chosen / pb.Opp;
-                double se = Math.Sqrt(pred * (1.0 - pred) / pb.Opp);
-                double z = se > 0 ? (obs - pred) / se : 0.0;
+                double se = Math.Sqrt(Math.Max(0.0, pred * (1.0 - pred)) / pb.Opp);
+                double z = se > 0.0 ? (obs - pred) / se : (Math.Abs(obs - pred) <= 1e-12 ? 0.0 : (obs > pred ? double.PositiveInfinity : double.NegativeInfinity));
                 if (pb.Opp >= 30)
                 {
                     evaluatedBins++;
@@ -173,13 +175,53 @@ namespace MonsterPathPredictor.ReplayCertifier
             _ => "FAIL"
         };
 
+        public static string ResolveCanonicalPath(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path)) return null;
+            string full = Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            if (string.IsNullOrEmpty(full)) return Path.GetFullPath(path);
+
+            try
+            {
+                // Resolve every symlink component along the path from root toward leaf so directory aliases
+                // (e.g. alias/report or alias/sub/report where alias -> out) resolve to the exact physical path
+                // even before the target report file exists on disk.
+                string root = Path.GetPathRoot(full) ?? string.Empty;
+                string remainder = full.Substring(root.Length);
+                string[] parts = remainder.Split(
+                    new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar },
+                    StringSplitOptions.RemoveEmptyEntries);
+
+                string cur = root;
+                for (int i = 0; i < parts.Length; i++)
+                {
+                    cur = string.IsNullOrEmpty(cur) ? parts[i] : Path.Combine(cur, parts[i]);
+                    if (File.Exists(cur))
+                    {
+                        var target = new FileInfo(cur).ResolveLinkTarget(returnFinalTarget: true);
+                        if (target != null) cur = Path.GetFullPath(target.FullName);
+                    }
+                    else if (Directory.Exists(cur))
+                    {
+                        var target = new DirectoryInfo(cur).ResolveLinkTarget(returnFinalTarget: true);
+                        if (target != null) cur = Path.GetFullPath(target.FullName);
+                    }
+                }
+                return Path.GetFullPath(cur).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            }
+            catch
+            {
+                return full;
+            }
+        }
+
         public static bool AreSameOutputPath(string pathA, string pathB)
         {
             if (string.IsNullOrWhiteSpace(pathA) || string.IsNullOrWhiteSpace(pathB)) return false;
             try
             {
-                string normA = Path.GetFullPath(pathA).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-                string normB = Path.GetFullPath(pathB).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                string normA = ResolveCanonicalPath(pathA);
+                string normB = ResolveCanonicalPath(pathB);
                 var cmp = (OperatingSystem.IsWindows() || OperatingSystem.IsMacOS())
                     ? StringComparison.OrdinalIgnoreCase
                     : StringComparison.Ordinal;
@@ -188,6 +230,43 @@ namespace MonsterPathPredictor.ReplayCertifier
             catch
             {
                 return false;
+            }
+        }
+
+        public static bool IsPathInsideDirectory(string filePath, string dirPath)
+        {
+            if (string.IsNullOrWhiteSpace(filePath) || string.IsNullOrWhiteSpace(dirPath)) return false;
+            try
+            {
+                string normFile = ResolveCanonicalPath(filePath);
+                string normDir = ResolveCanonicalPath(dirPath);
+                var cmp = (OperatingSystem.IsWindows() || OperatingSystem.IsMacOS())
+                    ? StringComparison.OrdinalIgnoreCase
+                    : StringComparison.Ordinal;
+                if (string.Equals(normFile, normDir, cmp)) return true;
+                string prefix = normDir + Path.DirectorySeparatorChar;
+                return normFile.StartsWith(prefix, cmp);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static void WriteTextAtomic(string path, string content)
+        {
+            string full = Path.GetFullPath(path);
+            string dir = Path.GetDirectoryName(full);
+            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+            string tmp = full + ".tmp." + Guid.NewGuid().ToString("N");
+            try
+            {
+                File.WriteAllText(tmp, content, Encoding.UTF8);
+                File.Move(tmp, full, overwrite: true);
+            }
+            finally
+            {
+                try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
             }
         }
 
@@ -311,7 +390,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                     calibration = eval.CalibrationRows,
                     frontAudit = fa
                 };
-                File.WriteAllText(jsonOut, JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true }), Encoding.UTF8);
+                WriteTextAtomic(jsonOut, JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true }));
                 Console.WriteLine($"\nWrote JSON report: {jsonOut}");
             }
 
@@ -340,7 +419,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                     var ms = kv.Value;
                     sb.AppendLine($"| {kv.Key} | {catalog.GetMapName(kv.Key)} | {ms.Replays:N0} | {ms.DetHits:N0} / {ms.DetTotal:N0} | {FormatAccuracy(ms.DetHits, ms.DetTotal)} | {ms.ProbTotal:N0} |");
                 }
-                File.WriteAllText(mdOut, sb.ToString(), Encoding.UTF8);
+                WriteTextAtomic(mdOut, sb.ToString());
                 Console.WriteLine($"Wrote Markdown report: {mdOut}");
             }
 

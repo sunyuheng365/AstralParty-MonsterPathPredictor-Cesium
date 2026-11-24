@@ -48,7 +48,8 @@ namespace MonsterPathPredictor.Runtime
         private GComponent _pillLayer;
         private readonly List<GGraph> _lineGraphPool = new List<GGraph>();
         private readonly List<PooledPill> _pillPool = new List<PooledPill>();
-        private readonly Dictionary<long, float> _stableHeaderHeight = new Dictionary<long, float>();
+        private long _stableHeaderMonsterId;
+        private float _stableHeaderHeight;
         private readonly Dictionary<int, Point2> _screenCache = new Dictionary<int, Point2>();
         private readonly Dictionary<int, int> _forkTagStack = new Dictionary<int, int>();
         private readonly Dictionary<int, float> _forkTagNextTopY = new Dictionary<int, float>();
@@ -180,13 +181,48 @@ namespace MonsterPathPredictor.Runtime
                 DrawDot(startPt, 8.5f, RingColor);
             }
 
-            // 2. Animated forward-marching dashed lines for all predicted edges (unclipped projection + viewport clip
-            //    so visible portions of edges with an off-screen endpoint still render cleanly).
+            // 2. Animated forward-marching dashed lines for all predicted edges:
+            //    first clip 3D segment against camera near plane (so edges partially behind the camera stay visible),
+            //    then project unclipped to screen space, clip 2D against viewport, and preserve exact original dash phase.
+            float nearClipDist = 0.15f;
+            try { nearClipDist = Math.Max(0.1f, camera.nearClipPlane + 0.01f); } catch { }
+
             for (int i = 0; i < plan.Edges.Count; i++)
             {
                 var edge = plan.Edges[i];
-                if (!TryProjectTileRaw(edge.FromLandId, out var pFrom)) continue;
-                if (!TryProjectTileRaw(edge.ToLandId, out var pTo)) continue;
+                if (!board.TryGetNode(edge.FromLandId, out var fromNode)) continue;
+                if (!board.TryGetNode(edge.ToLandId, out var toNode)) continue;
+
+                float ax = fromNode.X, ay = fromNode.Y + hOffset, az = fromNode.Z;
+                float bx = toNode.X, by = toNode.Y + hOffset, bz = toNode.Z;
+                if (!DashGeometry.TryClipSegmentToNearPlane(
+                        ax, ay, az, bx, by, bz,
+                        camPos.x, camPos.y, camPos.z,
+                        camForward.x, camForward.y, camForward.z,
+                        nearClipDist,
+                        out float cax, out float cay, out float caz,
+                        out float cbx, out float cby, out float cbz,
+                        out bool clippedNearStart, out bool clippedNearEnd))
+                    continue;
+
+                Point2 pFrom, pTo;
+                if (!clippedNearStart)
+                {
+                    if (!TryProjectTileRaw(edge.FromLandId, out pFrom)) continue;
+                }
+                else
+                {
+                    if (!TryProjectWorldUnclipped(layer, camera, camPos, camForward, new Vector3(cax, cay, caz), out pFrom)) continue;
+                }
+
+                if (!clippedNearEnd)
+                {
+                    if (!TryProjectTileRaw(edge.ToLandId, out pTo)) continue;
+                }
+                else
+                {
+                    if (!TryProjectWorldUnclipped(layer, camera, camPos, camForward, new Vector3(cbx, cby, cbz), out pTo)) continue;
+                }
 
                 if (!DashGeometry.TryClipSegmentToRect(pFrom, pTo, -40f, -40f, layer.width + 40f, layer.height + 40f,
                         out var clipFrom, out var clipTo, out float clippedFromStartPx))
@@ -198,10 +234,13 @@ namespace MonsterPathPredictor.Runtime
                     ? baseWidth
                     : Math.Max(2.0f, baseWidth * (0.65f + 0.35f * (float)edge.Probability));
 
-                float trimStart = Math.Max(0f, (edge.EarliestStep == 0 ? 10f : 3f) - clippedFromStartPx);
+                float origTrimStart = clippedNearStart ? 0f : (edge.EarliestStep == 0 ? 10f : 3f);
+                float origTrimEnd = clippedNearEnd ? 0f : 3f;
+                float trimStart = Math.Max(0f, origTrimStart - clippedFromStartPx);
                 float fullEdgeLen = pFrom.DistanceTo(pTo);
                 float clippedEndPx = Math.Max(0f, fullEdgeLen - clippedFromStartPx - clipFrom.DistanceTo(clipTo));
-                float trimEnd = Math.Max(0f, 3f - clippedEndPx);
+                float trimEnd = Math.Max(0f, origTrimEnd - clippedEndPx);
+                float clippedPhase = DashGeometry.ComputeClippedDashPhase(phaseOffset, origTrimStart, clippedFromStartPx, trimStart);
 
                 DashGeometry.BuildDashedSegmentsInto(
                     _dashQuadBuf,
@@ -211,7 +250,7 @@ namespace MonsterPathPredictor.Runtime
                     width,
                     trimStart: trimStart,
                     trimEnd: trimEnd,
-                    phaseOffset: phaseOffset - clippedFromStartPx);
+                    phaseOffset: clippedPhase);
 
                 for (int q = 0; q < _dashQuadBuf.Count; q++)
                 {
@@ -219,7 +258,7 @@ namespace MonsterPathPredictor.Runtime
                 }
 
                 // Draw directional chevron on the very first step out of the monster (only when visible)
-                if (edge.EarliestStep == 0 &&
+                if (edge.EarliestStep == 0 && !clippedNearStart && !clippedNearEnd &&
                     DashGeometry.TryBuildArrowHead(pFrom, pTo, Math.Max(12f, width * 3.1f), Math.Max(6f, width * 1.6f), out var head, 0.60f) &&
                     head.P0.X >= -60f && head.P0.X <= layer.width + 60f && head.P0.Y >= -60f && head.P0.Y <= layer.height + 60f)
                 {
@@ -373,23 +412,18 @@ namespace MonsterPathPredictor.Runtime
             long mid = selectedMonster.State != null ? selectedMonster.State.MonsterId : 0;
             if (mid != 0)
             {
-                if (_stableHeaderHeight.TryGetValue(mid, out float cached))
+                if (_stableHeaderMonsterId == mid)
                 {
-                    if (measuredHeight > cached + 0.08f)
+                    if (measuredHeight > _stableHeaderHeight + 0.08f || _stableHeaderHeight - measuredHeight > 0.60f)
                     {
-                        cached = measuredHeight;
-                        _stableHeaderHeight[mid] = cached;
+                        _stableHeaderHeight = measuredHeight;
                     }
-                    else if (cached - measuredHeight > 0.60f)
-                    {
-                        cached = measuredHeight;
-                        _stableHeaderHeight[mid] = cached;
-                    }
-                    measuredHeight = cached;
+                    measuredHeight = _stableHeaderHeight;
                 }
                 else
                 {
-                    _stableHeaderHeight[mid] = measuredHeight;
+                    _stableHeaderMonsterId = mid;
+                    _stableHeaderHeight = measuredHeight;
                 }
             }
 
@@ -655,6 +689,12 @@ namespace MonsterPathPredictor.Runtime
             return pill;
         }
 
+        public void ClearStableHeaderCache()
+        {
+            _stableHeaderMonsterId = 0;
+            _stableHeaderHeight = 0f;
+        }
+
         public void Dispose()
         {
             for (int i = 0; i < _lineGraphPool.Count; i++)
@@ -667,7 +707,7 @@ namespace MonsterPathPredictor.Runtime
             }
             _lineGraphPool.Clear();
             _pillPool.Clear();
-            _stableHeaderHeight.Clear();
+            ClearStableHeaderCache();
             _usedLineGraphs = 0;
             _usedPills = 0;
 

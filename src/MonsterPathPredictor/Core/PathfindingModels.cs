@@ -154,10 +154,23 @@ namespace MonsterPathPredictor.Core
     {
         public int NextLandId { get; set; }
         public double ConditionalProbability { get; set; }
+        /// <summary>
+        /// Natural logarithm of the conditional exit probability (finite even when ConditionalProbability
+        /// underflows IEEE-754 double to 0.0 on extreme 1076+ diamond graphs; NegativeInfinity when unreachable).
+        /// </summary>
+        public double LogConditionalProbability { get; set; } = double.NegativeInfinity;
         public double CumulativeProbability { get; set; }
         public bool IsGlobalRedArrow { get; set; }
 
-        public string FormatConditionalPercent() => ProbabilityFormat.Percent(ConditionalProbability);
+        public bool IsPositiveSupport => ConditionalProbability > 0.0 || !double.IsNegativeInfinity(LogConditionalProbability);
+
+        public string FormatConditionalPercent()
+        {
+            if (ConditionalProbability <= 0.0 && !double.IsNegativeInfinity(LogConditionalProbability))
+                return "<0.1%";
+            return ProbabilityFormat.Percent(ConditionalProbability);
+        }
+
         public string FormatCumulativePercent() => ProbabilityFormat.Percent(CumulativeProbability);
     }
 

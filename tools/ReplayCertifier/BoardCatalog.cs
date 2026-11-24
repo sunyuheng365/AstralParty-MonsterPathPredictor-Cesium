@@ -29,11 +29,14 @@ namespace MonsterPathPredictor.ReplayCertifier
             return true;
         }
 
-        public void LoadJsonFile(string jsonPath)
+        public int LoadJsonFile(string jsonPath)
         {
-            if (string.IsNullOrWhiteSpace(jsonPath) || !File.Exists(jsonPath)) return;
+            if (string.IsNullOrWhiteSpace(jsonPath) || !File.Exists(jsonPath))
+                throw new FileNotFoundException($"Map definition file not found: {jsonPath}", jsonPath);
+
             using var doc = JsonDocument.Parse(File.ReadAllText(jsonPath));
             var root = doc.RootElement;
+            int loadedCount = 0;
 
             if (root.TryGetProperty("maps", out var mapsEl) && mapsEl.ValueKind == JsonValueKind.Array)
             {
@@ -50,9 +53,13 @@ namespace MonsterPathPredictor.ReplayCertifier
                         scenes.Add((sceneId, ParseNodes(prop.Value.GetProperty("nodes"))));
                     }
                     scenes.Sort((a, b) => a.SceneId.CompareTo(b.SceneId));
-                    _byMap[mapId] = scenes;
+                    if (scenes.Count > 0)
+                    {
+                        _byMap[mapId] = scenes;
+                        loadedCount++;
+                    }
                 }
-                return;
+                return loadedCount;
             }
 
             if (root.TryGetProperty("id", out var idEl) && root.TryGetProperty("nodes", out var nodesEl))
@@ -62,7 +69,10 @@ namespace MonsterPathPredictor.ReplayCertifier
                 int sceneId = root.TryGetProperty("scene", out var sEl) ? sEl.GetInt32() : 0;
                 _names[mapId] = name;
                 _byMap[mapId] = new List<(int, BoardGraph)> { (sceneId, ParseNodes(nodesEl)) };
+                return 1;
             }
+
+            return 0;
         }
 
         private static BoardGraph ParseNodes(JsonElement nodesEl)

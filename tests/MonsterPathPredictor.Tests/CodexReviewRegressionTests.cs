@@ -812,5 +812,146 @@ namespace MonsterPathPredictor.Tests
             float maxBigX = Math.Max(Math.Max(lastBig.P0.X, lastBig.P1.X), Math.Max(lastBig.P2.X, lastBig.P3.X));
             Assert.True(maxBigX >= 49900f, $"Extreme edge dash stopped early at x={maxBigX}");
         }
+
+        [Fact]
+        public void ThiefStopAtFirstCombat_StopsImmediatelyAtStealTileAndMarksFinalStep()
+        {
+            // Round 6 (#14): 1-2-3, Thief starts at 1 facing 2, player with Gold=1 at 2.
+            var board = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(1, new[] { 2 }),
+                new LandNodeSnapshot(2, new[] { 3, 1 }),
+                new LandNodeSnapshot(3, new[] { 2 })
+            });
+            var players = new List<TrackedPlayer>
+            {
+                new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = 2, IsAlive = true, IsTargetable = true, Gold = 1 }
+            };
+            var thief = new MonsterState
+            {
+                MonsterId = 960, IsNormalAggressive = false, IsThief = true,
+                CurrentLandId = 1, FromLandId = -1, FrontNodeIds = new[] { 2 }
+            };
+
+            // MaxSteps=2 -> stops at tile 2 (no edge 2->3) with StoppedAtCombat=true
+            var plan2 = MonsterPathEngine.Plan(board, thief, players, new PlanOptions { MaxSteps = 2, PostCombatMode = PostCombatMode.StopAtFirstCombat });
+            Assert.Single(plan2.Edges);
+            Assert.Equal(2, plan2.Edges[0].ToLandId);
+            Assert.True(plan2.Combats.Single().IsSteal);
+            var ep2 = plan2.Endpoints.Single();
+            Assert.Equal(2, ep2.LandId);
+            Assert.True(ep2.StoppedAtCombat);
+
+            // MaxSteps=1 (final step lands on steal tile) -> also sets StoppedAtCombat=true
+            var plan1 = MonsterPathEngine.Plan(board, thief, players, new PlanOptions { MaxSteps = 1, PostCombatMode = PostCombatMode.StopAtFirstCombat });
+            Assert.True(plan1.Endpoints.Single().StoppedAtCombat);
+        }
+
+        [Fact]
+        public void Extreme1076DiamondsVsSingleChain_RetainsUnderflowedExitInPositiveSupport()
+        {
+            // Round 6 (#15): Exit A has 2^1076 shortest paths, Exit B has 1 shortest path.
+            // 1/(2^1076+1) underflows IEEE-754 double to 0.0, yet B MUST remain in fork.Exits with IsPositiveSupport=true!
+            var adj = new Dictionary<int, List<int>>();
+            void Link(int u, int v)
+            {
+                if (!adj.TryGetValue(u, out var lu)) adj[u] = lu = new List<int>();
+                if (!adj.TryGetValue(v, out var lv)) adj[v] = lv = new List<int>();
+                if (!lu.Contains(v)) lu.Add(v);
+                if (!lv.Contains(u)) lv.Add(u);
+            }
+
+            Link(0, 1);
+            Link(1, 2); // Branch A start
+            Link(1, 3); // Branch B start
+            int nextId = 10;
+            int curA = 2;
+            const int diamonds = 1076;
+            const int target = 999999;
+            for (int d = 0; d < diamonds; d++)
+            {
+                int top = nextId++;
+                int bot = nextId++;
+                int nxt = (d == diamonds - 1) ? target : nextId++;
+                Link(curA, top);
+                Link(curA, bot);
+                Link(top, nxt);
+                Link(bot, nxt);
+                curA = nxt;
+            }
+            int curB = 3;
+            for (int s = 0; s < diamonds * 2; s++)
+            {
+                int nxt = (s == diamonds * 2 - 1) ? target : nextId++;
+                Link(curB, nxt);
+                curB = nxt;
+            }
+
+            var board = new BoardGraph(adj.Select(kv => new LandNodeSnapshot(kv.Key, kv.Value.ToArray())).ToArray());
+            var players = new List<TrackedPlayer>
+            {
+                new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = target, IsAlive = true, IsTargetable = true }
+            };
+            var m = new MonsterState { MonsterId = 961, CurrentLandId = 1, FromLandId = 0, IsCurrentlyMovingMidTurn = true };
+
+            var plan = MonsterPathEngine.Plan(board, m, players, new PlanOptions { MaxSteps = 1, MinBranchProbability = 0.0 });
+            var fork = plan.Forks.Single(f => f.ForkLandId == 1);
+            Assert.Equal(2, fork.Exits.Count);
+            Assert.True(fork.HasMultipleBranches);
+            var exitB = fork.Exits.Single(e => e.NextLandId == 3);
+            Assert.True(exitB.IsPositiveSupport);
+            Assert.Equal("<0.1%", exitB.FormatConditionalPercent());
+        }
+
+        [Fact]
+        public void GeometryRound6_NearPlaneClip_StaticDashPhase_DoublePrecisionClip_AndExactSmallPathCount()
+        {
+            // Round 6 (#16): 3D near-plane clip preserves visible part of (0,0,-1)->(1,0,4) against near=0.3
+            bool okNear = DashGeometry.TryClipSegmentToNearPlane(
+                0f, 0f, -1f, 1f, 0f, 4f,
+                0f, 0f, 0f, 0f, 0f, 1f, 0.3f,
+                out float ax, out _, out float az, out float bx, out _, out float bz,
+                out bool clipS, out bool clipE);
+            Assert.True(okNear);
+            Assert.True(clipS);
+            Assert.False(clipE);
+            Assert.Equal(0.3f, az, 3);
+            Assert.Equal(4f, bz, 3);
+            Assert.Equal(0.26f, ax, 3);
+            Assert.Equal(1f, bx, 3);
+
+            // Round 6 (#17): Viewport clip preserves static dash phase (origTrimStart=10, dash=12, gap=8, phase=0, clipStart=20)
+            var fullQuads = new List<DashQuad>();
+            DashGeometry.BuildDashedSegmentsInto(fullQuads, new Point2(0f, 0f), new Point2(100f, 0f), 12f, 8f, 4f, trimStart: 10f, trimEnd: 0f, phaseOffset: 0f);
+            float newTrim = Math.Max(0f, 10f - 20f);
+            float clippedPhase = DashGeometry.ComputeClippedDashPhase(0f, 10f, 20f, newTrim);
+            var clippedQuads = new List<DashQuad>();
+            DashGeometry.BuildDashedSegmentsInto(clippedQuads, new Point2(20f, 0f), new Point2(100f, 0f), 12f, 8f, 4f, trimStart: newTrim, trimEnd: 0f, phaseOffset: clippedPhase);
+            // Both unclipped and clipped must draw exact dashes [50,62] and [70,82]
+            Assert.Contains(fullQuads, q => Math.Abs(Math.Min(q.P0.X, q.P1.X) - 50f) < 0.1f && Math.Abs(Math.Max(q.P0.X, q.P1.X) - 62f) < 0.1f);
+            Assert.Contains(clippedQuads, q => Math.Abs(Math.Min(q.P0.X, q.P1.X) - 50f) < 0.1f && Math.Abs(Math.Max(q.P0.X, q.P1.X) - 62f) < 0.1f);
+
+            // Round 6 (#18): (-2^36, 50) -> (2^36, 50) clipped to [0,0,800,100] preserves full 800px segment
+            float huge = (float)Math.Pow(2.0, 36);
+            bool okClip = DashGeometry.TryClipSegmentToRect(new Point2(-huge, 50f), new Point2(huge, 50f), 0f, 0f, 800f, 100f, out var ca, out var cb, out _);
+            Assert.True(okClip);
+            Assert.Equal(0f, ca.X, 3);
+            Assert.Equal(800f, cb.X, 3);
+
+            // Round 6 (#19): 3 chained diamonds have EXACT count 8.0 (not 7.999999999999998)
+            var diamondBoard = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(0, new[] { 1, 2 }),
+                new LandNodeSnapshot(1, new[] { 3, 0 }), new LandNodeSnapshot(2, new[] { 3, 0 }),
+                new LandNodeSnapshot(3, new[] { 4, 5, 1, 2 }),
+                new LandNodeSnapshot(4, new[] { 6, 3 }), new LandNodeSnapshot(5, new[] { 6, 3 }),
+                new LandNodeSnapshot(6, new[] { 7, 8, 4, 5 }),
+                new LandNodeSnapshot(7, new[] { 9, 6 }), new LandNodeSnapshot(8, new[] { 9, 6 }),
+                new LandNodeSnapshot(9, new[] { 7, 8 })
+            });
+            var field = diamondBoard.ComputeShortestPathsTo(9);
+            Assert.Equal(8.0, field.GetPathCount(0));
+            Assert.Equal(8, (int)field.GetPathCount(0));
+        }
     }
 }

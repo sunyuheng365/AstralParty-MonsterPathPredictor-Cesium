@@ -883,7 +883,216 @@ namespace MonsterPathPredictor.ReplayCertifier
                 return 1;
             }
 
-            Console.WriteLine("ReplayCertifier self-tests PASSED (30/30).");
+            // Test 31 (Round 6 #1): 1096.Place moving the mover itself (1-2, 3-4, Place 2->3):
+            //          split [1,2]+[2,3,4] and merged [1,2,3,4] MUST both produce IllegalMoveEdges=0 for BOTH player and monster!
+            var cat31 = BuildTestCatalog(82016,
+                "{\"id\":1,\"neighbors\":[2]},{\"id\":2,\"neighbors\":[1]},{\"id\":3,\"neighbors\":[4]},{\"id\":4,\"neighbors\":[3]}");
+            int RunSelfTeleport31(bool isMonster, bool merged)
+            {
+                var d = new StubDecoder();
+                long actor = isMonster ? 600 : 1;
+                var room = new StubRoom { MapId = 82016 };
+                if (isMonster) room.Monsters.Add(new StubUnit { Id = 600, Hero = new StubHero { HeroId = 1002, MonsterType = 11, NodeId = 1 } });
+                else room.Players.Add(new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 101, NodeId = 1 } });
+                int r = d.Register(new StubRunning { Room = room });
+                int roll = d.Register(new StubThrowDice { PlayerId = actor });
+                int sm = d.Register(new StubSkillMoveEffect
+                {
+                    PlayerId = actor,
+                    EffectData = new Dictionary<int, StubMoveEffectBucket>
+                    {
+                        [2] = new StubMoveEffectBucket { Effects = new List<StubAttr> { new StubAttr { PlayerId = actor, EffectDatas = new List<StubEffect> { new StubEffect { PlayerId = actor, Place = new StubPlace { Place = new StubPlaceInner { NodeId = 3, BackNodeId = -1 } } } } } } }
+                    }
+                });
+                int fin = d.Register(new StubFinish());
+                if (merged)
+                {
+                    int mv = d.Register(new StubMove { PlayerId = actor, NodeIds = new[] { 1, 2, 3, 4 } });
+                    var res = ReplayEvaluator.EvaluateBytes("m31", ConcatFrames(MakeFrame(1003, r), MakeFrame(5022, roll), MakeFrame(1096, sm), MakeFrame(5028, mv), MakeFrame(1016, fin)), d, cat31);
+                    return (int)res.IllegalMoveEdges;
+                }
+                int mv1 = d.Register(new StubMove { PlayerId = actor, NodeIds = new[] { 1, 2 } });
+                int mv2 = d.Register(new StubMove { PlayerId = actor, NodeIds = new[] { 2, 3, 4 } });
+                var resS = ReplayEvaluator.EvaluateBytes("s31", ConcatFrames(MakeFrame(1003, r), MakeFrame(5022, roll), MakeFrame(1096, sm), MakeFrame(5028, mv1), MakeFrame(5028, mv2), MakeFrame(1016, fin)), d, cat31);
+                return (int)resS.IllegalMoveEdges;
+            }
+            if (RunSelfTeleport31(false, false) != 0 || RunSelfTeleport31(false, true) != 0 ||
+                RunSelfTeleport31(true, false) != 0 || RunSelfTeleport31(true, true) != 0)
+            {
+                Console.Error.WriteLine("SELF-TEST FAILED (Test 31): Merged vs split self-teleport 1096.Place diverged.");
+                return 1;
+            }
+
+            // Test 32 (Round 6 #2): Directed graph 0->1, 1->{2,3}, player at 2, monster actually moves [0,1,3]
+            //          MUST be scored as DetTotal=1, DetHits=0 (NOT skipped as non-fork!).
+            var cat32 = BuildTestCatalog(82016,
+                "{\"id\":0,\"neighbors\":[1]},{\"id\":1,\"neighbors\":[2,3]},{\"id\":2,\"neighbors\":[]},{\"id\":3,\"neighbors\":[]}");
+            var dec32 = new StubDecoder();
+            int tokRun32 = dec32.Register(new StubRunning
+            {
+                Room = new StubRoom
+                {
+                    MapId = 82016,
+                    Players = new List<StubUnit> { new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 101, NodeId = 2 } } },
+                    Monsters = new List<StubUnit> { new StubUnit { Id = 610, Hero = new StubHero { HeroId = 1002, MonsterType = 11, NodeId = 0, BackNodeId = -1, FrontNodeIds = new[] { 1 } } } }
+                }
+            });
+            int tokRoll32 = dec32.Register(new StubThrowDice { PlayerId = 610 });
+            int tokMove32 = dec32.Register(new StubMove { PlayerId = 610, NodeIds = new[] { 0, 1, 3 } });
+            int tokFin32 = dec32.Register(new StubFinish());
+            var res32 = ReplayEvaluator.EvaluateBytes("dir-fork",
+                ConcatFrames(MakeFrame(1003, tokRun32), MakeFrame(5022, tokRoll32), MakeFrame(5028, tokMove32), MakeFrame(1016, tokFin32)),
+                dec32, cat32);
+            if (res32.Buckets["MidWalkFork"].DetTotal != 1 || res32.Buckets["MidWalkFork"].DetHits != 0)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 32): Directed fork was skipped (det={res32.Buckets["MidWalkFork"].DetHits}/{res32.Buckets["MidWalkFork"].DetTotal}).");
+                return 1;
+            }
+
+            // Test 33 (Round 6 #3): Context-independent canonical calibration key:
+            //          15x [0.25, 0.75] + 15x [0.25, 0.2502, 0.4998] all picking 0.25 MUST merge into "25%" (n=30) and FAIL GATE 3!
+            var splitBias33 = new CertificationSummary { ReplaysAttempted = 10, ReplaysVerified = 10 };
+            PopulatePassingBaseline(splitBias33);
+            for (int i = 0; i < 15; i++)
+            {
+                ReplayEvaluator.RecordMultiBranchCalibration(board, 23, new List<ForkExitPrediction>
+                {
+                    new() { NextLandId = 22, ConditionalProbability = 0.25 },
+                    new() { NextLandId = 55, ConditionalProbability = 0.75 }
+                }, actualNext: 22, splitBias33.ProbBins);
+                ReplayEvaluator.RecordMultiBranchCalibration(board3, 1, new List<ForkExitPrediction>
+                {
+                    new() { NextLandId = 2, ConditionalProbability = 0.25 },
+                    new() { NextLandId = 3, ConditionalProbability = 0.2502 },
+                    new() { NextLandId = 4, ConditionalProbability = 0.4998 }
+                }, actualNext: 2, splitBias33.ProbBins);
+            }
+            for (int i = 0; i < 15; i++) ReplayEvaluator.RecordMultiBranchCalibration(board, 23, exits, actualNext: 22, splitBias33.ProbBins);
+            for (int i = 0; i < 15; i++) ReplayEvaluator.RecordMultiBranchCalibration(board, 23, exits, actualNext: 55, splitBias33.ProbBins);
+            var e33 = ReportWriter.EvaluateGates(splitBias33, t);
+            if (!splitBias33.ProbBins.ContainsKey("25%") || splitBias33.ProbBins["25%"].Opp != 30 || e33.CalibrationGate != GateStatus.Fail)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 33): Context-dependent bin split hid 25% bias (keys={string.Join(",", splitBias33.ProbBins.Keys)}, gate={e33.CalibrationGate}).");
+                return 1;
+            }
+
+            // Test 34 (Round 6 #4): Corrupt mid-stream 5028 between valid 1003 and 1016 MUST fail HasValidFrameStream
+            //          (so primary CDN falls back to backup CDN) AND fail non-PVE / missing-map as TruncatedOrCorrupt=1.
+            byte[] badMid5028 = MakeFrame(5028, 999999); // unregistered token => TryDecode returns null
+            byte[] corruptMidStream = ConcatFrames(MakeFrame(1003, tokRun11), badMid5028, MakeFrame(1016, tokFin11));
+            if (ReplayEvaluator.HasValidFrameStream(corruptMidStream, dec11))
+            {
+                Console.Error.WriteLine("SELF-TEST FAILED (Test 34a): HasValidFrameStream accepted undecodable mid-stream 5028.");
+                return 1;
+            }
+            int tokNonPve34 = dec11.Register(new StubRunning { Room = new StubRoom { MapId = 81001 } });
+            var resNonPveBad = ReplayEvaluator.EvaluateBytes("npve-bad", ConcatFrames(MakeFrame(1003, tokNonPve34), badMid5028, MakeFrame(1016, tokFin11)), dec11, forkCatalog);
+            if (resNonPveBad.TruncatedOrCorrupt != 1 || resNonPveBad.SkippedNonPve != 0)
+            {
+                Console.Error.WriteLine("SELF-TEST FAILED (Test 34b): Corrupt mid-stream 5028 hid under SkippedNonPve.");
+                return 1;
+            }
+
+            // Test 35 (Round 6 #5): Duplicate non-PVE replays under different IDs MUST be deduplicated (never dilute DownloadFailRatio).
+            byte[] validNonPve35 = ConcatFrames(MakeFrame(1003, tokNonPve34), MakeFrame(1016, tokFin11));
+            var npveA = ReplayEvaluator.EvaluateBytes("1788434495879901", validNonPve35, dec11, forkCatalog);
+            var npveB = ReplayEvaluator.EvaluateBytes("1788434495879902", validNonPve35, dec11, forkCatalog);
+            var merged35 = Program.DeduplicateAndMerge(new[] { npveA, npveB });
+            if (merged35.SkippedNonPve != 1 || merged35.TruncatedOrCorrupt != 1)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 35): Duplicate non-PVE replay bypassed dedup (nonPve={merged35.SkippedNonPve}, corrupt={merged35.TruncatedOrCorrupt}).");
+                return 1;
+            }
+
+            // Test 36 (Round 6 #6 & #22): Output overwriting --corpus/--maps rejected by TryParseArgs; missing --maps file throws.
+            if (Program.TryParseArgs(new[] { "--protocol-dir", "p", "--maps", "m.json", "--corpus", "ids.txt", "--json-out", "ids.txt" }, out _, out _) ||
+                Program.TryParseArgs(new[] { "--protocol-dir", "p", "--maps", "m.json", "--cache-dir", "c", "--md-out", "m.json" }, out _, out _))
+            {
+                Console.Error.WriteLine("SELF-TEST FAILED (Test 36a): Output overwriting input file was accepted.");
+                return 1;
+            }
+            bool threwMissingMap = false;
+            try { new BoardCatalog().LoadJsonFile(Path.Combine(Path.GetTempPath(), "definitely-missing-map-" + Guid.NewGuid().ToString("N") + ".json")); }
+            catch (FileNotFoundException) { threwMissingMap = true; }
+            if (!threwMissingMap)
+            {
+                Console.Error.WriteLine("SELF-TEST FAILED (Test 36b): Missing map file was silently skipped by BoardCatalog.LoadJsonFile.");
+                return 1;
+            }
+
+            // Test 37 (Round 6 #7, #8, #9, #10):
+            //   37a: IllegalMoveEdges>0 needs cache recovery and is NOT cacheable; clean MissingMap adopted for diagnosis but NOT cacheable.
+            //   37b: Empty 5028 with unknown mover MUST fail as TruncatedOrCorrupt=1 (not ReplaysVerified=1).
+            var illegalSum = new CertificationSummary { ReplaysAttempted = 1, ReplaysVerified = 1, IllegalMoveEdges = 1 };
+            var missingMapSum = new CertificationSummary { ReplaysAttempted = 1, MissingMap = 1 };
+            if (!Program.NeedsCacheRecovery(illegalSum) || Program.IsCacheableAndClean(illegalSum) ||
+                !Program.ShouldAdoptRecoveryResult(missingMapSum) || Program.IsCacheableAndClean(missingMapSum))
+            {
+                Console.Error.WriteLine("SELF-TEST FAILED (Test 37a): Cache recovery / publish policy failed.");
+                return 1;
+            }
+            var dec37 = new StubDecoder();
+            int tokRun37 = dec37.Register(new StubRunning { Room = new StubRoom { MapId = 82016 } });
+            int tokEmptyUnk37 = dec37.Register(new StubMove { PlayerId = 888888, NodeIds = Array.Empty<int>() });
+            int tokFin37 = dec37.Register(new StubFinish());
+            var res37 = ReplayEvaluator.EvaluateBytes("empty-unk",
+                ConcatFrames(MakeFrame(1003, tokRun37), MakeFrame(5028, tokEmptyUnk37), MakeFrame(1016, tokFin37)),
+                dec37, forkCatalog);
+            if (res37.TruncatedOrCorrupt != 1 || res37.ReplaysVerified != 0)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 37b): Empty 5028 unknown mover bypassed check (corrupt={res37.TruncatedOrCorrupt}, verified={res37.ReplaysVerified}).");
+                return 1;
+            }
+
+            // Test 38 (Round 6 #11, #20, #21):
+            //   38a: Sherry Place(->2), then ordinary Place(2->1), then ordinary Place(1->2, Front=[3]) MUST NOT reactivate ShirleyThrow.
+            //   38b: Single corrupt replay (Attempted=1, Verified=0, Corrupt=1) MUST report CoverageGate == Fail (not InsufficientSample).
+            //   38c: Spawn Front=[Blue(4)] when RedBlue=3 and actual move=3 MUST count SpawnF1Actual=0, SpawnF1RedBlue=1.
+            var dec38 = new StubDecoder();
+            int tokRun38 = dec38.Register(new StubRunning
+            {
+                Room = new StubRoom
+                {
+                    MapId = 82016,
+                    Players = new List<StubUnit> { new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 306, NodeId = 1 } } },
+                    Monsters = new List<StubUnit>
+                    {
+                        new StubUnit { Id = 620, Hero = new StubHero { HeroId = 1002, MonsterType = 11, NodeId = 1, BackNodeId = -1, FrontNodeIds = new[] { 2 } } },
+                        new StubUnit { Id = 621, Hero = new StubHero { HeroId = 1002, MonsterType = 11, NodeId = 2, BackNodeId = 1, FrontNodeIds = new[] { 4 } } }
+                    }
+                }
+            });
+            int tokSherry38 = dec38.Register(new StubAttr { PlayerId = 1, Cause = new StubCause { Id = 30601 }, EffectDatas = new List<StubEffect> { new StubEffect { PlayerId = 620, Place = new StubPlace { Place = new StubPlaceInner { NodeId = 2, BackNodeId = 1, FrontNodeIds = new[] { 3 } } } } } });
+            int tokLeave38 = dec38.Register(new StubAttr { PlayerId = 1, EffectDatas = new List<StubEffect> { new StubEffect { PlayerId = 620, Place = new StubPlace { Place = new StubPlaceInner { NodeId = 1, BackNodeId = 2, FrontNodeIds = new[] { 2 } } } } } });
+            int tokReturn38 = dec38.Register(new StubAttr { PlayerId = 1, EffectDatas = new List<StubEffect> { new StubEffect { PlayerId = 620, Place = new StubPlace { Place = new StubPlaceInner { NodeId = 2, BackNodeId = 1, FrontNodeIds = new[] { 3 } } } } } });
+            int tokRoll620 = dec38.Register(new StubThrowDice { PlayerId = 620 });
+            int tokMove620 = dec38.Register(new StubMove { PlayerId = 620, NodeIds = new[] { 2, 3 } }); // Must be 100%-Det (Front=[3]), NOT ShirleyThrow!
+            int tokRoll621 = dec38.Register(new StubThrowDice { PlayerId = 621 });
+            int tokMove621 = dec38.Register(new StubMove { PlayerId = 621, NodeIds = new[] { 2, 3 } }); // Spawn Front=[4], RedBlue=3, actual=3!
+            int tokFin38 = dec38.Register(new StubFinish());
+            var res38 = ReplayEvaluator.EvaluateBytes("stale-tag-audit",
+                ConcatFrames(MakeFrame(1003, tokRun38), MakeFrame(1040, tokSherry38), MakeFrame(1040, tokLeave38), MakeFrame(1040, tokReturn38),
+                    MakeFrame(5022, tokRoll620), MakeFrame(5028, tokMove620),
+                    MakeFrame(5022, tokRoll621), MakeFrame(5028, tokMove621), MakeFrame(1016, tokFin38)),
+                dec38, forkCatalog);
+            if (res38.Buckets["ForkStart"].DetHits != 1 || res38.Buckets["ForkStart"].DetTotal != 1 || res38.Buckets["ForkStart"].ProbTotal != 0)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 38a): Old ShirleyThrow tag reactivated after F->B->F (det={res38.Buckets["ForkStart"].DetTotal}, prob={res38.Buckets["ForkStart"].ProbTotal}).");
+                return 1;
+            }
+            var onlyCorruptGate = ReportWriter.EvaluateGates(new CertificationSummary { ReplaysAttempted = 1, ReplaysVerified = 0, TruncatedOrCorrupt = 1 }, t);
+            if (onlyCorruptGate.CoverageGate != GateStatus.Fail)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 38b): All-corrupt corpus reported {onlyCorruptGate.CoverageGate} instead of Fail.");
+                return 1;
+            }
+            if (res38.FrontAudit.SpawnF1 != 1 || res38.FrontAudit.SpawnF1Actual != 0 || res38.FrontAudit.SpawnF1RedBlue != 1)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 38c): SpawnF1RedBlue did not compare nextTile==rbNext (f1={res38.FrontAudit.SpawnF1}, actual={res38.FrontAudit.SpawnF1Actual}, rb={res38.FrontAudit.SpawnF1RedBlue}).");
+                return 1;
+            }
+
+            Console.WriteLine("ReplayCertifier self-tests PASSED (38/38).");
             return 0;
         }
     }

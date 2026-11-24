@@ -161,11 +161,12 @@ namespace MonsterPathPredictor.ReplayCertifier
                     mapIndex = (int)running.Room.MapIndex;
                     if (mapId < 82000 || mapId >= 84000)
                     {
-                        if (!HasValidFrameStream(bytes, decoder, replayId))
+                        if (!HasValidFrameStream(bytes, decoder, replayId, out string nonPveReplayId))
                         {
                             decodeFailed = true;
                             break;
                         }
+                        summary.VerifiedReplayId = nonPveReplayId;
                         summary.SkippedNonPve = 1;
                         return summary;
                     }
@@ -330,7 +331,18 @@ namespace MonsterPathPredictor.ReplayCertifier
                     if (targetUnit != null)
                     {
                         int nid = (int)mp.NodeId;
-                        if (nid >= 0) targetUnit.NodeId = nid;
+                        if (nid >= 0 && nid != targetUnit.NodeId)
+                        {
+                            targetUnit.NodeId = nid;
+                            targetUnit.PendingSkillMoveKind = SkillMoveKind.None;
+                            targetUnit.PendingSkillMoveLandId = -1;
+                            targetUnit.PendingSkillMovePushDirId = -1;
+                            targetUnit.PendingSkillMovePushFromId = -1;
+                        }
+                        else if (nid >= 0)
+                        {
+                            targetUnit.NodeId = nid;
+                        }
                         targetUnit.BackNodeId = (int)mp.BackId;
                         targetUnit.FrontNodeIds = ToIntArray((IEnumerable)mp.FrontIds);
                     }

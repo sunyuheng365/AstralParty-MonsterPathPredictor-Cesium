@@ -702,5 +702,115 @@ namespace MonsterPathPredictor.Tests
             Assert.Equal(4, longChoice);
             Assert.Equal(longChoice, arrivalChoice);
         }
+
+        [Fact]
+        public void DirectedAdjacencyGraph_LongForecastMatchesArrivalRecomputation()
+        {
+            // Round 5 (#11): Directed 0 -> 1, 1 -> [2, 3] (no 1 -> 0 back-edge), single player at 2.
+            // Both 2-step forecast from 0 and mid-turn arrival recomputation at 1 (From=0, Front=[]) MUST pick 2 at 100%.
+            var board = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(0, new[] { 1 }),
+                new LandNodeSnapshot(1, new[] { 2, 3 }),
+                new LandNodeSnapshot(2, Array.Empty<int>()),
+                new LandNodeSnapshot(3, Array.Empty<int>())
+            });
+            var players = new List<TrackedPlayer>
+            {
+                new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = 2, IsAlive = true, IsTargetable = true }
+            };
+
+            var fromStart = new MonsterState { MonsterId = 951, CurrentLandId = 0, FromLandId = -1, FrontNodeIds = new[] { 1 } };
+            var longPlan = MonsterPathEngine.Plan(board, fromStart, players, new PlanOptions { MaxSteps = 2 });
+            var longExits = longPlan.Forks.Single(f => f.ForkLandId == 1).Exits;
+
+            var atOne = new MonsterState
+            {
+                MonsterId = 951, CurrentLandId = 1, FromLandId = 0,
+                FrontNodeIds = Array.Empty<int>(), IsCurrentlyMovingMidTurn = true
+            };
+            var arrivalPlan = MonsterPathEngine.Plan(board, atOne, players, new PlanOptions { MaxSteps = 1 });
+            var arrivalExits = arrivalPlan.Forks.Single(f => f.ForkLandId == 1).Exits;
+
+            Assert.Single(longExits);
+            Assert.Equal(2, longExits[0].NextLandId);
+            Assert.Single(arrivalExits);
+            Assert.Equal(2, arrivalExits[0].NextLandId);
+        }
+
+        [Fact]
+        public void LargeDiamondGraph_1023DiamondsPerBranch_DoesNotOverflowToDeadEnd()
+        {
+            // Round 5 (#16): 2 equal-length exits merging into 1,023 chained diamonds (2^1023 shortest paths each).
+            // Raw double addition overflows to Infinity; log-domain shortest-path counts must return exact 50%/50%.
+            var adj = new Dictionary<int, List<int>>();
+            void Link(int u, int v)
+            {
+                if (!adj.TryGetValue(u, out var lu)) adj[u] = lu = new List<int>();
+                if (!adj.TryGetValue(v, out var lv)) adj[v] = lv = new List<int>();
+                if (!lu.Contains(v)) lu.Add(v);
+                if (!lv.Contains(u)) lv.Add(u);
+            }
+
+            Link(0, 1);
+            Link(1, 2);
+            Link(1, 3);
+            Link(2, 4);
+            Link(3, 4);
+            int cur = 4;
+            int nextId = 10;
+            for (int d = 0; d < 1023; d++)
+            {
+                int top = nextId++;
+                int bot = nextId++;
+                int nxt = nextId++;
+                Link(cur, top);
+                Link(cur, bot);
+                Link(top, nxt);
+                Link(bot, nxt);
+                cur = nxt;
+            }
+
+            var board = new BoardGraph(adj.Select(kv => new LandNodeSnapshot(kv.Key, kv.Value.ToArray())).ToArray());
+            var players = new List<TrackedPlayer>
+            {
+                new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = cur, IsAlive = true, IsTargetable = true }
+            };
+            var m = new MonsterState { MonsterId = 952, CurrentLandId = 1, FromLandId = 0, IsCurrentlyMovingMidTurn = true };
+
+            var plan = MonsterPathEngine.Plan(board, m, players, new PlanOptions { MaxSteps = 1 });
+            var fork = plan.Forks.Single(f => f.ForkLandId == 1);
+            Assert.Equal(2, fork.Exits.Count);
+            Assert.Equal(0.5, fork.Exits[0].ConditionalProbability, 6);
+            Assert.Equal(0.5, fork.Exits[1].ConditionalProbability, 6);
+        }
+
+        [Fact]
+        public void DashGeometry_ClipsOffscreenEndpointAndCoversFullLongEdgeWithoutTruncation()
+        {
+            // Round 5 (#17): Segment (200,200)->(1200,200) against viewport [0,0,800,600] keeps visible [200..800].
+            bool visible = DashGeometry.TryClipSegmentToRect(
+                new Point2(200f, 200f), new Point2(1200f, 200f),
+                0f, 0f, 800f, 600f,
+                out var ca, out var cb, out float trim);
+            Assert.True(visible);
+            Assert.Equal(200f, ca.X, 3);
+            Assert.Equal(800f, cb.X, 3);
+            Assert.Equal(0f, trim, 3);
+
+            // Round 5 (#18): Long edge (0,0)->(1920,0) with valid config dash=4, gap=2 must span all the way to x=1920.
+            var segs = new List<DashQuad>();
+            DashGeometry.BuildDashedSegmentsInto(segs, new Point2(0f, 0f), new Point2(1920f, 0f), 4f, 2f, 4f, 0f, 0f, 0f);
+            Assert.True(segs.Count > 256);
+            var last = segs[segs.Count - 1];
+            float maxX = Math.Max(Math.Max(last.P0.X, last.P1.X), Math.Max(last.P2.X, last.P3.X));
+            Assert.True(maxX >= 1916f, $"Last dash stopped early at x={maxX}");
+
+            // Extreme 50,000px edge also downscales proportionally to cover the full visible length.
+            DashGeometry.BuildDashedSegmentsInto(segs, new Point2(0f, 0f), new Point2(50000f, 0f), 4f, 2f, 4f, 0f, 0f, 0f);
+            var lastBig = segs[segs.Count - 1];
+            float maxBigX = Math.Max(Math.Max(lastBig.P0.X, lastBig.P1.X), Math.Max(lastBig.P2.X, lastBig.P3.X));
+            Assert.True(maxBigX >= 49900f, $"Extreme edge dash stopped early at x={maxBigX}");
+        }
     }
 }

@@ -9,6 +9,12 @@ namespace MonsterPathPredictor.ReplayCertifier
 {
     internal static partial class ReplayEvaluator
     {
+        private static bool IsStateFrame(int cmd)
+        {
+            return cmd == 1003 || cmd == 1016 || cmd == 1113 || cmd == 1018 || cmd == 5022 ||
+                   cmd == 1040 || cmd == 1096 || cmd == 5214 || cmd == 1007 || cmd == 1115 || cmd == 5028;
+        }
+
         private static (List<(int CmdId, byte[] Payload)> Frames, bool IsTruncated) ReadFrames(byte[] bytes)
         {
             var list = new List<(int, byte[])>();
@@ -30,6 +36,73 @@ namespace MonsterPathPredictor.ReplayCertifier
             }
             if (i != bytes.Length) truncated = true;
             return (list, truncated);
+        }
+
+        /// <summary>
+        /// Structural + lifecycle integrity check for a raw replay stream (no arbitrary byte-size cutoff).
+        /// Verifies non-truncated framing, valid 1003 -> 1016 lifecycle, non-empty state payloads, and optional
+        /// protocol decoding of boundary frames (1003/1016 and pre/post 1040).
+        /// </summary>
+        public static bool HasValidFrameStream(byte[] bytes, IProtocolDecoder decoder = null, string expectedReplayId = null)
+        {
+            var (frames, isTruncated) = ReadFrames(bytes);
+            if (isTruncated || frames.Count == 0) return false;
+
+            var state = StreamLifecycleState.Unstarted;
+            for (int i = 0; i < frames.Count; i++)
+            {
+                var (cmd, payload) = frames[i];
+                bool isState = IsStateFrame(cmd);
+                if (payload.Length == 0)
+                {
+                    if (isState) return false;
+                    continue;
+                }
+
+                if (cmd == 1003)
+                {
+                    if (state != StreamLifecycleState.Unstarted) return false;
+                    if (decoder != null)
+                    {
+                        dynamic running = decoder.TryDecode("party.protocol.RunningGameS2C", payload);
+                        if (running?.Room == null) return false;
+                    }
+                    state = StreamLifecycleState.Running;
+                    continue;
+                }
+
+                if (state == StreamLifecycleState.Unstarted || state == StreamLifecycleState.Finished)
+                {
+                    if (cmd == 1040)
+                    {
+                        if (decoder != null && decoder.TryDecode("party.protocol.UpdateHeroAttrS2C", payload) == null)
+                            return false;
+                        continue;
+                    }
+                    if (isState) return false;
+                    continue;
+                }
+
+                if (cmd == 1016)
+                {
+                    if (decoder != null)
+                    {
+                        dynamic fin = decoder.TryDecode("party.protocol.GameFinishS2C", payload);
+                        if (fin == null) return false;
+                        if (!string.IsNullOrWhiteSpace(expectedReplayId))
+                        {
+                            string finReplayId = null;
+                            try { finReplayId = (string)fin.ReplayId; } catch { }
+                            finReplayId = finReplayId?.Trim();
+                            if (!string.IsNullOrEmpty(finReplayId) &&
+                                !string.Equals(finReplayId, expectedReplayId, StringComparison.Ordinal))
+                                return false;
+                        }
+                    }
+                    state = StreamLifecycleState.Finished;
+                }
+            }
+            return state == StreamLifecycleState.Finished;
         }
 
         private static int[] ToIntArray(IEnumerable items)
@@ -216,13 +289,23 @@ namespace MonsterPathPredictor.ReplayCertifier
                     int newNode = (int)pl.NodeId;
                     int newBack = (int)pl.BackNodeId;
                     int[] newFront = ToIntArray((IEnumerable)pl.FrontNodeIds);
+                    bool tileChanged = newNode >= 0 && newNode != oldNode;
                     if (newNode >= 0) target.NodeId = newNode;
                     target.BackNodeId = newBack;
-                    if (newFront.Length > 0) target.FrontNodeIds = newFront;
+                    if (tileChanged)
+                    {
+                        // Always replace FrontNodeIds on tile change (including empty []) so stale old-tile
+                        // facing can never leak onto the new tile.
+                        target.FrontNodeIds = newFront;
+                    }
+                    else if (newFront.Length > 0)
+                    {
+                        target.FrontNodeIds = newFront;
+                    }
 
                     // Record displacement (From -> To) pair for BOTH 1040.Place and 1096.Place so subsequent
                     // MoveS2C echoes (standalone or prefix-merged) are stripped accurately without false illegal edges.
-                    if (newNode >= 0 && newNode != oldNode)
+                    if (tileChanged)
                     {
                         target.SkillDisplacedFromNode = oldNode;
                         target.SkillDisplacedToNode = newNode;
@@ -230,16 +313,26 @@ namespace MonsterPathPredictor.ReplayCertifier
 
                     if (target.IsMonster && displacementKind != SkillMoveKind.None && newNode >= 0)
                     {
+                        bool sameTileDuplicateLingling =
+                            !tileChanged &&
+                            displacementKind == SkillMoveKind.LinglingPush &&
+                            target.PendingSkillMoveKind == SkillMoveKind.LinglingPush &&
+                            target.PendingSkillMoveLandId == newNode &&
+                            target.PendingSkillMovePushFromId >= 0;
+
                         target.PendingSkillMoveKind = displacementKind;
                         target.PendingSkillMoveLandId = newNode;
-                        target.PendingSkillMovePushDirId = -1;
-                        target.PendingSkillMovePushFromId = -1;
-                        if (displacementKind == SkillMoveKind.LinglingPush)
+                        if (!sameTileDuplicateLingling)
                         {
-                            int casterLand = players.TryGetValue(attrOwner, out var casterUnit) ? casterUnit.NodeId : -1;
-                            InferLinglingPushDirection(board, oldNode, newNode, casterLand, out int pushDir, out int pushFrom);
-                            target.PendingSkillMovePushDirId = pushDir;
-                            target.PendingSkillMovePushFromId = pushFrom;
+                            target.PendingSkillMovePushDirId = -1;
+                            target.PendingSkillMovePushFromId = -1;
+                            if (displacementKind == SkillMoveKind.LinglingPush)
+                            {
+                                int casterLand = players.TryGetValue(attrOwner, out var casterUnit) ? casterUnit.NodeId : -1;
+                                InferLinglingPushDirection(board, tileChanged ? oldNode : -1, newNode, casterLand, out int pushDir, out int pushFrom);
+                                target.PendingSkillMovePushDirId = pushDir;
+                                target.PendingSkillMovePushFromId = pushFrom;
+                            }
                         }
                     }
                 }

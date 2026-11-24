@@ -3,6 +3,7 @@ using System.Buffers.Binary;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
+using System.Security.Cryptography;
 using MonsterPathPredictor.Core;
 
 namespace MonsterPathPredictor.ReplayCertifier
@@ -44,9 +45,14 @@ namespace MonsterPathPredictor.ReplayCertifier
 
         public static CertificationSummary EvaluateBytes(string replayId, byte[] bytes, IProtocolDecoder decoder, BoardCatalog catalog)
         {
-            var summary = new CertificationSummary { ReplaysAttempted = 1 };
+            var summary = new CertificationSummary
+            {
+                ReplaysAttempted = 1,
+                RequestedReplayId = replayId,
+                ContentSha256 = (bytes != null && bytes.Length > 0) ? Convert.ToHexString(SHA256.HashData(bytes)) : null
+            };
             var (frames, isTruncated) = ReadFrames(bytes);
-            if (frames.Count == 0)
+            if (frames.Count == 0 || isTruncated)
             {
                 summary.TruncatedOrCorrupt = 1;
                 return summary;
@@ -136,8 +142,7 @@ namespace MonsterPathPredictor.ReplayCertifier
             for (int fi = 0; fi < frames.Count && !unknownLayout && !decodeFailed && !parseError; fi++)
             {
                 var (cmd, payload) = frames[fi];
-                bool isStateFrame = cmd == 1003 || cmd == 1016 || cmd == 1113 || cmd == 1018 || cmd == 5022 ||
-                                    cmd == 1040 || cmd == 1096 || cmd == 5214 || cmd == 1007 || cmd == 1115 || cmd == 5028;
+                bool isStateFrame = IsStateFrame(cmd);
                 if (payload.Length == 0)
                 {
                     // State-carrying protocol frames must never have empty payload
@@ -154,7 +159,16 @@ namespace MonsterPathPredictor.ReplayCertifier
 
                     mapId = (int)running.Room.MapId;
                     mapIndex = (int)running.Room.MapIndex;
-                    if (mapId < 82000 || mapId >= 84000) { summary.SkippedNonPve = 1; return summary; }
+                    if (mapId < 82000 || mapId >= 84000)
+                    {
+                        if (!HasValidFrameStream(bytes, decoder, replayId))
+                        {
+                            decodeFailed = true;
+                            break;
+                        }
+                        summary.SkippedNonPve = 1;
+                        return summary;
+                    }
                     if (!catalog.TryGetGraph(mapId, mapIndex, out board)) { unknownLayout = true; break; }
 
                     mapStat = new MapStats();
@@ -202,6 +216,18 @@ namespace MonsterPathPredictor.ReplayCertifier
                 {
                     dynamic fin = decoder.TryDecode("party.protocol.GameFinishS2C", payload);
                     if (fin == null) { decodeFailed = true; break; }
+                    string finReplayId = null;
+                    try { finReplayId = (string)fin.ReplayId; } catch { }
+                    finReplayId = finReplayId?.Trim();
+                    if (!string.IsNullOrEmpty(finReplayId))
+                    {
+                        summary.VerifiedReplayId = finReplayId;
+                        if (!string.IsNullOrWhiteSpace(replayId) && !string.Equals(finReplayId, replayId, StringComparison.Ordinal))
+                        {
+                            decodeFailed = true;
+                            break;
+                        }
+                    }
                     lifecycle = StreamLifecycleState.Finished;
                 }
                 else if (cmd == 1113)
@@ -332,8 +358,12 @@ namespace MonsterPathPredictor.ReplayCertifier
                 {
                     dynamic mv = decoder.TryDecode("party.protocol.MoveS2C", payload);
                     if (mv == null) { decodeFailed = true; continue; }
-                    HandleMove(mv, replayId, mapId, curRound, fi, board, players, monsters, spawnedAtTile, pendingMoveEffects,
-                        curTurnActor, startedOnFork, turnStartLandId, ref stepped, ref foughtOnTile, foughtTurn, ref thiefStoleOnTile, mapStat, summary);
+                    if (!HandleMove(mv, replayId, mapId, curRound, fi, board, players, monsters, spawnedAtTile, pendingMoveEffects,
+                            curTurnActor, startedOnFork, turnStartLandId, ref stepped, ref foughtOnTile, foughtTurn, ref thiefStoleOnTile, mapStat, summary))
+                    {
+                        decodeFailed = true;
+                        break;
+                    }
                 }
             }
 
@@ -341,17 +371,45 @@ namespace MonsterPathPredictor.ReplayCertifier
             // so truncated or corrupt replays can NEVER pollute verified corpus accuracy or calibration bins.
             if (unknownLayout)
             {
-                return new CertificationSummary { ReplaysAttempted = 1, MissingMap = 1 };
+                if (!HasValidFrameStream(bytes, decoder, replayId))
+                {
+                    return new CertificationSummary
+                    {
+                        ReplaysAttempted = 1,
+                        RequestedReplayId = replayId,
+                        ContentSha256 = summary.ContentSha256,
+                        TruncatedOrCorrupt = 1,
+                        MissingPredictions = summary.MissingPredictions,
+                        OutOfSupportPredictions = summary.OutOfSupportPredictions,
+                        IllegalMoveEdges = summary.IllegalMoveEdges
+                    };
+                }
+                return new CertificationSummary
+                {
+                    ReplaysAttempted = 1,
+                    RequestedReplayId = replayId,
+                    ContentSha256 = summary.ContentSha256,
+                    MissingMap = 1
+                };
             }
             if (parseError)
             {
-                return new CertificationSummary { ReplaysAttempted = 1, ParseErrors = 1 };
+                return new CertificationSummary
+                {
+                    ReplaysAttempted = 1,
+                    RequestedReplayId = replayId,
+                    ContentSha256 = summary.ContentSha256,
+                    ParseErrors = 1
+                };
             }
             if (isTruncated || decodeFailed || lifecycle != StreamLifecycleState.Finished)
             {
                 return new CertificationSummary
                 {
                     ReplaysAttempted = 1,
+                    RequestedReplayId = replayId,
+                    VerifiedReplayId = summary.VerifiedReplayId,
+                    ContentSha256 = summary.ContentSha256,
                     TruncatedOrCorrupt = 1,
                     MissingPredictions = summary.MissingPredictions,
                     OutOfSupportPredictions = summary.OutOfSupportPredictions,

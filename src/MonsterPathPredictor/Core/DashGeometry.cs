@@ -279,19 +279,31 @@ namespace MonsterPathPredictor.Core
             float period = dashLength + gapLength;
             if (period <= 0.5f) return;
 
+            // Scale period proportionally only if an extreme edge would exceed the safety draw budget,
+            // ensuring the dashed stroke ALWAYS covers 100% of the visible edge without tail truncation.
+            const int maxRenderSegments = 2048;
+            float effDash = dashLength;
+            float effPeriod = period;
+            if (usableLength / effPeriod > maxRenderSegments - 2)
+            {
+                float scale = usableLength / ((maxRenderSegments - 2) * effPeriod);
+                effDash *= scale;
+                effPeriod *= scale;
+            }
+
             float shift = 0f;
             if (!float.IsNaN(phaseOffset) && !float.IsInfinity(phaseOffset))
             {
-                shift = phaseOffset % period;
-                if (shift < 0f) shift += period;
+                shift = phaseOffset % effPeriod;
+                if (shift < 0f) shift += effPeriod;
             }
 
-            float cursor = usableStart + shift - period;
+            float cursor = usableStart + shift - effPeriod;
             int safety = 0;
-            while (cursor < usableEnd - 0.5f && safety++ < 256)
+            while (cursor < usableEnd - 0.5f && safety++ < maxRenderSegments)
             {
                 float segStart = Math.Max(usableStart, cursor);
-                float segEnd = Math.Min(usableEnd, cursor + dashLength);
+                float segEnd = Math.Min(usableEnd, cursor + effDash);
                 if (segEnd - segStart >= 1.5f)
                 {
                     float x0 = start.X + ux * segStart;
@@ -306,8 +318,62 @@ namespace MonsterPathPredictor.Core
                     output.Add(MakePositiveWinding(a, b, c, d));
                 }
 
-                cursor += period;
+                cursor += effPeriod;
             }
+        }
+
+        /// <summary>
+        /// Liang-Barsky 2D segment clipping against an axis-aligned viewport rectangle.
+        /// Returns false if the segment lies completely outside the rectangle; otherwise outputs the clipped
+        /// endpoints plus the exact distance clipped from <paramref name="a"/> so dash phase stays steady.
+        /// </summary>
+        public static bool TryClipSegmentToRect(
+            Point2 a,
+            Point2 b,
+            float minX,
+            float minY,
+            float maxX,
+            float maxY,
+            out Point2 clippedA,
+            out Point2 clippedB,
+            out float startTrimPx)
+        {
+            clippedA = a;
+            clippedB = b;
+            startTrimPx = 0f;
+
+            float dx = b.X - a.X;
+            float dy = b.Y - a.Y;
+            float t0 = 0f;
+            float t1 = 1f;
+
+            bool ClipEdge(float p, float q)
+            {
+                if (Math.Abs(p) < 1e-6f) return q >= 0f;
+                float r = q / p;
+                if (p < 0f)
+                {
+                    if (r > t1) return false;
+                    if (r > t0) t0 = r;
+                }
+                else
+                {
+                    if (r < t0) return false;
+                    if (r < t1) t1 = r;
+                }
+                return true;
+            }
+
+            if (!ClipEdge(-dx, a.X - minX)) return false;
+            if (!ClipEdge(dx, maxX - a.X)) return false;
+            if (!ClipEdge(-dy, a.Y - minY)) return false;
+            if (!ClipEdge(dy, maxY - a.Y)) return false;
+
+            float fullLen = (float)Math.Sqrt(dx * dx + dy * dy);
+            startTrimPx = t0 * fullLen;
+            clippedA = new Point2(a.X + t0 * dx, a.Y + t0 * dy);
+            clippedB = new Point2(a.X + t1 * dx, a.Y + t1 * dy);
+            return true;
         }
 
         private static DashQuad MakePositiveWinding(Point2 a, Point2 b, Point2 c, Point2 d)

@@ -203,6 +203,18 @@ namespace MonsterPathPredictor.ReplayCertifier
                 return false;
             }
 
+            if (!opts.SelfTest && opts.SaveCache && string.IsNullOrWhiteSpace(opts.CacheDir))
+            {
+                error = "ERROR: --save-cache requires --cache-dir <dir>.";
+                return false;
+            }
+
+            if (!opts.SelfTest && ReportWriter.AreSameOutputPath(opts.JsonOut, opts.MdOut))
+            {
+                error = "ERROR: --json-out and --md-out must not resolve to the same file path.";
+                return false;
+            }
+
             return true;
         }
 
@@ -283,38 +295,21 @@ namespace MonsterPathPredictor.ReplayCertifier
 
             var sw = Stopwatch.StartNew();
             var perReplay = new ConcurrentBag<CertificationSummary>();
+            var cacheSeenSha = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
+            var cacheSeenVerifiedId = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
             int processed = 0, cacheHits = 0, streamed = 0;
 
-            async Task<byte[]> DownloadReplayAsync(string id, CancellationToken ct)
+            Task<(byte[] Bytes, bool ReceivedCorruptPayload)> DownloadReplayAsync(string id, CancellationToken ct)
             {
-                string[] cdns = cdnBase.Contains("sereplaycn", StringComparison.OrdinalIgnoreCase)
-                    ? new[] { cdnBase, "https://sereplayjp.feimogames.com/prod/" }
-                    : new[] { cdnBase };
-
-                foreach (string baseUrl in cdns)
-                {
-                    for (int attempt = 0; attempt < 2; attempt++)
-                    {
-                        try
-                        {
-                            byte[] fetched = await client.GetByteArrayAsync(baseUrl + id, ct);
-                            if (fetched.Length > 1000)
-                            {
-                                Interlocked.Increment(ref streamed);
-                                return fetched;
-                            }
-                        }
-                        catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
-                        {
-                            break;
-                        }
-                        catch
-                        {
-                            if (attempt < 1) await Task.Delay(250 * (attempt + 1), ct);
-                        }
-                    }
-                }
-                return null;
+                string[] urls = cdnBase.Contains("sereplaycn", StringComparison.OrdinalIgnoreCase)
+                    ? new[] { cdnBase + id, "https://sereplayjp.feimogames.com/prod/" + id }
+                    : new[] { cdnBase + id };
+                return DownloadReplayFromUrlsAsync(
+                    client,
+                    urls,
+                    fetched => ReplayEvaluator.HasValidFrameStream(fetched, decoder, id),
+                    () => Interlocked.Increment(ref streamed),
+                    ct);
             }
 
             await Parallel.ForEachAsync(replayIds, new ParallelOptions { MaxDegreeOfParallelism = concurrency }, async (id, ct) =>
@@ -322,21 +317,22 @@ namespace MonsterPathPredictor.ReplayCertifier
                 byte[] bytes = null;
                 bool loadedFromCache = false;
                 bool hadCorruptLocalFile = false;
+                bool receivedCorruptRemote = false;
                 string cachedPath = ResolveCachedReplayPath(cacheDir, id);
                 if (cachedPath != null)
                 {
                     try
                     {
-                        var fi = new FileInfo(cachedPath);
-                        if (fi.Length > 1000)
+                        bytes = await File.ReadAllBytesAsync(cachedPath, ct);
+                        if (bytes.Length == 0)
                         {
-                            bytes = await File.ReadAllBytesAsync(cachedPath, ct);
-                            loadedFromCache = true;
-                            Interlocked.Increment(ref cacheHits);
+                            bytes = null;
+                            hadCorruptLocalFile = true;
                         }
                         else
                         {
-                            hadCorruptLocalFile = true;
+                            loadedFromCache = true;
+                            Interlocked.Increment(ref cacheHits);
                         }
                     }
                     catch (Exception ex)
@@ -348,29 +344,29 @@ namespace MonsterPathPredictor.ReplayCertifier
 
                 if (bytes == null)
                 {
-                    bytes = await DownloadReplayAsync(id, ct);
+                    (bytes, receivedCorruptRemote) = await DownloadReplayAsync(id, ct);
                 }
 
                 CertificationSummary local;
                 if (bytes == null)
                 {
-                    local = hadCorruptLocalFile
-                        ? new CertificationSummary { ReplaysAttempted = 1, TruncatedOrCorrupt = 1 }
-                        : new CertificationSummary { ReplaysAttempted = 1, DownloadFailed = 1 };
+                    local = (hadCorruptLocalFile || receivedCorruptRemote)
+                        ? new CertificationSummary { ReplaysAttempted = 1, RequestedReplayId = id, TruncatedOrCorrupt = 1 }
+                        : new CertificationSummary { ReplaysAttempted = 1, RequestedReplayId = id, DownloadFailed = 1 };
                 }
                 else
                 {
                     local = SafeEvaluateReplay(id, bytes, decoder, catalog);
 
-                    // If an existing cached file (>1000B) evaluated as corrupt/parse-error, allow ONE automatic CDN
-                    // recovery attempt before classifying as corrupt, and never persist corrupt downloads to cache.
+                    // If an existing cached file evaluated as corrupt/parse-error, allow ONE automatic CDN
+                    // recovery attempt before classifying as corrupt, and never overwrite cache with corrupt/missing-map payloads.
                     if (loadedFromCache && (local.TruncatedOrCorrupt > 0 || local.ParseErrors > 0))
                     {
-                        byte[] refreshed = await DownloadReplayAsync(id, ct);
+                        var (refreshed, _) = await DownloadReplayAsync(id, ct);
                         if (refreshed != null)
                         {
                             var refreshedResult = SafeEvaluateReplay(id, refreshed, decoder, catalog);
-                            if (refreshedResult.TruncatedOrCorrupt == 0 && refreshedResult.ParseErrors == 0)
+                            if (refreshedResult.ReplaysVerified == 1 || refreshedResult.SkippedNonPve == 1)
                             {
                                 bytes = refreshed;
                                 local = refreshedResult;
@@ -379,11 +375,19 @@ namespace MonsterPathPredictor.ReplayCertifier
                         }
                     }
 
-                    // Atomically publish to cache ONLY AFTER verifying the replay is not corrupt/parse-error.
-                    if (!loadedFromCache && saveCache && savePath != null &&
-                        local.TruncatedOrCorrupt == 0 && local.ParseErrors == 0)
+                    // Atomically publish to cache ONLY AFTER verifying full stream integrity and uniqueness
+                    // (never persist TruncatedOrCorrupt, ParseErrors, MissingMap, or duplicate replay copies).
+                    if (local.ReplaysVerified == 1 || local.SkippedNonPve == 1)
                     {
-                        TryWriteCacheAtomic(savePath, bytes);
+                        bool uniqueForCache = true;
+                        if (!string.IsNullOrEmpty(local.ContentSha256) && !cacheSeenSha.TryAdd(local.ContentSha256, 0))
+                            uniqueForCache = false;
+                        if (uniqueForCache && !string.IsNullOrEmpty(local.VerifiedReplayId) && !cacheSeenVerifiedId.TryAdd(local.VerifiedReplayId, 0))
+                            uniqueForCache = false;
+                        if (!loadedFromCache && saveCache && savePath != null && uniqueForCache)
+                        {
+                            TryWriteCacheAtomic(savePath, bytes);
+                        }
                     }
                 }
 
@@ -394,11 +398,88 @@ namespace MonsterPathPredictor.ReplayCertifier
             });
 
             sw.Stop();
-            var total = new CertificationSummary();
-            foreach (var item in perReplay) total.MergeFrom(item);
+            var total = DeduplicateAndMerge(perReplay);
 
             bool passed = ReportWriter.PrintAndExport(total, catalog, sw.Elapsed.TotalSeconds, thresholds, jsonOut, mdOut);
             return passed ? 0 : 2;
+        }
+
+        public static async Task<(byte[] Bytes, bool ReceivedCorruptPayload)> DownloadReplayFromUrlsAsync(
+            HttpClient client,
+            IReadOnlyList<string> urls,
+            Func<byte[], bool> isValidPayload,
+            Action onStreamedSuccess,
+            CancellationToken ct)
+        {
+            bool receivedCorrupt = false;
+            for (int u = 0; u < urls.Count; u++)
+            {
+                string url = urls[u];
+                for (int attempt = 0; attempt < 2; attempt++)
+                {
+                    try
+                    {
+                        using var resp = await client.GetAsync(url, ct);
+                        if (resp.StatusCode == System.Net.HttpStatusCode.NotFound)
+                        {
+                            break;
+                        }
+                        resp.EnsureSuccessStatusCode();
+                        byte[] fetched = await resp.Content.ReadAsByteArrayAsync(ct);
+                        if (isValidPayload(fetched))
+                        {
+                            onStreamedSuccess?.Invoke();
+                            return (fetched, false);
+                        }
+                        receivedCorrupt = true;
+                        if (attempt < 1) await Task.Delay(150 * (attempt + 1), ct);
+                    }
+                    catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+                    {
+                        break;
+                    }
+                    catch
+                    {
+                        if (attempt < 1) await Task.Delay(250 * (attempt + 1), ct);
+                    }
+                }
+            }
+            return (null, receivedCorrupt);
+        }
+
+        public static CertificationSummary DeduplicateAndMerge(IEnumerable<CertificationSummary> items)
+        {
+            var total = new CertificationSummary();
+            if (items == null) return total;
+
+            var seenSha = new HashSet<string>(StringComparer.Ordinal);
+            var seenVerifiedId = new HashSet<string>(StringComparer.Ordinal);
+
+            var ordered = items
+                .Select((item, idx) => (item, idx))
+                .OrderBy(t => t.item?.RequestedReplayId ?? string.Empty, StringComparer.Ordinal)
+                .ThenBy(t => t.idx);
+
+            foreach (var (item, _) in ordered)
+            {
+                if (item == null) continue;
+                if (item.ReplaysVerified > 0)
+                {
+                    bool dupSha = !string.IsNullOrEmpty(item.ContentSha256) && !seenSha.Add(item.ContentSha256);
+                    bool dupId = !string.IsNullOrEmpty(item.VerifiedReplayId) && !seenVerifiedId.Add(item.VerifiedReplayId);
+                    if (dupSha || dupId)
+                    {
+                        total.MergeFrom(new CertificationSummary
+                        {
+                            ReplaysAttempted = item.ReplaysAttempted > 0 ? item.ReplaysAttempted : 1,
+                            TruncatedOrCorrupt = 1
+                        });
+                        continue;
+                    }
+                }
+                total.MergeFrom(item);
+            }
+            return total;
         }
 
         private static bool IsValidReplayId(string s)

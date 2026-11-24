@@ -3,6 +3,10 @@ using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Threading;
+using System.Threading.Tasks;
 using MonsterPathPredictor.Core;
 
 namespace MonsterPathPredictor.ReplayCertifier
@@ -38,7 +42,15 @@ namespace MonsterPathPredictor.ReplayCertifier
         public sealed class StubUnit { public long Id { get; set; } public int Slot { get; set; } public int ChangeSlot { get; set; } = -1; public StubHero Hero { get; set; } }
         public sealed class StubRoom { public int MapId { get; set; } = 82016; public int MapIndex { get; set; } public int Round { get; set; } = 1; public List<StubUnit> Players { get; set; } = new(); public List<StubUnit> Monsters { get; set; } = new(); }
         public sealed class StubRunning { public StubRoom Room { get; set; } }
-        public sealed class StubFinish { public int Winner { get; set; } }
+        public sealed class StubFinish { public int Winner { get; set; } public string ReplayId { get; set; } }
+
+        private sealed class StubHttpHandler : HttpMessageHandler
+        {
+            private readonly Func<string, HttpResponseMessage> _responder;
+            public StubHttpHandler(Func<string, HttpResponseMessage> responder) => _responder = responder;
+            protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+                => Task.FromResult(_responder(request.RequestUri!.ToString()));
+        }
         public sealed class StubThrowDice { public long PlayerId { get; set; } }
         public sealed class StubMove { public long PlayerId { get; set; } public int[] NodeIds { get; set; } }
         public sealed class StubGold { public int ChangeGold { get; set; } public int CurrGold { get; set; } }
@@ -651,7 +663,227 @@ namespace MonsterPathPredictor.ReplayCertifier
                 return 1;
             }
 
-            Console.WriteLine("ReplayCertifier self-tests PASSED (23/23).");
+            // Test 24 (Round 5 #1): Mismatched 1016.ReplayId fails as TruncatedOrCorrupt, and identical content under
+            //          two different requested IDs is deduplicated (never double-counted) in DeduplicateAndMerge.
+            var dec24 = new StubDecoder();
+            int tokRun24 = dec24.Register(new StubRunning { Room = new StubRoom { MapId = 82016 } });
+            int tokFinMatch24 = dec24.Register(new StubFinish { ReplayId = "1788434495879801" });
+            int tokFinNoId24 = dec24.Register(new StubFinish());
+            byte[] replayWithId24 = ConcatFrames(MakeFrame(1003, tokRun24), MakeFrame(1016, tokFinMatch24));
+            var r24Ok = ReplayEvaluator.EvaluateBytes("1788434495879801", replayWithId24, dec24, forkCatalog);
+            var r24Spoof = ReplayEvaluator.EvaluateBytes("1788434495879802", replayWithId24, dec24, forkCatalog);
+            if (r24Ok.ReplaysVerified != 1 || r24Spoof.ReplaysVerified != 0 || r24Spoof.TruncatedOrCorrupt != 1)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 24a): Mismatched 1016.ReplayId was not rejected (ok={r24Ok.ReplaysVerified}, spoofCorrupt={r24Spoof.TruncatedOrCorrupt}).");
+                return 1;
+            }
+            byte[] legacyNoId24 = ConcatFrames(MakeFrame(1003, tokRun24), MakeFrame(1016, tokFinNoId24));
+            var r24DupA = ReplayEvaluator.EvaluateBytes("1788434495879803", legacyNoId24, dec24, forkCatalog);
+            var r24DupB = ReplayEvaluator.EvaluateBytes("1788434495879804", legacyNoId24, dec24, forkCatalog);
+            var merged24 = Program.DeduplicateAndMerge(new[] { r24DupA, r24DupB });
+            if (merged24.ReplaysVerified != 1 || merged24.TruncatedOrCorrupt != 1)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 24b): Duplicate legacy replay was double-counted (verified={merged24.ReplaysVerified}, corrupt={merged24.TruncatedOrCorrupt}).");
+                return 1;
+            }
+
+            // Test 25 (Round 5 #2): 0.50004 / 0.49996 repeated 30x always picking exit 1 MUST NOT merge into "50.00%" (z=0);
+            //          precision must escalate to 3 decimals ("50.004%" / "49.996%") and FAIL GATE 3!
+            var tightExits = new List<ForkExitPrediction>
+            {
+                new() { NextLandId = 22, ConditionalProbability = 0.50004 },
+                new() { NextLandId = 55, ConditionalProbability = 0.49996 }
+            };
+            var tightBias = new CertificationSummary { ReplaysAttempted = 10, ReplaysVerified = 10 };
+            PopulatePassingBaseline(tightBias);
+            for (int i = 0; i < 30; i++) ReplayEvaluator.RecordMultiBranchCalibration(board, 23, tightExits, actualNext: 22, tightBias.ProbBins);
+            var e25 = ReportWriter.EvaluateGates(tightBias, t);
+            if (!tightBias.ProbBins.ContainsKey("50.004%") || !tightBias.ProbBins.ContainsKey("49.996%") ||
+                tightBias.ProbBins.ContainsKey("50.00%") || e25.CalibrationGate != GateStatus.Fail)
+            {
+                Console.Error.WriteLine("SELF-TEST FAILED (Test 25): 0.50004/0.49996 collided and hid bias: " + string.Join(",", tightBias.ProbBins.Keys));
+                return 1;
+            }
+
+            // Test 26 (Round 5 #3 & #4):
+            //   26a: HTTP 200 7-byte corrupt body from all CDNs sets ReceivedCorruptPayload=true (NOT DownloadFailed).
+            //   26b: HTTP 200 1001-byte corrupt body on primary CDN falls back to valid backup CDN.
+            //   26c: Truncated stream with missing map MUST return TruncatedOrCorrupt=1 (NOT MissingMap=1).
+            byte[] validSmall = ConcatFrames(MakeFrame(1003, tokRun11), MakeFrame(1016, tokFin11));
+            using (var c26a = new HttpClient(new StubHttpHandler(_ => new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(new byte[7]) })))
+            {
+                var (b26a, corrupt26a) = Program.DownloadReplayFromUrlsAsync(c26a, new[] { "http://cdn1/1", "http://cdn2/1" },
+                    b => ReplayEvaluator.HasValidFrameStream(b, dec11), null, CancellationToken.None).GetAwaiter().GetResult();
+                if (b26a != null || !corrupt26a)
+                {
+                    Console.Error.WriteLine($"SELF-TEST FAILED (Test 26a): 7-byte HTTP 200 corrupt body did not set ReceivedCorruptPayload (corrupt={corrupt26a}).");
+                    return 1;
+                }
+            }
+            using (var c26b = new HttpClient(new StubHttpHandler(url => url.Contains("cdn1")
+                ? new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(new byte[1001]) }
+                : new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(validSmall) })))
+            {
+                var (b26b, corrupt26b) = Program.DownloadReplayFromUrlsAsync(c26b, new[] { "http://cdn1/1", "http://cdn2/1" },
+                    b => ReplayEvaluator.HasValidFrameStream(b, dec11), null, CancellationToken.None).GetAwaiter().GetResult();
+                if (b26b == null || corrupt26b)
+                {
+                    Console.Error.WriteLine("SELF-TEST FAILED (Test 26b): 1001-byte corrupt primary did not fall back to valid backup CDN.");
+                    return 1;
+                }
+            }
+            int tokUnknownMap26 = dec11.Register(new StubRunning { Room = new StubRoom { MapId = 82999, MapIndex = 0 } });
+            byte[] truncUnknownMap = MakeFrame(1003, tokUnknownMap26).Concat(new byte[7]).ToArray();
+            var res26c = ReplayEvaluator.EvaluateBytes("trunc-miss", truncUnknownMap, dec11, forkCatalog);
+            if (res26c.TruncatedOrCorrupt != 1 || res26c.MissingMap != 0)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 26c): Truncated missing-map replay misclassified (corrupt={res26c.TruncatedOrCorrupt}, missing={res26c.MissingMap}).");
+                return 1;
+            }
+
+            // Test 27 (Round 5 #5): Unknown mover 5028 [1, 5] (non-adjacent) MUST flag IllegalMoveEdges=1 AND TruncatedOrCorrupt=1
+            var dec27 = new StubDecoder();
+            int tokRun27 = dec27.Register(new StubRunning { Room = new StubRoom { MapId = 82016 } });
+            int tokMoveUnk27 = dec27.Register(new StubMove { PlayerId = 999999, NodeIds = new[] { 1, 5 } });
+            int tokFin27 = dec27.Register(new StubFinish());
+            var res27 = ReplayEvaluator.EvaluateBytes("unk-mover",
+                ConcatFrames(MakeFrame(1003, tokRun27), MakeFrame(5028, tokMoveUnk27), MakeFrame(1016, tokFin27)),
+                dec27, forkCatalog);
+            if (res27.IllegalMoveEdges != 1 || res27.TruncatedOrCorrupt != 1 || res27.ReplaysVerified != 0)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 27): Unknown mover illegal move bypassed checks (illegal={res27.IllegalMoveEdges}, corrupt={res27.TruncatedOrCorrupt}, verified={res27.ReplaysVerified}).");
+                return 1;
+            }
+
+            // Test 28 (Round 5 #6): Split [1,2]+[2,3,4] and merged [1,2,3,4] after 1096 deferred NotSelect on landing tile 2
+            //          MUST yield identical multi-branch 50/50 predictions at Fork 3 (not 100% -> 4 on merged frame).
+            var cat28 = BuildTestCatalog(82016,
+                "{\"id\":1,\"neighbors\":[2]},{\"id\":2,\"neighbors\":[3,1]},{\"id\":3,\"neighbors\":[4,5,2]},{\"id\":4,\"neighbors\":[3]},{\"id\":5,\"neighbors\":[3]}");
+            CertificationSummary RunCase28(bool mergedMove)
+            {
+                var d = new StubDecoder();
+                int r = d.Register(new StubRunning
+                {
+                    Room = new StubRoom
+                    {
+                        MapId = 82016,
+                        Players = new List<StubUnit> { new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 101, NodeId = 4 } } },
+                        Monsters = new List<StubUnit> { new StubUnit { Id = 500, Hero = new StubHero { HeroId = 1002, MonsterType = 11, NodeId = 1, BackNodeId = -1, FrontNodeIds = new[] { 2 } } } }
+                    }
+                });
+                int roll = d.Register(new StubThrowDice { PlayerId = 500 });
+                int sm = d.Register(new StubSkillMoveEffect
+                {
+                    PlayerId = 500,
+                    EffectData = new Dictionary<int, StubMoveEffectBucket>
+                    {
+                        [2] = new StubMoveEffectBucket { Effects = new List<StubAttr> { new StubAttr { PlayerId = 500, EffectDatas = new List<StubEffect> { new StubEffect { PlayerId = 1, NotSelect = new StubNotSelect { NotSelect = true } } } } } }
+                    }
+                });
+                int pl = d.Register(new StubAttr
+                {
+                    PlayerId = 1,
+                    EffectDatas = new List<StubEffect> { new StubEffect { PlayerId = 500, Place = new StubPlace { Place = new StubPlaceInner { NodeId = 2, BackNodeId = 1, FrontNodeIds = new[] { 3 } } } } }
+                });
+                int fin = d.Register(new StubFinish());
+                if (mergedMove)
+                {
+                    int mv = d.Register(new StubMove { PlayerId = 500, NodeIds = new[] { 1, 2, 3, 4 } });
+                    return ReplayEvaluator.EvaluateBytes("m28", ConcatFrames(MakeFrame(1003, r), MakeFrame(5022, roll), MakeFrame(1096, sm), MakeFrame(1040, pl), MakeFrame(5028, mv), MakeFrame(1016, fin)), d, cat28);
+                }
+                int mv1 = d.Register(new StubMove { PlayerId = 500, NodeIds = new[] { 1, 2 } });
+                int mv2 = d.Register(new StubMove { PlayerId = 500, NodeIds = new[] { 2, 3, 4 } });
+                return ReplayEvaluator.EvaluateBytes("s28", ConcatFrames(MakeFrame(1003, r), MakeFrame(5022, roll), MakeFrame(1096, sm), MakeFrame(1040, pl), MakeFrame(5028, mv1), MakeFrame(5028, mv2), MakeFrame(1016, fin)), d, cat28);
+            }
+            var split28 = RunCase28(false);
+            var merged28 = RunCase28(true);
+            if (split28.Buckets["MidWalkFork"].ProbTotal != 1 || merged28.Buckets["MidWalkFork"].ProbTotal != 1 ||
+                split28.Buckets["MidWalkFork"].DetTotal != 0 || merged28.Buckets["MidWalkFork"].DetTotal != 0)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 28): Merged vs split 1096 landing effect diverged (splitProb={split28.Buckets["MidWalkFork"].ProbTotal}, mergedProb={merged28.Buckets["MidWalkFork"].ProbTotal}).");
+                return 1;
+            }
+
+            // Test 29 (Round 5 #7 & #8):
+            //   29a: Duplicate same-tile Lingling (12801) 1040.Place MUST preserve PushFrom=3 so monster exits to 4 (not back to 3).
+            //   29b: Normal Place changing tile 1->2 with FrontNodeIds=[] MUST NOT inherit stale tile-1 Front=[4]; must follow Red(3).
+            var dec29 = new StubDecoder();
+            int tokRun29 = dec29.Register(new StubRunning
+            {
+                Room = new StubRoom
+                {
+                    MapId = 82016,
+                    Players = new List<StubUnit> { new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 128, NodeId = 1 } } },
+                    Monsters = new List<StubUnit>
+                    {
+                        new StubUnit { Id = 510, Hero = new StubHero { HeroId = 1002, MonsterType = 11, NodeId = 3, BackNodeId = -1, FrontNodeIds = new[] { 2 } } },
+                        new StubUnit { Id = 511, Hero = new StubHero { HeroId = 1002, MonsterType = 11, NodeId = 1, BackNodeId = -1, FrontNodeIds = new[] { 4 } } }
+                    }
+                }
+            });
+            int tokLing1 = dec29.Register(new StubAttr
+            {
+                PlayerId = 1, Cause = new StubCause { Id = 12801 },
+                EffectDatas = new List<StubEffect> { new StubEffect { PlayerId = 510, Place = new StubPlace { Place = new StubPlaceInner { NodeId = 2, BackNodeId = 3, FrontNodeIds = Array.Empty<int>() } } } }
+            });
+            int tokLingDup = dec29.Register(new StubAttr
+            {
+                PlayerId = 1, Cause = new StubCause { Id = 12801 },
+                EffectDatas = new List<StubEffect> { new StubEffect { PlayerId = 510, Place = new StubPlace { Place = new StubPlaceInner { NodeId = 2, BackNodeId = 3, FrontNodeIds = Array.Empty<int>() } } } }
+            });
+            int tokRoll510 = dec29.Register(new StubThrowDice { PlayerId = 510 });
+            int tokMove510 = dec29.Register(new StubMove { PlayerId = 510, NodeIds = new[] { 2, 4 } }); // Must predict 4 (not 3)!
+            int tokEmptyFrontPlace = dec29.Register(new StubAttr
+            {
+                PlayerId = 1,
+                EffectDatas = new List<StubEffect> { new StubEffect { PlayerId = 511, Place = new StubPlace { Place = new StubPlaceInner { NodeId = 2, BackNodeId = 1, FrontNodeIds = Array.Empty<int>() } } } }
+            });
+            int tokRoll511 = dec29.Register(new StubThrowDice { PlayerId = 511 });
+            int tokMove511 = dec29.Register(new StubMove { PlayerId = 511, NodeIds = new[] { 2, 3 } }); // Must predict Red(3), NOT stale 4!
+            int tokFin29 = dec29.Register(new StubFinish());
+            var res29 = ReplayEvaluator.EvaluateBytes("ling-front",
+                ConcatFrames(MakeFrame(1003, tokRun29), MakeFrame(1040, tokLing1), MakeFrame(1040, tokLingDup),
+                    MakeFrame(5022, tokRoll510), MakeFrame(5028, tokMove510),
+                    MakeFrame(1040, tokEmptyFrontPlace), MakeFrame(5022, tokRoll511), MakeFrame(5028, tokMove511), MakeFrame(1016, tokFin29)),
+                dec29, forkCatalog);
+            if (res29.Buckets["ForkStart"].DetHits != 2 || res29.Buckets["ForkStart"].DetTotal != 2)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 29): Duplicate Lingling Place or empty FrontNodeIds failed (hits={res29.Buckets["ForkStart"].DetHits}/{res29.Buckets["ForkStart"].DetTotal}).");
+                return 1;
+            }
+
+            // Test 30 (Round 5 #12, #13, #14, #15):
+            //   30a: Negative MinCalibratedBins=-1 fails EvaluateGates even with empty ProbBins (#12).
+            //   30b: Bucket OutOfSupport exports consistent outOfSupportCount=1 & mismatchCount=1 in JSON (#13).
+            //   30c: Same --json-out & --md-out path AND --save-cache without --cache-dir rejected by TryParseArgs (#14, #15).
+            var negGate = ReportWriter.EvaluateGates(new CertificationSummary { ReplaysAttempted = 10, ReplaysVerified = 10 },
+                new GateThresholds { MinCalibratedBins = -1 });
+            if (negGate.Passed || negGate.CalibrationGate != GateStatus.Fail)
+            {
+                Console.Error.WriteLine("SELF-TEST FAILED (Test 30a): Negative MinCalibratedBins bypassed EvaluateGates.");
+                return 1;
+            }
+            string tmpJson30 = Path.Combine(Path.GetTempPath(), "certifier-oos-" + Guid.NewGuid().ToString("N") + ".json");
+            try
+            {
+                ReportWriter.PrintAndExport(res13, forkCatalog, 0.1, t, tmpJson30, null);
+                using var doc30 = System.Text.Json.JsonDocument.Parse(File.ReadAllText(tmpJson30));
+                var thiefElem = doc30.RootElement.GetProperty("buckets").EnumerateArray().First(b => b.GetProperty("Key").GetString() == "ThiefFork");
+                if (thiefElem.GetProperty("outOfSupportCount").GetInt64() != 1 || thiefElem.GetProperty("mismatchCount").GetInt64() != 1)
+                {
+                    Console.Error.WriteLine("SELF-TEST FAILED (Test 30b): Out-of-support JSON mismatchCount/outOfSupportCount inconsistent.");
+                    return 1;
+                }
+            }
+            finally { try { if (File.Exists(tmpJson30)) File.Delete(tmpJson30); } catch { } }
+            if (Program.TryParseArgs(new[] { "--protocol-dir", "p", "--maps", "m.json", "--corpus", "ids.txt", "--save-cache" }, out _, out _) ||
+                Program.TryParseArgs(new[] { "--protocol-dir", "p", "--maps", "m.json", "--cache-dir", "c", "--json-out", "rep.out", "--md-out", "./rep.out" }, out _, out _))
+            {
+                Console.Error.WriteLine("SELF-TEST FAILED (Test 30c): --save-cache without --cache-dir or colliding output paths was accepted.");
+                return 1;
+            }
+
+            Console.WriteLine("ReplayCertifier self-tests PASSED (30/30).");
             return 0;
         }
     }

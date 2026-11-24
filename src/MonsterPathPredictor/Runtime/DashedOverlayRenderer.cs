@@ -154,7 +154,7 @@ namespace MonsterPathPredictor.Runtime
             }
 
             _screenCache.Clear();
-            bool TryProjectTile(int landId, out Point2 pt)
+            bool TryProjectTileRaw(int landId, out Point2 pt)
             {
                 if (_screenCache.TryGetValue(landId, out pt)) return true;
                 if (!board.TryGetNode(landId, out var node))
@@ -163,9 +163,15 @@ namespace MonsterPathPredictor.Runtime
                     return false;
                 }
                 var world = new Vector3(node.X, node.Y + hOffset, node.Z);
-                if (!TryProjectWorld(layer, camera, camPos, camForward, world, out pt)) return false;
+                if (!TryProjectWorldUnclipped(layer, camera, camPos, camForward, world, out pt)) return false;
                 _screenCache[landId] = pt;
                 return true;
+            }
+
+            bool TryProjectTile(int landId, out Point2 pt)
+            {
+                if (!TryProjectTileRaw(landId, out pt)) return false;
+                return pt.X >= -300f && pt.X <= layer.width + 300f && pt.Y >= -300f && pt.Y <= layer.height + 300f;
             }
 
             // 1. Highlight dot on the selected monster's starting tile
@@ -174,12 +180,17 @@ namespace MonsterPathPredictor.Runtime
                 DrawDot(startPt, 8.5f, RingColor);
             }
 
-            // 2. Animated forward-marching dashed lines for all predicted edges (zero-alloc buffers)
+            // 2. Animated forward-marching dashed lines for all predicted edges (unclipped projection + viewport clip
+            //    so visible portions of edges with an off-screen endpoint still render cleanly).
             for (int i = 0; i < plan.Edges.Count; i++)
             {
                 var edge = plan.Edges[i];
-                if (!TryProjectTile(edge.FromLandId, out var pFrom)) continue;
-                if (!TryProjectTile(edge.ToLandId, out var pTo)) continue;
+                if (!TryProjectTileRaw(edge.FromLandId, out var pFrom)) continue;
+                if (!TryProjectTileRaw(edge.ToLandId, out var pTo)) continue;
+
+                if (!DashGeometry.TryClipSegmentToRect(pFrom, pTo, -40f, -40f, layer.width + 40f, layer.height + 40f,
+                        out var clipFrom, out var clipTo, out float clippedFromStartPx))
+                    continue;
 
                 Color color = PickEdgeColor(edge.Probability, edge.IsAfterCombat);
                 float baseWidth = edge.IsAfterCombat ? Math.Max(2.2f, settings.LineWidth * 0.78f) : settings.LineWidth;
@@ -187,24 +198,30 @@ namespace MonsterPathPredictor.Runtime
                     ? baseWidth
                     : Math.Max(2.0f, baseWidth * (0.65f + 0.35f * (float)edge.Probability));
 
+                float trimStart = Math.Max(0f, (edge.EarliestStep == 0 ? 10f : 3f) - clippedFromStartPx);
+                float fullEdgeLen = pFrom.DistanceTo(pTo);
+                float clippedEndPx = Math.Max(0f, fullEdgeLen - clippedFromStartPx - clipFrom.DistanceTo(clipTo));
+                float trimEnd = Math.Max(0f, 3f - clippedEndPx);
+
                 DashGeometry.BuildDashedSegmentsInto(
                     _dashQuadBuf,
-                    pFrom, pTo,
+                    clipFrom, clipTo,
                     settings.DashLength,
                     settings.GapLength,
                     width,
-                    trimStart: edge.EarliestStep == 0 ? 10f : 3f,
-                    trimEnd: 3f,
-                    phaseOffset: phaseOffset);
+                    trimStart: trimStart,
+                    trimEnd: trimEnd,
+                    phaseOffset: phaseOffset - clippedFromStartPx);
 
                 for (int q = 0; q < _dashQuadBuf.Count; q++)
                 {
                     DrawQuad(_dashQuadBuf[q], color);
                 }
 
-                // Draw directional chevron on the very first step out of the monster
+                // Draw directional chevron on the very first step out of the monster (only when visible)
                 if (edge.EarliestStep == 0 &&
-                    DashGeometry.TryBuildArrowHead(pFrom, pTo, Math.Max(12f, width * 3.1f), Math.Max(6f, width * 1.6f), out var head, 0.60f))
+                    DashGeometry.TryBuildArrowHead(pFrom, pTo, Math.Max(12f, width * 3.1f), Math.Max(6f, width * 1.6f), out var head, 0.60f) &&
+                    head.P0.X >= -60f && head.P0.X <= layer.width + 60f && head.P0.Y >= -60f && head.P0.Y <= layer.height + 60f)
                 {
                     DrawTriangle(head, color);
                 }
@@ -421,7 +438,7 @@ namespace MonsterPathPredictor.Runtime
             return PickEdgeColor(exit.ConditionalProbability, fork.IsAfterCombat);
         }
 
-        private static bool TryProjectWorld(
+        private static bool TryProjectWorldUnclipped(
             GComponent layer,
             Camera camera,
             Vector3 camPos,
@@ -434,9 +451,21 @@ namespace MonsterPathPredictor.Runtime
             Vector2 local = layer.WorldToLocal(world, camera);
             if (float.IsNaN(local.x) || float.IsInfinity(local.x) || float.IsNaN(local.y) || float.IsInfinity(local.y))
                 return false;
-            if (local.x < -300f || local.x > layer.width + 300f || local.y < -300f || local.y > layer.height + 300f)
-                return false;
             pt = new Point2(local.x, local.y);
+            return true;
+        }
+
+        private static bool TryProjectWorld(
+            GComponent layer,
+            Camera camera,
+            Vector3 camPos,
+            Vector3 camForward,
+            Vector3 world,
+            out Point2 pt)
+        {
+            if (!TryProjectWorldUnclipped(layer, camera, camPos, camForward, world, out pt)) return false;
+            if (pt.X < -300f || pt.X > layer.width + 300f || pt.Y < -300f || pt.Y > layer.height + 300f)
+                return false;
             return true;
         }
 

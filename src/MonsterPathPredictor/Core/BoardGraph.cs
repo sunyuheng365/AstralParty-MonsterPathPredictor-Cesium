@@ -35,15 +35,15 @@ namespace MonsterPathPredictor.Core
     public sealed class ShortestPathField
     {
         private readonly Dictionary<int, int> _distances;
-        private readonly Dictionary<int, double> _pathCounts;
+        private readonly Dictionary<int, double> _logPathCounts;
 
         public int TargetLandId { get; }
 
-        internal ShortestPathField(int targetLandId, Dictionary<int, int> distances, Dictionary<int, double> pathCounts)
+        internal ShortestPathField(int targetLandId, Dictionary<int, int> distances, Dictionary<int, double> logPathCounts)
         {
             TargetLandId = targetLandId;
             _distances = distances;
-            _pathCounts = pathCounts;
+            _logPathCounts = logPathCounts;
         }
 
         public bool IsReachable(int fromLandId) => _distances.ContainsKey(fromLandId);
@@ -53,9 +53,18 @@ namespace MonsterPathPredictor.Core
             return _distances.TryGetValue(fromLandId, out int dist) ? dist : int.MaxValue;
         }
 
+        /// <summary>
+        /// Natural logarithm of the exact shortest-path count (never overflows IEEE-754 double even on
+        /// arbitrarily deep diamond graphs). Returns <see cref="double.NegativeInfinity"/> if unreachable.
+        /// </summary>
+        public double GetLogPathCount(int fromLandId)
+        {
+            return _logPathCounts.TryGetValue(fromLandId, out double logCount) ? logCount : double.NegativeInfinity;
+        }
+
         public double GetPathCount(int fromLandId)
         {
-            return _pathCounts.TryGetValue(fromLandId, out double count) ? count : 0.0;
+            return _logPathCounts.TryGetValue(fromLandId, out double logCount) ? Math.Exp(logCount) : 0.0;
         }
     }
 
@@ -229,30 +238,39 @@ namespace MonsterPathPredictor.Core
             return false;
         }
 
+        private static double LogAddExp(double a, double b)
+        {
+            if (double.IsNegativeInfinity(a)) return b;
+            if (double.IsNegativeInfinity(b)) return a;
+            double hi = a >= b ? a : b;
+            double lo = a >= b ? b : a;
+            return hi + Math.Log(1.0 + Math.Exp(lo - hi));
+        }
+
         /// <summary>
-        /// Computes full-board shortest road distances and exact equal-length shortest-path counts
+        /// Computes full-board shortest road distances and overflow-free log-scale equal-length shortest-path counts
         /// from every reachable tile to <paramref name="targetLandId"/> (including paths that require U-turning).
         /// </summary>
         public ShortestPathField ComputeShortestPathsTo(int targetLandId)
         {
             var distances = new Dictionary<int, int>();
-            var counts = new Dictionary<int, double>();
+            var logCounts = new Dictionary<int, double>();
 
             if (!Contains(targetLandId))
             {
-                return new ShortestPathField(targetLandId, distances, counts);
+                return new ShortestPathField(targetLandId, distances, logCounts);
             }
 
             var queue = new Queue<int>();
             distances[targetLandId] = 0;
-            counts[targetLandId] = 1.0;
+            logCounts[targetLandId] = 0.0; // ln(1) = 0
             queue.Enqueue(targetLandId);
 
             while (queue.Count > 0)
             {
                 int cur = queue.Dequeue();
                 int curDist = distances[cur];
-                double curCount = counts[cur];
+                double curLogCount = logCounts[cur];
 
                 if (!_reverseAdjacency.TryGetValue(cur, out var predecessors)) continue;
                 for (int i = 0; i < predecessors.Count; i++)
@@ -261,17 +279,17 @@ namespace MonsterPathPredictor.Core
                     if (!distances.TryGetValue(prev, out int prevDist))
                     {
                         distances[prev] = curDist + 1;
-                        counts[prev] = curCount;
+                        logCounts[prev] = curLogCount;
                         queue.Enqueue(prev);
                     }
                     else if (prevDist == curDist + 1)
                     {
-                        counts[prev] += curCount;
+                        logCounts[prev] = LogAddExp(logCounts[prev], curLogCount);
                     }
                 }
             }
 
-            return new ShortestPathField(targetLandId, distances, counts);
+            return new ShortestPathField(targetLandId, distances, logCounts);
         }
 
         public bool SameTopology(BoardGraph other)

@@ -30,7 +30,7 @@ namespace MonsterPathPredictor.ReplayCertifier
             }
         }
 
-        private static void HandleMove(
+        private static bool HandleMove(
             dynamic mv, string replayId, int mapId, int curRound, int fi, BoardGraph board,
             Dictionary<long, UnitSim> players, Dictionary<long, UnitSim> monsters, Dictionary<long, int> spawnedAtTile,
             Dictionary<long, Dictionary<int, List<dynamic>>> pendingMoveEffects, long curTurnActor,
@@ -39,7 +39,7 @@ namespace MonsterPathPredictor.ReplayCertifier
         {
             long moverId = (long)mv.PlayerId;
             int[] nodeIds = ToIntArray((IEnumerable)mv.NodeIds);
-            if (nodeIds.Length == 0) return;
+            if (nodeIds.Length == 0) return true;
 
             if (players.TryGetValue(moverId, out var mp))
             {
@@ -49,7 +49,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                 if (startIdx >= nodeIds.Length)
                 {
                     ConsumePendingMoveEffects(moverId, mp.NodeId, board, pendingMoveEffects, players, monsters, curTurnActor, ref thiefStoleOnTile);
-                    return;
+                    return true;
                 }
 
                 int prev = mp.NodeId;
@@ -71,10 +71,33 @@ namespace MonsterPathPredictor.ReplayCertifier
                     mp.NodeId = prev;
                     ConsumePendingMoveEffects(moverId, prev, board, pendingMoveEffects, players, monsters, curTurnActor, ref thiefStoleOnTile);
                 }
-                return;
+                return true;
             }
 
-            if (!monsters.TryGetValue(moverId, out var m)) return;
+            if (!monsters.TryGetValue(moverId, out var m))
+            {
+                // Unresolved mover in a state-carrying 5028 frame: still validate every consecutive edge
+                // independently on the board AND flag an integrity violation.
+                if (nodeIds.Length == 1)
+                {
+                    if (!board.Contains(nodeIds[0])) summary.IllegalMoveEdges++;
+                }
+                else
+                {
+                    int prev = nodeIds[0];
+                    for (int idx = 1; idx < nodeIds.Length; idx++)
+                    {
+                        int nid = nodeIds[idx];
+                        if (nid == prev) continue;
+                        if (!board.Contains(prev) || !board.Contains(nid) || !board.IsValidNeighbor(prev, nid))
+                        {
+                            summary.IllegalMoveEdges++;
+                        }
+                        prev = nid;
+                    }
+                }
+                return false;
+            }
             bool isNormalAggro = m.MonsterType == 2 || m.MonsterType == 10 || m.MonsterType == 11 || m.MonsterType == 12;
             bool isThief = m.MonsterType == 1;
 
@@ -86,7 +109,15 @@ namespace MonsterPathPredictor.ReplayCertifier
             if (mStartIdx >= nodeIds.Length)
             {
                 ConsumePendingMoveEffects(moverId, m.NodeId, board, pendingMoveEffects, players, monsters, curTurnActor, ref thiefStoleOnTile);
-                return;
+                return true;
+            }
+
+            // When MoveS2C echoes a displacement landing (mStartIdx > 0) or begins at the monster's current tile,
+            // consume deferred 1096 tile effects for m.NodeId BEFORE traversing subsequent steps so split
+            // [1,2]+[2,3,4] and merged [1,2,3,4] frames execute identically.
+            if (mStartIdx > 0 || nodeIds[0] == m.NodeId)
+            {
+                ConsumePendingMoveEffects(moverId, m.NodeId, board, pendingMoveEffects, players, monsters, curTurnActor, ref thiefStoleOnTile);
             }
 
             var pathSteps = new List<int>();
@@ -136,6 +167,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                 if (spawnedAtTile.TryGetValue(m.Id, out int spt) && spt != nextTile) spawnedAtTile.Remove(m.Id);
                 ConsumePendingMoveEffects(moverId, nextTile, board, pendingMoveEffects, players, monsters, curTurnActor, ref thiefStoleOnTile);
             }
+            return true;
         }
 
         private static int StripSkillDisplacementPrefix(UnitSim u, int[] nodeIds)
@@ -306,6 +338,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                 if (!inSupport)
                 {
                     summary.OutOfSupportPredictions++;
+                    bStat.OutOfSupport++;
                     if (bStat.Mismatches.Count < 15)
                     {
                         string predList = string.Join(",", forkPred.Exits.Select(e => $"{e.NextLandId}:{e.FormatConditionalPercent()}"));
@@ -389,29 +422,13 @@ namespace MonsterPathPredictor.ReplayCertifier
                 return inSupport;
             }
 
-            // Detect formatted-label collisions across distinct numeric clusters (e.g. 0.5004 vs 0.4996 both formatting as "50%").
-            var rawLabels = new string[clusters.Count];
-            var labelCounts = new Dictionary<string, int>(StringComparer.Ordinal);
-            for (int c = 0; c < clusters.Count; c++)
-            {
-                string lbl = ProbabilityFormat.Percent(clusters[c].Prob);
-                rawLabels[c] = lbl;
-                labelCounts.TryGetValue(lbl, out int cnt);
-                labelCounts[lbl] = cnt + 1;
-            }
+            // Resolve pairwise-distinct keys across ALL distinct numeric clusters so near-equal probabilities
+            // (e.g. 0.5004/0.4996 or 0.50004/0.49996) NEVER collide into the same calibration bin and self-cancel.
+            var clusterKeys = ResolveDistinctClusterKeys(clusters, positiveExits.Count);
 
             for (int c = 0; c < clusters.Count; c++)
             {
-                string binKey = labelCounts[rawLabels[c]] > 1
-                    ? (clusters[c].Prob * 100.0).ToString("0.00", System.Globalization.CultureInfo.InvariantCulture) + "%"
-                    : rawLabels[c];
-
-                // Never mix k>=3 fork 50% singletons (e.g. [1/2,1/4,1/4]) into the dedicated 2-way "50%" bin.
-                if (string.Equals(binKey, "50%", StringComparison.Ordinal))
-                {
-                    binKey = $"50%(k={positiveExits.Count})";
-                }
-
+                string binKey = clusterKeys[c];
                 var group = clusters[c].Exits;
                 if (group.Count == 1)
                 {
@@ -427,6 +444,65 @@ namespace MonsterPathPredictor.ReplayCertifier
             }
 
             return inSupport;
+        }
+
+        private static string[] ResolveDistinctClusterKeys(
+            List<(double Prob, List<ForkExitPrediction> Exits)> clusters,
+            int totalPositiveExits)
+        {
+            var keys = new string[clusters.Count];
+            for (int c = 0; c < clusters.Count; c++)
+            {
+                keys[c] = ProbabilityFormat.Percent(clusters[c].Prob);
+            }
+
+            // Escalate decimal precision for any colliding clusters until every distinct numeric cluster has a unique key.
+            string[] precisionFormats = { "0.00", "0.000", "0.0000", "0.00000", "0.000000", "0.0000000", "0.00000000", "G15" };
+            for (int p = 0; p < precisionFormats.Length; p++)
+            {
+                var dupIndices = FindCollidingIndices(keys);
+                if (dupIndices.Count == 0) break;
+                foreach (int idx in dupIndices)
+                {
+                    keys[idx] = (clusters[idx].Prob * 100.0).ToString(precisionFormats[p], System.Globalization.CultureInfo.InvariantCulture) + "%";
+                }
+            }
+
+            // Never mix non-2-way 50% clusters (e.g. [1/2,1/4,1/4]) into the dedicated 2-way "50%" bin.
+            for (int c = 0; c < keys.Length; c++)
+            {
+                if (string.Equals(keys[c], "50%", StringComparison.Ordinal))
+                {
+                    keys[c] = $"50%(k={totalPositiveExits})";
+                }
+            }
+
+            // Absolute fallback guarantee: if any key still collides across distinct clusters, disambiguate deterministically.
+            var remainingDups = FindCollidingIndices(keys);
+            if (remainingDups.Count > 0)
+            {
+                foreach (int idx in remainingDups)
+                {
+                    keys[idx] = $"{keys[idx]}~{idx + 1}";
+                }
+            }
+            return keys;
+        }
+
+        private static List<int> FindCollidingIndices(string[] keys)
+        {
+            var counts = new Dictionary<string, int>(StringComparer.Ordinal);
+            for (int i = 0; i < keys.Length; i++)
+            {
+                counts.TryGetValue(keys[i], out int cnt);
+                counts[keys[i]] = cnt + 1;
+            }
+            var dups = new List<int>();
+            for (int i = 0; i < keys.Length; i++)
+            {
+                if (counts[keys[i]] > 1) dups.Add(i);
+            }
+            return dups;
         }
 
         private static void AddCalibrationObs(Dictionary<string, ProbBin> probBins, string binKey, ForkExitPrediction exit, int actualNext, string shape)

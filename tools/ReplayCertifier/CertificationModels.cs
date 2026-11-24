@@ -11,6 +11,7 @@ namespace MonsterPathPredictor.ReplayCertifier
         public long DetTotal;
         public long DetHits;
         public long ProbTotal;
+        public long OutOfSupport;
         public List<string> Mismatches = new();
 
         public void MergeFrom(BucketStats other, int maxSamples = 25)
@@ -19,6 +20,7 @@ namespace MonsterPathPredictor.ReplayCertifier
             DetTotal += other.DetTotal;
             DetHits += other.DetHits;
             ProbTotal += other.ProbTotal;
+            OutOfSupport += other.OutOfSupport;
             foreach (var m in other.Mismatches)
             {
                 if (Mismatches.Count >= maxSamples) break;
@@ -110,6 +112,11 @@ namespace MonsterPathPredictor.ReplayCertifier
         public long MissingPredictions;
         public long OutOfSupportPredictions;
         public long IllegalMoveEdges;
+
+        // Per-replay identity metadata (set on single-replay evaluation for duplicate/spoof detection; not merged).
+        public string RequestedReplayId;
+        public string VerifiedReplayId;
+        public string ContentSha256;
 
         public Dictionary<string, BucketStats> Buckets = new()
         {

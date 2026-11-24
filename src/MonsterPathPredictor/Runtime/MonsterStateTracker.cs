@@ -86,10 +86,17 @@ namespace MonsterPathPredictor.Runtime
         private readonly ConcurrentQueue<CombatRecord> _combatQueue = new ConcurrentQueue<CombatRecord>();
         private readonly ConcurrentQueue<ThiefStealRecord> _thiefStealQueue = new ConcurrentQueue<ThiefStealRecord>();
 
+        private enum ExactPlaceLookup
+        {
+            NotFound = 0,
+            KnownOtherCause = 1,
+            TaggedDisplacement = 2
+        }
+
         private readonly Dictionary<long, MonsterMemory> _memories = new Dictionary<long, MonsterMemory>();
         private readonly HashSet<long> _rosterAliveMonsterIds = new HashSet<long>();
         private readonly List<SkillCastRecord> _recentSkills = new List<SkillCastRecord>();
-        private readonly List<SkillDisplacementRecord> _recentPlaces = new List<SkillDisplacementRecord>();
+        private readonly Dictionary<long, SkillDisplacementRecord> _pendingPlaceByMonster = new Dictionary<long, SkillDisplacementRecord>();
 
         private long _activeActorId;
         private int _activeActorStartLandId = -1;
@@ -147,7 +154,7 @@ namespace MonsterPathPredictor.Runtime
             _memories.Clear();
             _rosterAliveMonsterIds.Clear();
             _recentSkills.Clear();
-            _recentPlaces.Clear();
+            _pendingPlaceByMonster.Clear();
             while (_skillQueue.TryDequeue(out _)) { }
             while (_placeQueue.TryDequeue(out _)) { }
             while (_combatQueue.TryDequeue(out _)) { }
@@ -291,7 +298,7 @@ namespace MonsterPathPredictor.Runtime
                 }
 
                 // Target-bound skill displacement (cmd 1040 Place effect carries exact victim MonsterId + caster + Cause)
-                if (eff.Place != null && eff.Place.Place != null && eff.PlayerId != 0)
+                if (eff.Place != null && eff.Place.Place != null && eff.PlayerId != 0 && !TryIsUnitHero(eff.PlayerId))
                 {
                     if (_placeQueue.Count >= MaxQueuedEvents) _placeQueue.TryDequeue(out _);
                     _placeQueue.Enqueue(new SkillDisplacementRecord
@@ -352,6 +359,9 @@ namespace MonsterPathPredictor.Runtime
         public bool ObserveTurnBoundary(BattleLogic battle)
         {
             bool matchChanged = EnsureSameMatch();
+            // Drain exact target-bound 1040.Place records even while rendering is paused so they
+            // remain latched until tile confirmation, superseding Place, monster death, or match reset.
+            DrainPlaceQueue();
             if (battle == null) return matchChanged;
 
             var currentActor = SafeGetCurrentPlayer(battle);
@@ -520,6 +530,7 @@ namespace MonsterPathPredictor.Runtime
                         JustSpawnedOnFork = board.IsFork(landId) && (frontIds.Length == 1 || !board.IsValidNeighbor(landId, fromLandId))
                     };
                     _memories[mid] = mem;
+                    TryConsumeExactPlaceDisplacement(board, mid, mem, fromLandId, landId, playerPositions, allUnits);
                 }
                 else
                 {
@@ -542,10 +553,29 @@ namespace MonsterPathPredictor.Runtime
                         bool movedNonAdjacently = mem.LastLandId >= 0 && !board.IsValidNeighbor(mem.LastLandId, landId);
 
                         // Always check exact target-bound 1040.Place displacement first (even on own-turn adjacent moves);
-                        // only fall back to the time-window SkillUsed heuristic when off-turn or non-adjacent.
-                        if (TryConsumeExactPlaceDisplacement(board, mid, mem, mem.LastLandId, landId, playerPositions, allUnits))
+                        // only fall back to the time-window SkillUsed heuristic when no matching exact Place record exists
+                        // (never overwrite a KnownOtherCause exact Place with an unrelated cast from the time window).
+                        var exactLookup = TryConsumeExactPlaceDisplacement(board, mid, mem, mem.LastLandId, landId, playerPositions, allUnits);
+                        if (exactLookup == ExactPlaceLookup.TaggedDisplacement)
                         {
                             // Exact displacement matched and tagged onto mem
+                        }
+                        else if (exactLookup == ExactPlaceLookup.KnownOtherCause)
+                        {
+                            // Exact 1040.Place confirmed a non-displacement cause; clear stale flags without consulting time window.
+                            mem.JustSpawnedOnFork = false;
+                            if (mem.CombatForkLandId != landId)
+                            {
+                                mem.JustFoughtOnFork = false;
+                                mem.CombatForkLandId = -1;
+                            }
+                            if (mem.SkillMoveLandId != landId)
+                            {
+                                mem.SkillMoveKind = SkillMoveKind.None;
+                                mem.SkillMoveLandId = -1;
+                                mem.SkillMovePushDirId = -1;
+                                mem.SkillMovePushFromId = -1;
+                            }
                         }
                         else if (!isMonsterOwnTurn || movedNonAdjacently)
                         {
@@ -570,6 +600,11 @@ namespace MonsterPathPredictor.Runtime
 
                         mem.LastLandId = landId;
                         mem.LastFromLandId = fromLandId;
+                    }
+                    else if (_pendingPlaceByMonster.TryGetValue(mid, out var sameTilePl) &&
+                             (sameTilePl.NewLandId < 0 || sameTilePl.NewLandId == landId))
+                    {
+                        TryConsumeExactPlaceDisplacement(board, mid, mem, mem.LastLandId, landId, playerPositions, allUnits);
                     }
                 }
 
@@ -725,7 +760,25 @@ namespace MonsterPathPredictor.Runtime
             }
             if (stale != null)
             {
-                for (int i = 0; i < stale.Count; i++) _memories.Remove(stale[i]);
+                for (int i = 0; i < stale.Count; i++)
+                {
+                    _memories.Remove(stale[i]);
+                    _pendingPlaceByMonster.Remove(stale[i]);
+                }
+            }
+            // Also prune any orphaned pending Place records for non-alive/hero units that never enter _memories.
+            List<long> stalePlaces = null;
+            foreach (var k in _pendingPlaceByMonster.Keys)
+            {
+                if (!rosterAliveIds.Contains(k))
+                {
+                    if (stalePlaces == null) stalePlaces = new List<long>();
+                    stalePlaces.Add(k);
+                }
+            }
+            if (stalePlaces != null)
+            {
+                for (int i = 0; i < stalePlaces.Count; i++) _pendingPlaceByMonster.Remove(stalePlaces[i]);
             }
         }
 
@@ -760,6 +813,17 @@ namespace MonsterPathPredictor.Runtime
             public int Round;
         }
 
+        private void DrainPlaceQueue()
+        {
+            while (_placeQueue.TryDequeue(out var pl))
+            {
+                if (pl != null && pl.TargetMonsterId != 0)
+                {
+                    _pendingPlaceByMonster[pl.TargetMonsterId] = pl;
+                }
+            }
+        }
+
         private void DrainEventQueues(
             out Dictionary<long, PendingUnitCombat> combatByUnit,
             out Dictionary<long, PendingThiefSteal> thiefStealsByUnit)
@@ -777,17 +841,9 @@ namespace MonsterPathPredictor.Runtime
                 }
             }
 
-            while (_placeQueue.TryDequeue(out var pl))
-            {
-                _recentPlaces.Add(pl);
-            }
-            for (int i = _recentPlaces.Count - 1; i >= 0; i--)
-            {
-                if ((now - _recentPlaces[i].TimestampUtc).TotalSeconds > 2.5)
-                {
-                    _recentPlaces.RemoveAt(i);
-                }
-            }
+            // Target-bound 1040.Place events do NOT expire on a wall-clock timeout: they persist across
+            // arbitrary render pauses until consumed on tile confirmation, superseded, monster death, or reset.
+            DrainPlaceQueue();
 
             combatByUnit = new Dictionary<long, PendingUnitCombat>();
             while (_combatQueue.TryDequeue(out var c))
@@ -823,7 +879,7 @@ namespace MonsterPathPredictor.Runtime
             }
         }
 
-        private bool TryConsumeExactPlaceDisplacement(
+        private ExactPlaceLookup TryConsumeExactPlaceDisplacement(
             BoardGraph board,
             long monsterId,
             MonsterMemory mem,
@@ -833,20 +889,36 @@ namespace MonsterPathPredictor.Runtime
             IReadOnlyList<BattlePlayerData> allUnits)
         {
             // Match exact target-bound protocol Place event (cmd 1040 UpdateHeroAttrS2C) carrying exact victim MonsterId.
-            for (int i = _recentPlaces.Count - 1; i >= 0; i--)
+            if (!_pendingPlaceByMonster.TryGetValue(monsterId, out var pl))
             {
-                var pl = _recentPlaces[i];
-                if (pl.TargetMonsterId != monsterId) continue;
-                if (pl.NewLandId >= 0 && pl.NewLandId != newLandId) continue;
-
-                SkillMoveKind exactKind = IdentifyDisplacementSkill(pl.SkillId, pl.CasterPlayerId, allUnits);
-                _recentPlaces.RemoveAt(i);
-                if (exactKind == SkillMoveKind.None) return false;
-
-                ApplyDisplacementTag(board, mem, exactKind, oldLandId, newLandId, pl.CasterPlayerId, playerPositions);
-                return true;
+                return ExactPlaceLookup.NotFound;
             }
-            return false;
+            if (pl.NewLandId >= 0 && pl.NewLandId != newLandId)
+            {
+                // Stale Place for an older tile that the monster has since moved past.
+                _pendingPlaceByMonster.Remove(monsterId);
+                return ExactPlaceLookup.NotFound;
+            }
+
+            _pendingPlaceByMonster.Remove(monsterId);
+            SkillMoveKind exactKind = IdentifyDisplacementSkill(pl.SkillId, pl.CasterPlayerId, allUnits);
+            if (exactKind == SkillMoveKind.None)
+            {
+                return ExactPlaceLookup.KnownOtherCause;
+            }
+
+            bool duplicateSameTileLingling =
+                oldLandId == newLandId &&
+                exactKind == SkillMoveKind.LinglingPush &&
+                mem.SkillMoveKind == SkillMoveKind.LinglingPush &&
+                mem.SkillMoveLandId == newLandId &&
+                mem.SkillMovePushFromId >= 0;
+
+            if (!duplicateSameTileLingling)
+            {
+                ApplyDisplacementTag(board, mem, exactKind, oldLandId != newLandId ? oldLandId : -1, newLandId, pl.CasterPlayerId, playerPositions);
+            }
+            return ExactPlaceLookup.TaggedDisplacement;
         }
 
         private void TryTagSkillDisplacementFromWindow(

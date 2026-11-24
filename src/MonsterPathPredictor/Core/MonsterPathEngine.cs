@@ -421,7 +421,8 @@ namespace MonsterPathPredictor.Core
         {
             int cur = monster.CurrentLandId;
             int from = monster.FromLandId;
-            bool isFork = board.IsFork(cur);
+            var forward = board.GetForwardNeighbors(cur, from);
+            bool isFork = board.IsFork(cur) || (monster.IsCurrentlyMovingMidTurn && forward.Count >= 2);
 
             // 0. Taunt override (嘲讽 — allows overriding facing / U-turning before combat at turn start or forks;
             //    matches DecideMidWalkStep so straight-road continuation past an unattackable taunter never diverges).
@@ -537,10 +538,9 @@ namespace MonsterPathPredictor.Core
                     isAfterCombat: monster.HasLaunchedFightThisTurn);
             }
 
-            // 3. Normal tile (non-fork, degree <= 2):
+            // 3. Normal tile (non-fork, at most 1 forward neighbor when moving mid-turn):
             //    If already moving mid-turn into a dead-end (only neighbor is FromLandId), stop cleanly
             //    like DecideMidWalkStep even when FrontNodeIds contains FromLandId.
-            var forward = board.GetForwardNeighbors(cur, from);
             if (forward.Count == 0 && monster.IsCurrentlyMovingMidTurn && board.IsValidNeighbor(cur, from))
             {
                 return EmptyOutcome();
@@ -771,6 +771,16 @@ namespace MonsterPathPredictor.Core
                 int targetDist = item.Dist;
                 var field = item.Field;
 
+                double maxLog = double.NegativeInfinity;
+                for (int j = 0; j < allNeighbors.Count; j++)
+                {
+                    int nb = allNeighbors[j];
+                    if (field.GetDistance(nb) != targetDist - 1) continue;
+                    double logC = field.GetLogPathCount(nb);
+                    if (logC > maxLog) maxLog = logC;
+                }
+                if (double.IsNegativeInfinity(maxLog)) continue;
+
                 double totalLots = 0.0;
                 double uTurnLots = 0.0;
                 int forwardLotExits = 0;
@@ -779,7 +789,9 @@ namespace MonsterPathPredictor.Core
                 {
                     int nb = allNeighbors[j];
                     if (field.GetDistance(nb) != targetDist - 1) continue;
-                    double lots = field.GetPathCount(nb);
+                    double logC = field.GetLogPathCount(nb);
+                    if (double.IsNegativeInfinity(logC)) continue;
+                    double lots = Math.Exp(logC - maxLog);
                     if (lots <= 0.0) continue;
 
                     totalLots += lots;
@@ -807,7 +819,9 @@ namespace MonsterPathPredictor.Core
                     {
                         int fwd = forward[j];
                         if (field.GetDistance(fwd) != targetDist - 1) continue;
-                        double lots = field.GetPathCount(fwd);
+                        double logC = field.GetLogPathCount(fwd);
+                        if (double.IsNegativeInfinity(logC)) continue;
+                        double lots = Math.Exp(logC - maxLog);
                         if (lots <= 0.0) continue;
                         exitProbs[fwd] += remainingProb * (lots / totalLots);
                     }
@@ -1019,13 +1033,25 @@ namespace MonsterPathPredictor.Core
             if (dist == int.MaxValue || dist <= 0) return false;
 
             var all = board.GetValidNeighbors(curLandId);
+            double maxLog = double.NegativeInfinity;
+            for (int i = 0; i < all.Count; i++)
+            {
+                int nb = all[i];
+                if (field.GetDistance(nb) != dist - 1) continue;
+                double logC = field.GetLogPathCount(nb);
+                if (logC > maxLog) maxLog = logC;
+            }
+            if (double.IsNegativeInfinity(maxLog)) return false;
+
             var bestExits = new List<(int NextLandId, double Lots)>();
             double totalLots = 0.0;
             for (int i = 0; i < all.Count; i++)
             {
                 int nb = all[i];
                 if (field.GetDistance(nb) != dist - 1) continue;
-                double lots = field.GetPathCount(nb);
+                double logC = field.GetLogPathCount(nb);
+                if (double.IsNegativeInfinity(logC)) continue;
+                double lots = Math.Exp(logC - maxLog);
                 if (lots <= 0.0) continue;
                 bestExits.Add((nb, lots));
                 totalLots += lots;
@@ -1149,13 +1175,25 @@ namespace MonsterPathPredictor.Core
             if (bestTarget == null || bestField == null) return false;
 
             var all = board.GetValidNeighbors(curLandId);
+            double maxLog = double.NegativeInfinity;
+            for (int i = 0; i < all.Count; i++)
+            {
+                int nb = all[i];
+                if (bestField.GetDistance(nb) != bestDist - 1) continue;
+                double logC = bestField.GetLogPathCount(nb);
+                if (logC > maxLog) maxLog = logC;
+            }
+            if (double.IsNegativeInfinity(maxLog)) return false;
+
             var bestExits = new List<(int NextLandId, double Lots)>();
             double totalLots = 0.0;
             for (int i = 0; i < all.Count; i++)
             {
                 int nb = all[i];
                 if (bestField.GetDistance(nb) != bestDist - 1) continue;
-                double lots = bestField.GetPathCount(nb);
+                double logC = bestField.GetLogPathCount(nb);
+                if (double.IsNegativeInfinity(logC)) continue;
+                double lots = Math.Exp(logC - maxLog);
                 if (lots <= 0.0) continue;
                 bestExits.Add((nb, lots));
                 totalLots += lots;

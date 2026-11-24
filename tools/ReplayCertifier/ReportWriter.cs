@@ -81,7 +81,10 @@ namespace MonsterPathPredictor.ReplayCertifier
                 double.IsFinite(t.MinDetAccuracy) && t.MinDetAccuracy >= 0.0 && t.MinDetAccuracy <= 1.0 &&
                 double.IsFinite(t.MinThiefAccuracy) && t.MinThiefAccuracy >= 0.0 && t.MinThiefAccuracy <= 1.0 &&
                 double.IsFinite(t.MaxDownloadFailRatio) && t.MaxDownloadFailRatio >= 0.0 && t.MaxDownloadFailRatio <= 1.0 &&
-                double.IsFinite(t.MaxAbsZ) && t.MaxAbsZ >= 0.0;
+                double.IsFinite(t.MaxAbsZ) && t.MaxAbsZ >= 0.0 &&
+                t.MinAggroSamples >= 0 &&
+                t.MinThiefSamples >= 0 &&
+                t.MinCalibratedBins >= 0;
 
             GateStatus coverageGate;
             if (!thresholdsValid)
@@ -170,6 +173,24 @@ namespace MonsterPathPredictor.ReplayCertifier
             _ => "FAIL"
         };
 
+        public static bool AreSameOutputPath(string pathA, string pathB)
+        {
+            if (string.IsNullOrWhiteSpace(pathA) || string.IsNullOrWhiteSpace(pathB)) return false;
+            try
+            {
+                string normA = Path.GetFullPath(pathA).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                string normB = Path.GetFullPath(pathB).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                var cmp = (OperatingSystem.IsWindows() || OperatingSystem.IsMacOS())
+                    ? StringComparison.OrdinalIgnoreCase
+                    : StringComparison.Ordinal;
+                return string.Equals(normA, normB, cmp);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         public static bool PrintAndExport(
             CertificationSummary s,
             BoardCatalog catalog,
@@ -178,6 +199,10 @@ namespace MonsterPathPredictor.ReplayCertifier
             string jsonOut,
             string mdOut)
         {
+            if (AreSameOutputPath(jsonOut, mdOut))
+            {
+                throw new ArgumentException("JSON and Markdown output paths must not point to the same file.");
+            }
             var eval = EvaluateGates(s, t);
             bool passed = eval.Passed;
             long aggroDetHits = eval.AggroDetHits;
@@ -240,7 +265,9 @@ namespace MonsterPathPredictor.ReplayCertifier
             foreach (var b in s.Buckets.Values)
             {
                 if (b.Mismatches.Count == 0) continue;
-                Console.WriteLine($"--- {b.Name} (mismatches={b.DetTotal - b.DetHits}, showing up to {b.Mismatches.Count}) ---");
+                long detMismatch = b.DetTotal - b.DetHits;
+                long totalMismatch = detMismatch + b.OutOfSupport;
+                Console.WriteLine($"--- {b.Name} (mismatches={totalMismatch}, detMismatch={detMismatch}, outOfSupport={b.OutOfSupport}, showing up to {b.Mismatches.Count}) ---");
                 foreach (var m in b.Mismatches.Take(12)) Console.WriteLine("  " + m);
             }
 
@@ -267,7 +294,19 @@ namespace MonsterPathPredictor.ReplayCertifier
                     },
                     aggressiveDeterministic = new { hits = aggroDetHits, total = aggroDetTotal, accuracy = aggroAcc, wilson95Low = wLow, wilson95High = wHigh },
                     thiefDeterministic = new { hits = thiefB.DetHits, total = thiefB.DetTotal, probTotal = thiefB.ProbTotal, accuracy = thiefAcc },
-                    buckets = s.Buckets.Values.Select(b => new { b.Key, b.Name, b.Total, b.DetHits, b.DetTotal, b.ProbTotal, mismatchCount = b.DetTotal - b.DetHits, samples = b.Mismatches.Take(15) }),
+                    buckets = s.Buckets.Values.Select(b => new
+                    {
+                        b.Key,
+                        b.Name,
+                        b.Total,
+                        b.DetHits,
+                        b.DetTotal,
+                        b.ProbTotal,
+                        detMismatchCount = b.DetTotal - b.DetHits,
+                        outOfSupportCount = b.OutOfSupport,
+                        mismatchCount = (b.DetTotal - b.DetHits) + b.OutOfSupport,
+                        samples = b.Mismatches.Take(15)
+                    }),
                     byMap = s.ByMap.OrderBy(k => k.Key).Select(k => new { mapId = k.Key, mapName = catalog.GetMapName(k.Key), k.Value.Replays, k.Value.DetHits, k.Value.DetTotal, k.Value.ProbTotal, k.Value.ThiefDetHits, k.Value.ThiefDetTotal, k.Value.ThiefProbTotal }),
                     calibration = eval.CalibrationRows,
                     frontAudit = fa

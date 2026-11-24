@@ -32,31 +32,50 @@ namespace MonsterPathPredictor.ReplayCertifier
         public static CertificationSummary EvaluateBytes(string replayId, byte[] bytes, ProtocolDecoder decoder, BoardCatalog catalog)
         {
             var summary = new CertificationSummary { ReplaysAttempted = 1 };
-            var frames = ReadFrames(bytes);
+            var (frames, isTruncated) = ReadFrames(bytes);
+            if (frames.Count == 0)
+            {
+                summary.TruncatedOrCorrupt = 1;
+                return summary;
+            }
+
             var runningFrame = frames.FirstOrDefault(f => f.CmdId == 1003 && f.Payload.Length > 0);
-            if (runningFrame.Payload == null) return summary;
+            if (runningFrame.Payload == null)
+            {
+                summary.TruncatedOrCorrupt = 1;
+                return summary;
+            }
 
             dynamic running = decoder.TryDecode("party.protocol.RunningGameS2C", runningFrame.Payload);
-            if (running?.Room == null) return summary;
+            if (running?.Room == null)
+            {
+                summary.ParseErrors = 1;
+                return summary;
+            }
 
             int mapId = (int)running.Room.MapId;
             int mapIndex = (int)running.Room.MapIndex;
             if (mapId < 82000 || mapId >= 84000) { summary.SkippedNonPve = 1; return summary; }
             if (!catalog.TryGetGraph(mapId, mapIndex, out var board)) { summary.MissingMap = 1; return summary; }
 
-            summary.ReplaysVerified = 1;
-            var mapStat = new MapStats { Replays = 1 };
+            var mapStat = new MapStats();
             summary.ByMap[mapId] = mapStat;
 
             var players = new Dictionary<long, UnitSim>();
             var monsters = new Dictionary<long, UnitSim>();
             var seenMonsters = new HashSet<long>();
             var spawnedAtTile = new Dictionary<long, int>();
+            bool unknownLayout = false;
+            bool decodeFailed = false;
 
             void SyncRoom(dynamic room)
             {
                 int newIdx = (int)room.MapIndex;
-                if (newIdx != mapIndex && catalog.TryGetGraph(mapId, newIdx, out var nb)) { mapIndex = newIdx; board = nb; }
+                if (newIdx != mapIndex)
+                {
+                    if (catalog.TryGetGraph(mapId, newIdx, out var nb)) { mapIndex = newIdx; board = nb; }
+                    else { unknownLayout = true; return; }
+                }
                 var prevDisp = monsters.Where(kv => kv.Value.DisplacedBySkill).Select(kv => kv.Key).ToHashSet();
                 players.Clear();
                 monsters.Clear();
@@ -81,7 +100,7 @@ namespace MonsterPathPredictor.ReplayCertifier
             int turnStartLandId = -1;
             bool startedOnFork = false, stepped = false, foughtOnTile = false, foughtTurn = false, thiefStoleOnTile = false;
 
-            for (int fi = 0; fi < frames.Count; fi++)
+            for (int fi = 0; fi < frames.Count && !unknownLayout; fi++)
             {
                 var (cmd, payload) = frames[fi];
                 if (payload.Length == 0) continue;
@@ -89,8 +108,9 @@ namespace MonsterPathPredictor.ReplayCertifier
                 if (cmd == 1113)
                 {
                     dynamic snap = decoder.TryDecode("party.protocol.ReplaySnapshotS2C", payload);
-                    if (snap?.Room == null) continue;
+                    if (snap?.Room == null) { decodeFailed = true; continue; }
                     SyncRoom(snap.Room);
+                    if (unknownLayout) break;
                     curRound = (int)snap.Room.Round;
                     curTurnActor = (long)snap.PlayerId;
                     stepped = foughtOnTile = foughtTurn = thiefStoleOnTile = false;
@@ -100,7 +120,8 @@ namespace MonsterPathPredictor.ReplayCertifier
                 else if (cmd == 1018)
                 {
                     dynamic mr = decoder.TryDecode("party.protocol.MonsterRefreshS2C", payload);
-                    if (mr?.Monster?.Hero != null)
+                    if (mr == null) { decodeFailed = true; continue; }
+                    if (mr.Monster?.Hero != null)
                     {
                         UnitSim u = BuildUnit(mr.Monster, true);
                         monsters[u.Id] = u;
@@ -111,28 +132,28 @@ namespace MonsterPathPredictor.ReplayCertifier
                 else if (cmd == 5022)
                 {
                     dynamic td = decoder.TryDecode("party.protocol.ThrowDiceS2C", payload);
-                    if (td != null)
+                    if (td == null) { decodeFailed = true; continue; }
+                    long actorId = (long)td.PlayerId;
+                    if (monsters.TryGetValue(actorId, out var ma))
                     {
-                        long actorId = (long)td.PlayerId;
-                        if (monsters.TryGetValue(actorId, out var ma))
-                        {
-                            curTurnActor = ma.Id;
-                            stepped = foughtOnTile = foughtTurn = thiefStoleOnTile = false;
-                            turnStartLandId = ma.NodeId;
-                            startedOnFork = board.IsFork(ma.NodeId);
-                        }
+                        curTurnActor = ma.Id;
+                        stepped = foughtOnTile = foughtTurn = thiefStoleOnTile = false;
+                        turnStartLandId = ma.NodeId;
+                        startedOnFork = board.IsFork(ma.NodeId);
                     }
                 }
                 else if (cmd == 1040)
                 {
                     dynamic attr = decoder.TryDecode("party.protocol.UpdateHeroAttrS2C", payload);
+                    if (attr == null) { decodeFailed = true; continue; }
                     if (ApplyAttr(attr, players, monsters, false, curTurnActor))
                         thiefStoleOnTile = true;
                 }
                 else if (cmd == 1096)
                 {
                     dynamic sm = decoder.TryDecode("party.protocol.HeroSkillMoveEffectS2C", payload);
-                    if (sm?.EffectData != null)
+                    if (sm == null) { decodeFailed = true; continue; }
+                    if (sm.EffectData != null)
                         foreach (dynamic kv in (IEnumerable)sm.EffectData)
                             if (kv?.Value?.Effects != null)
                                 foreach (dynamic attr in (IEnumerable)kv.Value.Effects)
@@ -141,23 +162,22 @@ namespace MonsterPathPredictor.ReplayCertifier
                 else if (cmd == 5214)
                 {
                     dynamic mp = decoder.TryDecode("party.protocol.MonsterPursuitS2C", payload);
-                    if (mp != null)
+                    if (mp == null) { decodeFailed = true; continue; }
+                    long mpid = (long)mp.PlayerId;
+                    if (monsters.TryGetValue(mpid, out var pm))
                     {
-                        long mpid = (long)mp.PlayerId;
-                        if (monsters.TryGetValue(mpid, out var pm))
-                        {
-                            int nid = (int)mp.NodeId;
-                            if (nid >= 0) pm.NodeId = nid;
-                            pm.BackNodeId = (int)mp.BackId;
-                            int[] fids = ToIntArray((IEnumerable)mp.FrontIds);
-                            if (fids.Length > 0) pm.FrontNodeIds = fids;
-                        }
+                        int nid = (int)mp.NodeId;
+                        if (nid >= 0) pm.NodeId = nid;
+                        pm.BackNodeId = (int)mp.BackId;
+                        int[] fids = ToIntArray((IEnumerable)mp.FrontIds);
+                        if (fids.Length > 0) pm.FrontNodeIds = fids;
                     }
                 }
                 else if (cmd == 1007)
                 {
                     dynamic b = decoder.TryDecode("party.protocol.BattleS2C", payload);
-                    if (b?.Battle != null)
+                    if (b == null) { decodeFailed = true; continue; }
+                    if (b.Battle != null)
                     {
                         long atk = b.Battle.Attacker != null ? (long)b.Battle.Attacker.PlayerId : 0;
                         long def = b.Battle.Defender != null ? (long)b.Battle.Defender.PlayerId : 0;
@@ -167,20 +187,32 @@ namespace MonsterPathPredictor.ReplayCertifier
                 else if (cmd == 1115)
                 {
                     dynamic die = decoder.TryDecode("party.protocol.ReplayDieS2C", payload);
-                    if (die != null)
-                    {
-                        long pid = (long)die.PlayerId;
-                        if (players.TryGetValue(pid, out var dp)) dp.Hp = 0;
-                        if (monsters.TryGetValue(pid, out var dm)) dm.Hp = 0;
-                    }
+                    if (die == null) { decodeFailed = true; continue; }
+                    long pid = (long)die.PlayerId;
+                    if (players.TryGetValue(pid, out var dp)) dp.Hp = 0;
+                    if (monsters.TryGetValue(pid, out var dm)) dm.Hp = 0;
                 }
                 else if (cmd == 5028)
                 {
                     dynamic mv = decoder.TryDecode("party.protocol.MoveS2C", payload);
-                    if (mv != null)
-                        HandleMove(mv, replayId, mapId, curRound, fi, board, players, monsters, spawnedAtTile,
-                            startedOnFork, turnStartLandId, ref stepped, ref foughtOnTile, foughtTurn, ref thiefStoleOnTile, mapStat, summary);
+                    if (mv == null) { decodeFailed = true; continue; }
+                    HandleMove(mv, replayId, mapId, curRound, fi, board, players, monsters, spawnedAtTile,
+                        startedOnFork, turnStartLandId, ref stepped, ref foughtOnTile, foughtTurn, ref thiefStoleOnTile, mapStat, summary);
                 }
+            }
+
+            if (unknownLayout)
+            {
+                summary.MissingMap = 1;
+            }
+            else if (isTruncated || decodeFailed)
+            {
+                summary.TruncatedOrCorrupt = 1;
+            }
+            else
+            {
+                summary.ReplaysVerified = 1;
+                mapStat.Replays = 1;
             }
 
             return summary;

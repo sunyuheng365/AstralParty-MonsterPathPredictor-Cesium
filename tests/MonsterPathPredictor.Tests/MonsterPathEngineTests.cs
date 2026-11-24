@@ -644,13 +644,13 @@ namespace MonsterPathPredictor.Tests
         [Fact]
         public void TileStepsCountForwardFromZeroAtMonsterToMaxStepsAtEndpoint()
         {
-            // Linear path: 0 -> 1 -> 2 -> ... -> 12
+            // Linear path with continuation past step 12: 0 -> 1 -> 2 -> ... -> 14
             var nodes = new List<LandNodeSnapshot>();
-            for (int i = 0; i <= 12; i++)
+            for (int i = 0; i <= 14; i++)
             {
                 var nbs = new List<int>();
                 if (i > 0) nbs.Add(i - 1);
-                if (i < 12) nbs.Add(i + 1);
+                if (i < 14) nbs.Add(i + 1);
                 nodes.Add(new LandNodeSnapshot(i, nbs.ToArray()));
             }
             var board = new BoardGraph(nodes);

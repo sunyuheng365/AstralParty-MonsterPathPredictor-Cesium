@@ -9,19 +9,27 @@ namespace MonsterPathPredictor.ReplayCertifier
 {
     internal static partial class ReplayEvaluator
     {
-        private static List<(int CmdId, byte[] Payload)> ReadFrames(byte[] bytes)
+        private static (List<(int CmdId, byte[] Payload)> Frames, bool IsTruncated) ReadFrames(byte[] bytes)
         {
             var list = new List<(int, byte[])>();
+            if (bytes == null || bytes.Length < 6) return (list, true);
+
             int i = 0;
+            bool truncated = false;
             while (i + 6 <= bytes.Length)
             {
                 int cmd = BinaryPrimitives.ReadInt16BigEndian(bytes.AsSpan(i, 2));
                 int len = BinaryPrimitives.ReadInt32BigEndian(bytes.AsSpan(i + 2, 4));
-                if (len < 0 || i + 6 + len > bytes.Length) break;
+                if (len < 0 || i + 6 + len > bytes.Length)
+                {
+                    truncated = true;
+                    break;
+                }
                 list.Add((cmd, len > 0 ? bytes.AsSpan(i + 6, len).ToArray() : Array.Empty<byte>()));
                 i += 6 + len;
             }
-            return list;
+            if (i != bytes.Length) truncated = true;
+            return (list, truncated);
         }
 
         private static int[] ToIntArray(IEnumerable items)

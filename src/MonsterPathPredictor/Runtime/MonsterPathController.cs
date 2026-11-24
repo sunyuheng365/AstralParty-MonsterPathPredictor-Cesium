@@ -33,7 +33,8 @@ namespace MonsterPathPredictor.Runtime
         private DateTime _nextUnitSync;
         private DateTime _nextWarnAt;
         private DateTime _selectedMissingSince;
-        private bool _forceReplan;
+        private bool _needsUnitSync;
+        private bool _planDirty;
 
         public override string Name => "怪物寻路预测";
         public override string Version => "1.0.0";
@@ -58,9 +59,11 @@ namespace MonsterPathPredictor.Runtime
         public override void OnConfigChanged()
         {
             _settings = PredictorConfig.Load(Config, isInitial: false);
-            _forceReplan = true;
+            _needsUnitSync = true;
+            _planDirty = true;
             if (!_settings.Enabled)
             {
+                _tracker.SetEventCollectionEnabled(false);
                 ClearSelectionAndOverlay();
                 _popup.Hide();
             }
@@ -97,7 +100,7 @@ namespace MonsterPathPredictor.Runtime
         {
             _selectedMonsterId = (_selectedMonsterId == monsterId) ? 0 : monsterId;
             _selectedMissingSince = DateTime.MinValue;
-            _forceReplan = true;
+            _planDirty = true;
             if (_selectedMonsterId != 0)
             {
                 var picked = FindMonster(_selectedMonsterId);
@@ -118,7 +121,7 @@ namespace MonsterPathPredictor.Runtime
             int nextSteps = PredictorSettings.ClampInt(_settings.PreviewSteps + delta, 1, 30);
             if (nextSteps == _settings.PreviewSteps) return;
             _settings.PreviewSteps = nextSteps;
-            _forceReplan = true;
+            _planDirty = true;
             try
             {
                 if (Config != null)
@@ -134,21 +137,41 @@ namespace MonsterPathPredictor.Runtime
         {
             try
             {
-                if (!_settings.Enabled || !TryGetPveBattleContext(out var battle, out var landManager, out var camera))
+                if (!_settings.Enabled || !TryGetActivePveSession(out var battle))
                 {
+                    _tracker.SetEventCollectionEnabled(false);
                     if (_selectedMonsterId != 0 || _board != null || _popup.IsOpen) ResetBattleState();
                     return;
                 }
 
-                // Combat window or in-battle pause/settings popup: only hide overlay temporarily
+                // Enable game event ingestion only while actively inside an enabled PVE battle
+                // (stays active across FightWindow so combat events resolve accurately upon return).
+                _tracker.SetEventCollectionEnabled(true);
+
+                // Combat window or in-battle pause/settings popup: temporarily hide overlay AND popup
                 // without dropping the locked monster so tracking resumes automatically afterwards.
                 if (IsTemporaryOverlayOpen())
                 {
                     _picker.CancelPendingPointer();
                     _renderer.HideAll();
-                    _forceReplan = true;
+                    _popup.SetTemporarilyHidden(true);
+                    _needsUnitSync = true;
+                    _planDirty = true;
                     return;
                 }
+
+                // Transient camera/LandManager hiccup within the same active PVE session:
+                // hide overlay briefly without resetting selection or tracker state.
+                if (!TryGetRenderContext(out var landManager, out var camera))
+                {
+                    _picker.CancelPendingPointer();
+                    _renderer.HideAll();
+                    _popup.SetTemporarilyHidden(true);
+                    _needsUnitSync = true;
+                    return;
+                }
+
+                _popup.SetTemporarilyHidden(false);
 
                 var now = DateTime.UtcNow;
 
@@ -159,12 +182,13 @@ namespace MonsterPathPredictor.Runtime
                     if (_board == null || !_board.SameTopology(nextBoard))
                     {
                         _board = nextBoard;
-                        _forceReplan = true;
+                        _needsUnitSync = true;
+                        _planDirty = true;
                     }
                 }
 
                 // Detect tile-to-tile movement of the tracked monster immediately (0-frame lag)
-                if (_selectedMonsterId != 0 && !_forceReplan)
+                if (_selectedMonsterId != 0 && !_needsUnitSync)
                 {
                     var prevSel = FindMonster(_selectedMonsterId);
                     if (prevSel != null && prevSel.CharacterRef != null && UnityObject.IsAlive(prevSel.CharacterRef))
@@ -174,18 +198,24 @@ namespace MonsterPathPredictor.Runtime
                             int liveLandId = prevSel.CharacterRef.standLand != null ? prevSel.CharacterRef.standLand.Id : -1;
                             if (liveLandId >= 0 && liveLandId != prevSel.State.CurrentLandId)
                             {
-                                _forceReplan = true;
+                                _needsUnitSync = true;
                             }
                         }
                         catch { }
                     }
                 }
 
-                if (now >= _nextUnitSync || _forceReplan)
+                // Strictly throttle unit sampling (~120 ms) even when idle (no selected monster)
+                if (now >= _nextUnitSync || _needsUnitSync)
                 {
                     _nextUnitSync = now.AddMilliseconds(120);
-                    _tracker.SyncAndSnapshot(_board, battle, camera, _settings, out _monsters, out _players);
-                    _forceReplan = true;
+                    _needsUnitSync = false;
+                    _tracker.SyncAndSnapshot(_board, battle, camera, _settings, out _monsters, out _players, out bool matchChanged);
+                    if (matchChanged)
+                    {
+                        ClearSelectionAndOverlay();
+                    }
+                    _planDirty = true;
                 }
 
                 var layer = _renderer.EnsureLayer();
@@ -196,7 +226,7 @@ namespace MonsterPathPredictor.Runtime
                 if (selectionChanged)
                 {
                     _selectedMissingSince = DateTime.MinValue;
-                    _forceReplan = true;
+                    _planDirty = true;
                     if (_selectedMonsterId != 0 && _selectedMonsterId != beforeSelection)
                     {
                         var picked = FindMonster(_selectedMonsterId);
@@ -244,9 +274,9 @@ namespace MonsterPathPredictor.Runtime
                 }
                 _selectedMissingSince = DateTime.MinValue;
 
-                if (_forceReplan || _cachedPlan == null || _cachedPlan.MonsterId != _selectedMonsterId)
+                if (_planDirty || _cachedPlan == null || _cachedPlan.MonsterId != _selectedMonsterId)
                 {
-                    _forceReplan = false;
+                    _planDirty = false;
                     _cachedPlan = MonsterPathEngine.Plan(
                         _board,
                         selected.State,
@@ -288,11 +318,9 @@ namespace MonsterPathPredictor.Runtime
             return null;
         }
 
-        private static bool TryGetPveBattleContext(out BattleLogic battle, out LandManager landManager, out Camera camera)
+        private static bool TryGetActivePveSession(out BattleLogic battle)
         {
             battle = null;
-            landManager = null;
-            camera = null;
 
             if (!SimpleSingletonProvider<global::Core.Scene.SceneManager>.hasInstance ||
                 SimpleSingletonProvider<global::Core.Scene.SceneManager>.inst.currentType.Value != SceneType.Battle)
@@ -306,7 +334,13 @@ namespace MonsterPathPredictor.Runtime
             battle = gm.battle;
             if (battle == null) return false;
 
-            if (IsBattleSettled()) return false;
+            return !IsBattleSettled();
+        }
+
+        private static bool TryGetRenderContext(out LandManager landManager, out Camera camera)
+        {
+            landManager = null;
+            camera = null;
 
             var sceneCtrl = BattleSceneController.inst;
             if (sceneCtrl == null) return false;
@@ -367,7 +401,9 @@ namespace MonsterPathPredictor.Runtime
             _players.Clear();
             _nextBoardScan = DateTime.MinValue;
             _nextUnitSync = DateTime.MinValue;
-            _forceReplan = false;
+            _needsUnitSync = false;
+            _planDirty = false;
+            _tracker.SetEventCollectionEnabled(false);
             _tracker.Reset();
         }
     }

@@ -11,7 +11,7 @@ namespace MonsterPathPredictor.ReplayCertifier
     /// Loads official PVE board graphs with exact raw unsorted neighbor priority (Red > Blue > None).
     /// Supports both multi-map JSON catalogs and standalone single-map JSON files (e.g., Library 82016).
     /// </summary>
-    internal sealed class BoardCatalog
+    public sealed class BoardCatalog
     {
         private readonly Dictionary<int, List<(int SceneId, BoardGraph Graph)>> _byMap = new();
         private readonly Dictionary<int, string> _names = new();
@@ -24,8 +24,8 @@ namespace MonsterPathPredictor.ReplayCertifier
         {
             graph = null;
             if (!_byMap.TryGetValue(mapId, out var scenes) || scenes.Count == 0) return false;
-            int idx = (mapIndex >= 0 && mapIndex < scenes.Count) ? mapIndex : 0;
-            graph = scenes[idx].Graph;
+            if (mapIndex < 0 || mapIndex >= scenes.Count) return false;
+            graph = scenes[mapIndex].Graph;
             return true;
         }
 

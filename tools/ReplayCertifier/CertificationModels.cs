@@ -3,7 +3,7 @@ using System.Collections.Generic;
 
 namespace MonsterPathPredictor.ReplayCertifier
 {
-    internal sealed class BucketStats
+    public sealed class BucketStats
     {
         public string Key;
         public string Name;
@@ -27,7 +27,7 @@ namespace MonsterPathPredictor.ReplayCertifier
         }
     }
 
-    internal sealed class MapStats
+    public sealed class MapStats
     {
         public int Replays;
         public long DetTotal;
@@ -47,7 +47,7 @@ namespace MonsterPathPredictor.ReplayCertifier
         }
     }
 
-    internal sealed class ProbBin
+    public sealed class ProbBin
     {
         public long Opp;
         public double SumPred;
@@ -61,12 +61,18 @@ namespace MonsterPathPredictor.ReplayCertifier
         }
     }
 
-    internal sealed class FrontAuditStats
+    public sealed class FrontAuditStats
     {
-        public long SpawnF1, SpawnF1Actual, SpawnF1RedBlue;
-        public long StopF1, StopF1Actual, StopF1RedBlue;
-        public long StopMulti, StopMultiRedBlue;
-        public long PostCombatMulti, PostCombatMultiRedBlue;
+        public long SpawnF1 { get; set; }
+        public long SpawnF1Actual { get; set; }
+        public long SpawnF1RedBlue { get; set; }
+        public long StopF1 { get; set; }
+        public long StopF1Actual { get; set; }
+        public long StopF1RedBlue { get; set; }
+        public long StopMulti { get; set; }
+        public long StopMultiRedBlue { get; set; }
+        public long PostCombatMulti { get; set; }
+        public long PostCombatMultiRedBlue { get; set; }
 
         public void MergeFrom(FrontAuditStats o)
         {
@@ -77,7 +83,7 @@ namespace MonsterPathPredictor.ReplayCertifier
         }
     }
 
-    internal sealed class CertificationSummary
+    public sealed class CertificationSummary
     {
         public int ReplaysAttempted;
         public int ReplaysVerified;
@@ -85,6 +91,8 @@ namespace MonsterPathPredictor.ReplayCertifier
         public int MissingMap;
         public int DownloadFailed;
         public int ParseErrors;
+        public int TruncatedOrCorrupt;
+        public long MissingPredictions;
 
         public Dictionary<string, BucketStats> Buckets = new()
         {
@@ -107,6 +115,8 @@ namespace MonsterPathPredictor.ReplayCertifier
             MissingMap += other.MissingMap;
             DownloadFailed += other.DownloadFailed;
             ParseErrors += other.ParseErrors;
+            TruncatedOrCorrupt += other.TruncatedOrCorrupt;
+            MissingPredictions += other.MissingPredictions;
             FrontAudit.MergeFrom(other.FrontAudit);
 
             foreach (var kv in other.Buckets) Buckets[kv.Key].MergeFrom(kv.Value);

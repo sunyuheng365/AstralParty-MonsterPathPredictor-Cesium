@@ -84,22 +84,27 @@ namespace MonsterPathPredictor.Runtime
                 }
             }
 
+            // Track pointer displacement in layer-local coordinates so DragThresholdPx matches
+            // ClickRadius and sprite hitboxes consistently across all FairyGUI GRoot scale factors.
             var outcome = _clickTracker.Update(
                 isDownThisFrame: isDown,
                 isHeld: isHeld,
                 isUpThisFrame: isUp,
                 hasPosition: hasPos,
-                position: hasPos ? new Point2(stagePos.x, stagePos.y) : default,
+                position: hasPos ? new Point2(localPos.x, localPos.y) : default,
                 blockedByUiOnDown: blockedOnDown,
                 downHitMonsterId: downHitId);
 
             if (!outcome.IsBoardClick) return false;
 
-            // Evaluate click on release (only when pointer did not drag the map)
-            long hitMonsterId = HitTestMonsters(layer, camera, monsters, localPos, settings);
+            // Prefer the monster cleanly hit on MouseDown if still alive so a passing monster
+            // cannot hijack the release click; fall back to release-position hit test if needed.
+            long hitMonsterId = IsMonsterPresent(monsters, outcome.DownHitMonsterId)
+                ? outcome.DownHitMonsterId
+                : 0;
             if (hitMonsterId == 0)
             {
-                hitMonsterId = outcome.DownHitMonsterId;
+                hitMonsterId = HitTestMonsters(layer, camera, monsters, localPos, settings);
             }
 
             long nextSelected = PointerClickTracker.ApplyBoardClickSelection(
@@ -113,6 +118,17 @@ namespace MonsterPathPredictor.Runtime
                 return true;
             }
 
+            return false;
+        }
+
+        private static bool IsMonsterPresent(IReadOnlyList<LiveMonsterInfo> monsters, long monsterId)
+        {
+            if (monsterId == 0 || monsters == null) return false;
+            for (int i = 0; i < monsters.Count; i++)
+            {
+                var m = monsters[i];
+                if (m != null && m.State != null && m.State.MonsterId == monsterId) return true;
+            }
             return false;
         }
 
@@ -228,7 +244,7 @@ namespace MonsterPathPredictor.Runtime
             out MonsterHitBox hitBox)
         {
             hitBox = null;
-            if (bounds.Corners == null || bounds.Corners.Length < 4) return false;
+            if (!bounds.HasCorners) return false;
 
             float depth = Vector3.Dot(bounds.CenterWorld - camPos, camForward);
             if (depth <= 0.1f) return false;
@@ -237,9 +253,9 @@ namespace MonsterPathPredictor.Runtime
             float maxX = float.MinValue, maxY = float.MinValue;
             int valid = 0;
 
-            for (int i = 0; i < bounds.Corners.Length; i++)
+            for (int i = 0; i < 4; i++)
             {
-                Vector3 c = bounds.Corners[i];
+                Vector3 c = i == 0 ? bounds.BL : i == 1 ? bounds.BR : i == 2 ? bounds.TL : bounds.TR;
                 if (Vector3.Dot(c - camPos, camForward) <= 0.05f) continue;
                 Vector2 p = layer.WorldToLocal(c, camera);
                 if (float.IsNaN(p.x) || float.IsInfinity(p.x) || float.IsNaN(p.y) || float.IsInfinity(p.y))

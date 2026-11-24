@@ -49,6 +49,11 @@ namespace MonsterPathPredictor.Runtime
         private readonly List<GGraph> _lineGraphPool = new List<GGraph>();
         private readonly List<PooledPill> _pillPool = new List<PooledPill>();
         private readonly Dictionary<long, float> _stableHeaderHeight = new Dictionary<long, float>();
+        private readonly Dictionary<int, Point2> _screenCache = new Dictionary<int, Point2>();
+        private readonly Dictionary<int, int> _forkTagStack = new Dictionary<int, int>();
+        private readonly HashSet<int> _combatLandSet = new HashSet<int>();
+        private readonly List<DashQuad> _dashQuadBuf = new List<DashQuad>(32);
+        private readonly List<Vector2> _vertBuf = new List<Vector2>(4);
         private int _usedLineGraphs;
         private int _usedPills;
 
@@ -145,10 +150,10 @@ namespace MonsterPathPredictor.Runtime
                 DrawPillLabel(new Point2(headerPt.X, headerPt.Y - 12f), headerText, Math.Max(13, settings.FontSize - 2), RingColor);
             }
 
-            var screenCache = new Dictionary<int, Point2>();
+            _screenCache.Clear();
             bool TryProjectTile(int landId, out Point2 pt)
             {
-                if (screenCache.TryGetValue(landId, out pt)) return true;
+                if (_screenCache.TryGetValue(landId, out pt)) return true;
                 if (!board.TryGetNode(landId, out var node))
                 {
                     pt = default;
@@ -156,7 +161,7 @@ namespace MonsterPathPredictor.Runtime
                 }
                 var world = new Vector3(node.X, node.Y + hOffset, node.Z);
                 if (!TryProjectWorld(layer, camera, camPos, camForward, world, out pt)) return false;
-                screenCache[landId] = pt;
+                _screenCache[landId] = pt;
                 return true;
             }
 
@@ -166,7 +171,7 @@ namespace MonsterPathPredictor.Runtime
                 DrawDot(startPt, 8.5f, RingColor);
             }
 
-            // 2. Animated forward-marching dashed lines for all predicted edges
+            // 2. Animated forward-marching dashed lines for all predicted edges (zero-alloc buffers)
             for (int i = 0; i < plan.Edges.Count; i++)
             {
                 var edge = plan.Edges[i];
@@ -179,7 +184,8 @@ namespace MonsterPathPredictor.Runtime
                     ? baseWidth
                     : Math.Max(2.0f, baseWidth * (0.65f + 0.35f * (float)edge.Probability));
 
-                var quads = DashGeometry.BuildDashedSegments(
+                DashGeometry.BuildDashedSegmentsInto(
+                    _dashQuadBuf,
                     pFrom, pTo,
                     settings.DashLength,
                     settings.GapLength,
@@ -188,20 +194,22 @@ namespace MonsterPathPredictor.Runtime
                     trimEnd: 3f,
                     phaseOffset: phaseOffset);
 
-                for (int q = 0; q < quads.Count; q++)
+                for (int q = 0; q < _dashQuadBuf.Count; q++)
                 {
-                    DrawPolygon(quads[q], color);
+                    DrawQuad(_dashQuadBuf[q], color);
                 }
 
                 // Draw directional chevron on the very first step out of the monster
-                if (edge.EarliestStep == 0)
+                if (edge.EarliestStep == 0 &&
+                    DashGeometry.TryBuildArrowHead(pFrom, pTo, Math.Max(12f, width * 3.1f), Math.Max(6f, width * 1.6f), out var head, 0.60f))
                 {
-                    var head = DashGeometry.BuildArrowHead(pFrom, pTo, Math.Max(12f, width * 3.1f), Math.Max(6f, width * 1.6f), 0.60f);
-                    if (head.Length >= 3) DrawPolygon(head, color);
+                    DrawTriangle(head, color);
                 }
             }
 
-            // 3. Fork directional arrows & probability percentage badges (guide-aligned colors)
+            // 3. Fork directional arrows & probability percentage badges (de-overlapped across multi-visit forks)
+            _forkTagStack.Clear();
+            float tagLineHeight = Math.Max(20f, settings.FontSize + 5f);
             for (int i = 0; i < plan.Forks.Count; i++)
             {
                 var fork = plan.Forks[i];
@@ -209,6 +217,9 @@ namespace MonsterPathPredictor.Runtime
 
                 Color forkAccent = PickForkAccentColor(fork);
                 DrawDot(forkPt, 5.5f, forkAccent);
+
+                _forkTagStack.TryGetValue(fork.ForkLandId, out int visitIndex);
+                float alongShift = Math.Min(0.82f, 0.56f + visitIndex * 0.14f);
 
                 for (int e = 0; e < fork.Exits.Count; e++)
                 {
@@ -218,22 +229,34 @@ namespace MonsterPathPredictor.Runtime
                     Color exitColor = PickForkExitColor(fork, exit);
                     float arrowLen = Math.Max(14f, settings.LineWidth * 3.5f);
                     float arrowHalfW = Math.Max(7f, settings.LineWidth * 1.8f);
-                    var arrow = DashGeometry.BuildArrowHead(forkPt, exitPt, arrowLen, arrowHalfW, 0.56f);
-                    if (arrow.Length >= 3) DrawPolygon(arrow, exitColor);
+                    if (DashGeometry.TryBuildArrowHead(forkPt, exitPt, arrowLen, arrowHalfW, out var arrow, 0.56f))
+                    {
+                        DrawTriangle(arrow, exitColor);
+                    }
 
                     if (fork.HasMultipleBranches || settings.ShowDeterministicPercent)
                     {
-                        string pctText = exit.FormatConditionalPercent();
-                        var anchor = DashGeometry.ComputeEdgeLabelAnchor(forkPt, exitPt, alongRatio: 0.56f, lateralOffset: e == 0 ? -15f : 15f);
+                        string pctText = visitIndex > 0
+                            ? ("第" + fork.StepIndex + "步 " + exit.FormatConditionalPercent())
+                            : exit.FormatConditionalPercent();
+                        float lat = fork.Exits.Count <= 2
+                            ? (e == 0 ? -16f : 16f)
+                            : ((e - (fork.Exits.Count - 1) * 0.5f) * 20f);
+                        var anchor = DashGeometry.ComputeEdgeLabelAnchor(forkPt, exitPt, alongRatio: alongShift, lateralOffset: lat);
                         DrawPillLabel(anchor, pctText, settings.FontSize, exitColor);
                     }
                 }
 
                 if (settings.ShowReasonTag && !string.IsNullOrEmpty(fork.SummaryLabel))
                 {
-                    var tagPos = new Point2(forkPt.X, forkPt.Y - settings.FontSize - 14f);
-                    DrawPillLabel(tagPos, fork.SummaryLabel, Math.Max(12, settings.FontSize - 3), forkAccent);
+                    string reasonText = visitIndex > 0
+                        ? ("第" + fork.StepIndex + "步·" + fork.SummaryLabel)
+                        : fork.SummaryLabel;
+                    var tagPos = new Point2(forkPt.X, forkPt.Y - settings.FontSize - 14f - visitIndex * tagLineHeight);
+                    DrawPillLabel(tagPos, reasonText, Math.Max(12, settings.FontSize - 3), forkAccent);
                 }
+
+                _forkTagStack[fork.ForkLandId] = visitIndex + 1;
             }
 
             // 4. Encounter / combat / steal markers on tiles occupied by living players
@@ -278,20 +301,20 @@ namespace MonsterPathPredictor.Runtime
             else
             {
                 // Fallback endpoint-only markers when per-tile step numbers are disabled
-                var combatLands = new HashSet<int>();
-                for (int i = 0; i < plan.Combats.Count; i++) combatLands.Add(plan.Combats[i].LandId);
+                _combatLandSet.Clear();
+                for (int i = 0; i < plan.Combats.Count; i++) _combatLandSet.Add(plan.Combats[i].LandId);
 
                 for (int i = 0; i < plan.Endpoints.Count; i++)
                 {
                     var ep = plan.Endpoints[i];
-                    if (ep.StoppedAtCombat && combatLands.Contains(ep.LandId)) continue;
+                    if (ep.StoppedAtCombat && _combatLandSet.Contains(ep.LandId)) continue;
                     if (!TryProjectTile(ep.LandId, out var epPt)) continue;
 
                     Color epColor = PickEdgeColor(ep.Probability, ep.IsAfterCombat);
                     DrawDot(epPt, 6.5f, epColor);
 
                     string epLabel = ep.IsDeadEnd ? ("终点(" + ep.StepIndex + "格)") : (ep.StepIndex + "格");
-                    float yOff = combatLands.Contains(ep.LandId) ? -22f : 16f;
+                    float yOff = _combatLandSet.Contains(ep.LandId) ? -22f : 16f;
                     DrawPillLabel(new Point2(epPt.X, epPt.Y + yOff), epLabel, Math.Max(12, settings.FontSize - 4), epColor);
                 }
             }
@@ -404,32 +427,46 @@ namespace MonsterPathPredictor.Runtime
             return true;
         }
 
-        private void DrawPolygon(Point2[] points, Color color)
+        private void DrawQuad(DashQuad q, Color color)
         {
-            if (points == null || points.Length < 3) return;
-
-            float minX = float.MaxValue, minY = float.MaxValue;
-            float maxX = float.MinValue, maxY = float.MinValue;
-            for (int i = 0; i < points.Length; i++)
-            {
-                if (points[i].X < minX) minX = points[i].X;
-                if (points[i].Y < minY) minY = points[i].Y;
-                if (points[i].X > maxX) maxX = points[i].X;
-                if (points[i].Y > maxY) maxY = points[i].Y;
-            }
+            float minX = Math.Min(Math.Min(q.P0.X, q.P1.X), Math.Min(q.P2.X, q.P3.X));
+            float minY = Math.Min(Math.Min(q.P0.Y, q.P1.Y), Math.Min(q.P2.Y, q.P3.Y));
+            float maxX = Math.Max(Math.Max(q.P0.X, q.P1.X), Math.Max(q.P2.X, q.P3.X));
+            float maxY = Math.Max(Math.Max(q.P0.Y, q.P1.Y), Math.Max(q.P2.Y, q.P3.Y));
 
             float w = Math.Max(1f, maxX - minX);
             float h = Math.Max(1f, maxY - minY);
-            var verts = new List<Vector2>(points.Length);
-            for (int i = 0; i < points.Length; i++)
-            {
-                verts.Add(new Vector2(points[i].X - minX, points[i].Y - minY));
-            }
+            _vertBuf.Clear();
+            _vertBuf.Add(new Vector2(q.P0.X - minX, q.P0.Y - minY));
+            _vertBuf.Add(new Vector2(q.P1.X - minX, q.P1.Y - minY));
+            _vertBuf.Add(new Vector2(q.P2.X - minX, q.P2.Y - minY));
+            _vertBuf.Add(new Vector2(q.P3.X - minX, q.P3.Y - minY));
 
             var g = AcquireLineGraph();
             g.SetXY(minX, minY);
             g.SetSize(w, h);
-            g.DrawPolygon(w, h, verts, color);
+            g.DrawPolygon(w, h, _vertBuf, color);
+            if (!g.visible) g.visible = true;
+        }
+
+        private void DrawTriangle(ArrowTriangle t, Color color)
+        {
+            float minX = Math.Min(t.P0.X, Math.Min(t.P1.X, t.P2.X));
+            float minY = Math.Min(t.P0.Y, Math.Min(t.P1.Y, t.P2.Y));
+            float maxX = Math.Max(t.P0.X, Math.Max(t.P1.X, t.P2.X));
+            float maxY = Math.Max(t.P0.Y, Math.Max(t.P1.Y, t.P2.Y));
+
+            float w = Math.Max(1f, maxX - minX);
+            float h = Math.Max(1f, maxY - minY);
+            _vertBuf.Clear();
+            _vertBuf.Add(new Vector2(t.P0.X - minX, t.P0.Y - minY));
+            _vertBuf.Add(new Vector2(t.P1.X - minX, t.P1.Y - minY));
+            _vertBuf.Add(new Vector2(t.P2.X - minX, t.P2.Y - minY));
+
+            var g = AcquireLineGraph();
+            g.SetXY(minX, minY);
+            g.SetSize(w, h);
+            g.DrawPolygon(w, h, _vertBuf, color);
             if (!g.visible) g.visible = true;
         }
 

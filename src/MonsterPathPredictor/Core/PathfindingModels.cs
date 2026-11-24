@@ -119,6 +119,12 @@ namespace MonsterPathPredictor.Core
         public int LandId { get; set; } = -1;
         public bool IsAlive { get; set; } = true;
         public bool IsTargetable { get; set; } = true;
+        /// <summary>
+        /// Whether aggressive monsters can initiate combat with this player on contact.
+        /// False for stealth/unchallengeable buffs such as 1270202 (毒苹果隐匿) that still
+        /// attract monster pathfinding at forks without triggering combat.
+        /// </summary>
+        public bool CanBeAttacked { get; set; } = true;
         /// <summary>Player's current stars/gold (-1 = unknown/assume positive for thief steal checks).</summary>
         public int Gold { get; set; } = -1;
         /// <summary>Library (82016) 【罪证】 stack count (buff 10013 / Hero.CrimeNum).</summary>
@@ -134,7 +140,11 @@ namespace MonsterPathPredictor.Core
     public sealed class PlanOptions
     {
         public int MaxSteps { get; set; } = 12;
-        public double MinBranchProbability { get; set; } = 0.005;
+        /// <summary>
+        /// Optional branch pruning threshold (0.0 = exact probability conservation, no pruning).
+        /// Any probability mass pruned when &gt; 0 is recorded in <see cref="PathPlan.PrunedProbability"/>.
+        /// </summary>
+        public double MinBranchProbability { get; set; } = 0.0;
         public bool SimulateCombatOnFork { get; set; } = true;
         public PostCombatMode PostCombatMode { get; set; } = PostCombatMode.ContinueByGuide;
     }
@@ -168,9 +178,14 @@ namespace MonsterPathPredictor.Core
     {
         public int FromLandId { get; set; }
         public int ToLandId { get; set; }
+        /// <summary>
+        /// Maximum per-step traversal probability across all predicted steps (exact for same-step
+        /// branch merges; never inflated above a single looping branch's probability).
+        /// </summary>
         public double Probability { get; set; }
         public int EarliestStep { get; set; }
         public bool IsAfterCombat { get; set; }
+        public Dictionary<int, double> StepProbabilities { get; } = new Dictionary<int, double>();
     }
 
     public sealed class PredictedCombat
@@ -180,6 +195,7 @@ namespace MonsterPathPredictor.Core
         public double Probability { get; set; }
         public string TargetLabel { get; set; } = string.Empty;
         public bool IsSteal { get; set; }
+        public Dictionary<int, double> StepProbabilities { get; } = new Dictionary<int, double>();
     }
 
     public sealed class PredictedEndpoint
@@ -197,10 +213,12 @@ namespace MonsterPathPredictor.Core
         public int LandId { get; set; }
         public int StepIndex { get; set; }
         public List<int> StepIndices { get; } = new List<int>();
+        /// <summary>Maximum per-step arrival probability across steps visiting this tile.</summary>
         public double Probability { get; set; }
         public bool IsAfterCombat { get; set; }
         public bool IsEndpoint { get; set; }
         public bool IsDeadEnd { get; set; }
+        public Dictionary<int, double> StepProbabilities { get; } = new Dictionary<int, double>();
 
         public string FormatStepBadge()
         {
@@ -222,6 +240,8 @@ namespace MonsterPathPredictor.Core
         public int StepsRequested { get; set; }
         public bool IsNormalAggressive { get; set; } = true;
         public string HeadlineNote { get; set; } = string.Empty;
+        /// <summary>Total probability mass pruned when <see cref="PlanOptions.MinBranchProbability"/> &gt; 0.</summary>
+        public double PrunedProbability { get; set; }
 
         public List<PredictedEdge> Edges { get; } = new List<PredictedEdge>();
         public List<PredictedFork> Forks { get; } = new List<PredictedFork>();

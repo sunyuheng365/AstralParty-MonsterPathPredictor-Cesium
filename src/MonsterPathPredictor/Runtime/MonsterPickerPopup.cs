@@ -40,14 +40,19 @@ namespace MonsterPathPredictor.Runtime
         private GTextField _titleText;
         private GComponent _listHost;
         private GComponent _footerHost;
+        private GComponent _pagerHost;
+        private GTextField _pageLabel;
         private GTextField _stepsLabel;
         private GTextField _emptyText;
 
         private bool _isOpen;
+        private bool _temporarilyHidden;
         private bool _positioned;
+        private bool _closeOnSelect;
+        private int _pageIndex;
         private string _lastSignature = string.Empty;
 
-        public bool IsOpen => _isOpen;
+        public bool IsOpen => _isOpen && !_temporarilyHidden;
 
         public event Action<long> MonsterSelected;
         public event Action ClearRequested;
@@ -62,6 +67,7 @@ namespace MonsterPathPredictor.Runtime
         public void Show()
         {
             _isOpen = true;
+            _temporarilyHidden = false;
             _lastSignature = string.Empty;
             EnsureCreated();
             if (_root != null)
@@ -74,15 +80,26 @@ namespace MonsterPathPredictor.Runtime
         public void Hide()
         {
             _isOpen = false;
+            _temporarilyHidden = false;
             if (_root != null && !_root.isDisposed)
             {
                 _root.visible = false;
             }
         }
 
+        public void SetTemporarilyHidden(bool hidden)
+        {
+            if (_temporarilyHidden == hidden) return;
+            _temporarilyHidden = hidden;
+            if (_root != null && !_root.isDisposed)
+            {
+                _root.visible = _isOpen && !_temporarilyHidden;
+            }
+        }
+
         public bool ContainsStagePoint(Vector2 stagePos)
         {
-            if (!_isOpen || _root == null || _root.isDisposed || !_root.visible) return false;
+            if (!IsOpen || _root == null || _root.isDisposed || !_root.visible) return false;
             try
             {
                 Vector2 local = _root.GlobalToLocal(stagePos);
@@ -99,23 +116,16 @@ namespace MonsterPathPredictor.Runtime
             long selectedMonsterId,
             PredictorSettings settings)
         {
-            if (!_isOpen) return;
+            if (!IsOpen) return;
             EnsureCreated();
             if (_root == null || _root.isDisposed) return;
 
-            string sig = BuildSignature(monsters, selectedMonsterId, settings);
-            if (sig == _lastSignature) return;
-            _lastSignature = sig;
-
-            _titleText.text = "怪物寻路选择 [" + settings.PickerHotkey + "]";
-            _stepsLabel.text = "延伸 " + settings.PreviewSteps + " 格";
-
-            _listHost.RemoveChildren(0, -1, true);
+            _closeOnSelect = settings.ClosePickerOnSelect;
 
             var visible = new List<LiveMonsterInfo>();
             if (monsters != null)
             {
-                for (int i = 0; i < monsters.Count && visible.Count < MaxVisibleRows; i++)
+                for (int i = 0; i < monsters.Count; i++)
                 {
                     var m = monsters[i];
                     if (m == null || m.State == null) continue;
@@ -123,6 +133,19 @@ namespace MonsterPathPredictor.Runtime
                     visible.Add(m);
                 }
             }
+
+            int totalPages = Math.Max(1, (visible.Count + MaxVisibleRows - 1) / MaxVisibleRows);
+            if (_pageIndex >= totalPages) _pageIndex = totalPages - 1;
+            if (_pageIndex < 0) _pageIndex = 0;
+
+            string sig = BuildSignature(visible, selectedMonsterId, settings, _pageIndex, totalPages);
+            if (sig == _lastSignature) return;
+            _lastSignature = sig;
+
+            _titleText.text = "怪物寻路选择 [" + settings.PickerHotkey + "]";
+            _stepsLabel.text = "延伸 " + settings.PreviewSteps + " 格";
+
+            _listHost.RemoveChildren(0, -1, true);
 
             float listHeight;
             if (visible.Count == 0)
@@ -134,16 +157,30 @@ namespace MonsterPathPredictor.Runtime
             else
             {
                 _emptyText.visible = false;
-                listHeight = visible.Count * (RowHeight + 4f) + 4f;
-                for (int i = 0; i < visible.Count; i++)
+                int start = _pageIndex * MaxVisibleRows;
+                int count = Math.Min(MaxVisibleRows, visible.Count - start);
+                listHeight = count * (RowHeight + 4f) + 4f;
+                for (int i = 0; i < count; i++)
                 {
-                    var row = BuildMonsterRow(visible[i], selectedMonsterId, settings.ClosePickerOnSelect);
+                    var row = BuildMonsterRow(visible[start + i], selectedMonsterId);
                     row.SetXY(0f, i * (RowHeight + 4f));
                     _listHost.AddChild(row);
                 }
             }
 
-            float totalHeight = HeaderHeight + Padding + listHeight + Padding + FooterHeight;
+            bool showPager = totalPages > 1;
+            float pagerHeight = showPager ? 28f : 0f;
+            if (_pagerHost != null)
+            {
+                _pagerHost.visible = showPager;
+                if (showPager)
+                {
+                    _pageLabel.text = (_pageIndex + 1) + " / " + totalPages + " (" + visible.Count + "只)";
+                    _pagerHost.SetXY(0f, HeaderHeight + Padding + listHeight);
+                }
+            }
+
+            float totalHeight = HeaderHeight + Padding + listHeight + pagerHeight + Padding + FooterHeight;
             _root.SetSize(PanelWidth, totalHeight);
             _panelBg.SetSize(PanelWidth, totalHeight);
             _panelBg.DrawRect(PanelWidth, totalHeight, 2, PanelBorder, PanelBg);
@@ -162,7 +199,7 @@ namespace MonsterPathPredictor.Runtime
             ClampToStage();
         }
 
-        private GComponent BuildMonsterRow(LiveMonsterInfo info, long selectedMonsterId, bool closeOnSelect)
+        private GComponent BuildMonsterRow(LiveMonsterInfo info, long selectedMonsterId)
         {
             var st = info.State;
             bool isSelected = st.MonsterId == selectedMonsterId;
@@ -170,7 +207,8 @@ namespace MonsterPathPredictor.Runtime
 
             var row = new GComponent
             {
-                touchable = true
+                touchable = true,
+                opaque = true
             };
             row.SetSize(rowW, RowHeight);
 
@@ -223,7 +261,7 @@ namespace MonsterPathPredictor.Runtime
             row.onClick.Add(() =>
             {
                 MonsterSelected?.Invoke(capturedId);
-                if (closeOnSelect) Hide();
+                if (_closeOnSelect) Hide();
             });
 
             return row;
@@ -248,9 +286,10 @@ namespace MonsterPathPredictor.Runtime
             {
                 name = "MonsterPathPredictor.PickerPopup",
                 touchable = true,
+                opaque = true,
                 draggable = true,
                 sortingOrder = 2200,
-                visible = _isOpen
+                visible = IsOpen
             };
             GRoot.inst.AddChild(_root);
 
@@ -278,6 +317,26 @@ namespace MonsterPathPredictor.Runtime
             _listHost = new GComponent { touchable = true };
             _root.AddChild(_listHost);
 
+            _pagerHost = new GComponent { touchable = true, visible = false };
+            _pagerHost.SetSize(PanelWidth, 28f);
+            var prevBtn = CreateMiniButton("◀", 28f, 22f, () => { _pageIndex = Math.Max(0, _pageIndex - 1); _lastSignature = string.Empty; });
+            prevBtn.SetXY(Padding, 3f);
+            _pagerHost.AddChild(prevBtn);
+            _pageLabel = new GTextField
+            {
+                touchable = false,
+                autoSize = AutoSizeType.None,
+                align = AlignType.Center,
+                textFormat = new TextFormat { size = 13, color = TextMuted }
+            };
+            _pageLabel.SetXY(44f, 5f);
+            _pageLabel.SetSize(PanelWidth - 88f, 18f);
+            _pagerHost.AddChild(_pageLabel);
+            var nextBtn = CreateMiniButton("▶", 28f, 22f, () => { _pageIndex++; _lastSignature = string.Empty; });
+            nextBtn.SetXY(PanelWidth - Padding - 28f, 3f);
+            _pagerHost.AddChild(nextBtn);
+            _root.AddChild(_pagerHost);
+
             _emptyText = new GTextField
             {
                 touchable = false,
@@ -287,7 +346,7 @@ namespace MonsterPathPredictor.Runtime
             };
             _root.AddChild(_emptyText);
 
-            _footerHost = new GComponent { touchable = true };
+            _footerHost = new GComponent { touchable = true, opaque = true };
             _footerHost.SetSize(PanelWidth, FooterHeight);
             var footerBg = new GGraph { touchable = false };
             footerBg.SetSize(PanelWidth, FooterHeight);
@@ -322,7 +381,7 @@ namespace MonsterPathPredictor.Runtime
 
         private static GComponent CreateMiniButton(string text, float w, float h, Action onClick)
         {
-            var btn = new GComponent { touchable = true };
+            var btn = new GComponent { touchable = true, opaque = true };
             btn.SetSize(w, h);
 
             var bg = new GGraph { touchable = false };
@@ -358,15 +417,25 @@ namespace MonsterPathPredictor.Runtime
             _root.SetXY(x, y);
         }
 
-        private static string BuildSignature(IReadOnlyList<LiveMonsterInfo> monsters, long selectedId, PredictorSettings settings)
+        private static string BuildSignature(
+            IReadOnlyList<LiveMonsterInfo> visibleMonsters,
+            long selectedId,
+            PredictorSettings settings,
+            int pageIndex,
+            int totalPages)
         {
-            var sb = new System.Text.StringBuilder(128);
-            sb.Append(selectedId).Append('|').Append(settings.PreviewSteps).Append('|').Append(settings.PickerHotkey).Append('|');
-            if (monsters != null)
+            var sb = new System.Text.StringBuilder(160);
+            sb.Append(selectedId).Append('|')
+              .Append(settings.PreviewSteps).Append('|')
+              .Append(settings.PickerHotkey).Append('|')
+              .Append(settings.AllowNonAggressiveMonsters ? '1' : '0')
+              .Append(settings.ClosePickerOnSelect ? '1' : '0').Append('|')
+              .Append(pageIndex).Append('/').Append(totalPages).Append('|');
+            if (visibleMonsters != null)
             {
-                for (int i = 0; i < monsters.Count; i++)
+                for (int i = 0; i < visibleMonsters.Count; i++)
                 {
-                    var st = monsters[i].State;
+                    var st = visibleMonsters[i].State;
                     sb.Append(st.MonsterId).Append(':')
                       .Append(st.DisplayName).Append(':')
                       .Append(st.CurrentLandId).Append(':')
@@ -380,6 +449,8 @@ namespace MonsterPathPredictor.Runtime
         {
             _lastSignature = string.Empty;
             _positioned = false;
+            _temporarilyHidden = false;
+            _pageIndex = 0;
             if (_root != null)
             {
                 try { _root.Dispose(); } catch { }
@@ -389,6 +460,8 @@ namespace MonsterPathPredictor.Runtime
             _headerBg = null;
             _titleText = null;
             _listHost = null;
+            _pagerHost = null;
+            _pageLabel = null;
             _footerHost = null;
             _stepsLabel = null;
             _emptyText = null;

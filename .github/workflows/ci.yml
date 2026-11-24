@@ -16,3 +16,7 @@ jobs:
           dotnet-version: '8.0.x'
       - name: Run unit tests
         run: dotnet test tests/MonsterPathPredictor.Tests/MonsterPathPredictor.Tests.csproj -c Release --verbosity normal
+      - name: Build and self-test ReplayCertifier
+        run: |
+          dotnet build tools/ReplayCertifier/ReplayCertifier.csproj -c Release --nologo
+          dotnet run --project tools/ReplayCertifier/ReplayCertifier.csproj -c Release --no-build -- --self-test

@@ -72,17 +72,25 @@ namespace MonsterPathPredictor.Core
         {
             public int LandId;
             public int FromLandId;
+            public int StepIndex;
             public bool AfterCombat;
+            public int ClearedMarkLandId;
 
-            public ForkRecordKey(int landId, int fromLandId, bool afterCombat)
+            public ForkRecordKey(int landId, int fromLandId, int stepIndex, bool afterCombat, int clearedMarkLandId)
             {
                 LandId = landId;
                 FromLandId = fromLandId;
+                StepIndex = stepIndex;
                 AfterCombat = afterCombat;
+                ClearedMarkLandId = clearedMarkLandId;
             }
 
             public bool Equals(ForkRecordKey other) =>
-                LandId == other.LandId && FromLandId == other.FromLandId && AfterCombat == other.AfterCombat;
+                LandId == other.LandId &&
+                FromLandId == other.FromLandId &&
+                StepIndex == other.StepIndex &&
+                AfterCombat == other.AfterCombat &&
+                ClearedMarkLandId == other.ClearedMarkLandId;
 
             public override bool Equals(object obj) => obj is ForkRecordKey other && Equals(other);
 
@@ -92,7 +100,9 @@ namespace MonsterPathPredictor.Core
                 {
                     int h = LandId;
                     h = (h * 397) ^ FromLandId;
+                    h = (h * 397) ^ StepIndex;
                     h = (h * 397) ^ (AfterCombat ? 1 : 0);
+                    h = (h * 397) ^ ClearedMarkLandId;
                     return h;
                 }
             }
@@ -124,7 +134,7 @@ namespace MonsterPathPredictor.Core
             if (monster == null) throw new ArgumentNullException(nameof(monster));
 
             options = options ?? new PlanOptions();
-            int maxSteps = Math.Max(1, Math.Min(60, options.MaxSteps));
+            int maxSteps = Math.Max(0, Math.Min(60, options.MaxSteps));
             double minProb = Math.Max(0.0, options.MinBranchProbability);
 
             string displayName = !string.IsNullOrEmpty(monster.DisplayName) ? monster.DisplayName : (monster.Name ?? string.Empty);
@@ -145,7 +155,8 @@ namespace MonsterPathPredictor.Core
 
             var activePlayers = FilterEffectivePlayers(board, monster, players);
             var shortestPathCache = new Dictionary<int, ShortestPathField>();
-            var playersByLand = BuildPlayersByLand(activePlayers);
+            var combatPlayersByLand = BuildPlayersByLand(activePlayers, combatEligibleOnly: true);
+            var stealPlayersByLand = BuildPlayersByLand(activePlayers, combatEligibleOnly: false);
 
             var edgeMap = new Dictionary<EdgeKey, PredictedEdge>();
             var edgeHasPreCombat = new HashSet<EdgeKey>();
@@ -172,19 +183,23 @@ namespace MonsterPathPredictor.Core
                     var state = entry.Key;
                     double arrivalProb = entry.Value;
                     if (arrivalProb <= Epsilon) continue;
-                    if (step > 0 && arrivalProb < minProb) continue;
+                    if (step > 0 && minProb > 0.0 && arrivalProb < minProb)
+                    {
+                        plan.PrunedProbability += arrivalProb;
+                        continue;
+                    }
 
                     bool postCombatNow = state.HasEncounteredPlayer;
                     int clearedMarkLandId = state.ClearedMarkLandId;
                     bool encounteredOnThisTile = false;
 
                     // When stepping onto a tile occupied by living player(s) during the walk (step > 0):
-                    // - Aggressive monster initiates combat on this tile (once per turn).
+                    // - Aggressive monster initiates combat only against CanBeAttacked players (excludes stealth buff 1270202).
                     // - Thief steals coins from living player(s) with Gold != 0, interrupting movement on a fork
-                    //   so leaving that fork switches to Red > Blue (verified 99.83% across 746 real replays).
-                    if (step > 0 && !postCombatNow && playersByLand.TryGetValue(state.LandId, out var targetsHere))
+                    //   so leaving that fork switches to Red > Blue.
+                    if (step > 0 && !postCombatNow)
                     {
-                        if (monster.IsNormalAggressive)
+                        if (monster.IsNormalAggressive && combatPlayersByLand.TryGetValue(state.LandId, out var targetsHere))
                         {
                             encounteredOnThisTile = true;
                             postCombatNow = true;
@@ -200,9 +215,9 @@ namespace MonsterPathPredictor.Core
                                 continue;
                             }
                         }
-                        else if (monster.IsThief)
+                        else if (monster.IsThief && stealPlayersByLand.TryGetValue(state.LandId, out var stealCandidates))
                         {
-                            var stealTargets = FilterStealablePlayers(targetsHere);
+                            var stealTargets = FilterStealablePlayers(stealCandidates);
                             if (stealTargets.Count > 0)
                             {
                                 encounteredOnThisTile = true;
@@ -234,7 +249,7 @@ namespace MonsterPathPredictor.Core
 
                     if (outcome.IsForkDecision)
                     {
-                        RecordFork(board, forkMap, state.LandId, state.FromLandId, step, arrivalProb, postCombatNow, outcome);
+                        RecordFork(board, forkMap, state.LandId, state.FromLandId, step, arrivalProb, postCombatNow, clearedMarkLandId, outcome);
                         if (step == 0 && string.IsNullOrEmpty(plan.HeadlineNote))
                         {
                             plan.HeadlineNote = outcome.SummaryLabel;
@@ -275,7 +290,10 @@ namespace MonsterPathPredictor.Core
                             pe.IsAfterCombat = true;
                         }
 
-                        pe.Probability = Math.Min(1.0, pe.Probability + branchProb);
+                        pe.StepProbabilities.TryGetValue(step, out double prevEdgeStepProb);
+                        double nextEdgeStepProb = Math.Min(1.0, prevEdgeStepProb + branchProb);
+                        pe.StepProbabilities[step] = nextEdgeStepProb;
+                        if (nextEdgeStepProb > pe.Probability) pe.Probability = nextEdgeStepProb;
                         if (step < pe.EarliestStep) pe.EarliestStep = step;
 
                         RecordTileStep(tileStepMap, tileStepHasPreCombat, nextId, step + 1, branchProb, postCombatNow);
@@ -291,23 +309,24 @@ namespace MonsterPathPredictor.Core
                 currentLayer = nextLayer;
             }
 
-            // Also record combat if the final step lands directly on a living player
+            // Also record combat if the final step lands directly on a living player (when maxSteps > 0),
+            // and detect final-step dead-ends consistently regardless of whether MaxSteps hit exact length.
             foreach (var finalState in currentLayer)
             {
                 if (finalState.Value <= Epsilon) continue;
                 bool stoppedCombat = false;
                 bool afterCombat = finalState.Key.HasEncounteredPlayer;
-                if (!afterCombat && playersByLand.TryGetValue(finalState.Key.LandId, out var endTargets))
+                if (maxSteps > 0 && !afterCombat)
                 {
-                    if (monster.IsNormalAggressive)
+                    if (monster.IsNormalAggressive && combatPlayersByLand.TryGetValue(finalState.Key.LandId, out var endTargets))
                     {
                         RecordCombat(combatMap, finalState.Key.LandId, maxSteps, finalState.Value, endTargets, isSteal: false);
                         afterCombat = true;
                         stoppedCombat = (options.PostCombatMode == PostCombatMode.StopAtFirstCombat);
                     }
-                    else if (monster.IsThief)
+                    else if (monster.IsThief && stealPlayersByLand.TryGetValue(finalState.Key.LandId, out var endStealCandidates))
                     {
-                        var stealTargets = FilterStealablePlayers(endTargets);
+                        var stealTargets = FilterStealablePlayers(endStealCandidates);
                         if (stealTargets.Count > 0)
                         {
                             RecordCombat(combatMap, finalState.Key.LandId, maxSteps, finalState.Value, stealTargets, isSteal: true);
@@ -316,7 +335,13 @@ namespace MonsterPathPredictor.Core
                     }
                 }
 
-                AccumulateEndpoint(endpointMap, finalState.Key.LandId, maxSteps, false, stoppedCombat, afterCombat, finalState.Value);
+                bool isDeadEnd = false;
+                if (!stoppedCombat && maxSteps > 0)
+                {
+                    isDeadEnd = board.GetForwardNeighbors(finalState.Key.LandId, finalState.Key.FromLandId).Count == 0;
+                }
+
+                AccumulateEndpoint(endpointMap, finalState.Key.LandId, maxSteps, isDeadEnd, stoppedCombat, afterCombat, finalState.Value);
             }
 
             plan.Edges.AddRange(edgeMap.Values);
@@ -631,6 +656,14 @@ namespace MonsterPathPredictor.Core
                 }
             }
 
+            // Ongoing taunt override at mid-walk forks before combat (consistent with DecideFirstStep)
+            if (!isAfterCombat && !combatHappenedOnThisTile && monster != null &&
+                monster.IsTaunted && monster.TauntTargetPlayerId != 0 &&
+                TryDecideTauntStep(board, landId, monster.TauntTargetPlayerId, activePlayers, cache, out var midTauntOutcome))
+            {
+                return midTauntOutcome;
+            }
+
             // Marked-target free-direction chase at mid-walk forks BEFORE combat:
             // 1047 铜盏鸳鸯 and 1018 学院安全官 may U-turn at a pre-combat mid-walk fork toward a still-marked player
             // (excluding players standing on the monster's turn-start tile). Once combat occurs, no more U-turning.
@@ -834,9 +867,10 @@ namespace MonsterPathPredictor.Core
             int stepIndex,
             double arrivalProb,
             bool isAfterCombat,
+            int clearedMarkLandId,
             StepOutcome outcome)
         {
-            var key = new ForkRecordKey(forkLandId, incomingLandId, isAfterCombat);
+            var key = new ForkRecordKey(forkLandId, incomingLandId, stepIndex, isAfterCombat, clearedMarkLandId);
             var validAll = board.GetValidNeighbors(forkLandId);
             int globalRed = validAll.Count > 0 ? validAll[0] : -1;
 
@@ -869,10 +903,44 @@ namespace MonsterPathPredictor.Core
                 return;
             }
 
-            pf.ArrivalProbability = Math.Min(1.0, pf.ArrivalProbability + arrivalProb);
-            for (int i = 0; i < pf.Exits.Count; i++)
+            double newTotalArrival = pf.ArrivalProbability + arrivalProb;
+            pf.ArrivalProbability = Math.Min(1.0, newTotalArrival);
+
+            for (int i = 0; i < outcome.Transitions.Count; i++)
             {
-                pf.Exits[i].CumulativeProbability = Math.Min(1.0, pf.ArrivalProbability * pf.Exits[i].ConditionalProbability);
+                var tr = outcome.Transitions[i];
+                double addedMass = arrivalProb * tr.Prob;
+                ForkExitPrediction existing = null;
+                for (int j = 0; j < pf.Exits.Count; j++)
+                {
+                    if (pf.Exits[j].NextLandId == tr.NextLandId)
+                    {
+                        existing = pf.Exits[j];
+                        break;
+                    }
+                }
+                if (existing == null)
+                {
+                    pf.Exits.Add(new ForkExitPrediction
+                    {
+                        NextLandId = tr.NextLandId,
+                        CumulativeProbability = Math.Min(1.0, addedMass),
+                        IsGlobalRedArrow = (tr.NextLandId == globalRed)
+                    });
+                }
+                else
+                {
+                    existing.CumulativeProbability = Math.Min(1.0, existing.CumulativeProbability + addedMass);
+                }
+            }
+
+            if (newTotalArrival > Epsilon)
+            {
+                for (int i = 0; i < pf.Exits.Count; i++)
+                {
+                    pf.Exits[i].ConditionalProbability = Math.Min(1.0, pf.Exits[i].CumulativeProbability / newTotalArrival);
+                }
+                pf.Exits.Sort((a, b) => b.ConditionalProbability.CompareTo(a.ConditionalProbability));
             }
         }
 
@@ -960,25 +1028,31 @@ namespace MonsterPathPredictor.Core
                 {
                     LandId = landId,
                     StepIndex = stepIndex,
-                    Probability = probability,
+                    Probability = Math.Min(1.0, probability),
                     TargetLabel = string.Join("/", seats),
                     IsSteal = isSteal
                 };
+                c.StepProbabilities[stepIndex] = Math.Min(1.0, probability);
                 combatMap[landId] = c;
             }
             else
             {
                 c.Probability = Math.Min(1.0, c.Probability + probability);
+                c.StepProbabilities.TryGetValue(stepIndex, out double prevStepProb);
+                c.StepProbabilities[stepIndex] = Math.Min(1.0, prevStepProb + probability);
                 if (stepIndex < c.StepIndex) c.StepIndex = stepIndex;
             }
         }
 
-        private static Dictionary<int, List<TrackedPlayer>> BuildPlayersByLand(List<TrackedPlayer> activePlayers)
+        private static Dictionary<int, List<TrackedPlayer>> BuildPlayersByLand(
+            List<TrackedPlayer> activePlayers,
+            bool combatEligibleOnly)
         {
             var dict = new Dictionary<int, List<TrackedPlayer>>();
             for (int i = 0; i < activePlayers.Count; i++)
             {
                 var p = activePlayers[i];
+                if (combatEligibleOnly && !p.CanBeAttacked) continue;
                 if (!dict.TryGetValue(p.LandId, out var list))
                 {
                     list = new List<TrackedPlayer>();
@@ -1163,6 +1237,7 @@ namespace MonsterPathPredictor.Core
                     IsAfterCombat = isAfterCombat
                 };
                 ts.StepIndices.Add(step);
+                ts.StepProbabilities[step] = Math.Min(1.0, probability);
                 map[landId] = ts;
             }
             else
@@ -1172,7 +1247,10 @@ namespace MonsterPathPredictor.Core
                     ts.StepIndices.Add(step);
                 }
                 if (step < ts.StepIndex) ts.StepIndex = step;
-                ts.Probability = Math.Min(1.0, ts.Probability + probability);
+                ts.StepProbabilities.TryGetValue(step, out double prevStepProb);
+                double nextStepProb = Math.Min(1.0, prevStepProb + probability);
+                ts.StepProbabilities[step] = nextStepProb;
+                if (nextStepProb > ts.Probability) ts.Probability = nextStepProb;
             }
 
             if (!isAfterCombat)

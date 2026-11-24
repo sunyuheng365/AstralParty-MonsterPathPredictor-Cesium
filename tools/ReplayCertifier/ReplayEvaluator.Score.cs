@@ -76,13 +76,18 @@ namespace MonsterPathPredictor.ReplayCertifier
             {
                 var vf = (m.FrontNodeIds ?? Array.Empty<int>()).Where(id => board.IsValidNeighbor(curTile, id)).Distinct().ToArray();
                 board.TryGetPriorityForwardNeighbor(curTile, board.IsValidNeighbor(curTile, fromTile) ? fromTile : -1, out int rbNext, out _);
+                int vfRbNext = -1;
+                if (vf.Length >= 2)
+                {
+                    board.TryGetPriorityAmongCandidates(curTile, vf, out vfRbNext, out _);
+                }
                 var fa = summary.FrontAudit;
-                if (isPostCombat && vf.Length >= 2) { fa.PostCombatMulti++; if (rbNext == nextTile) fa.PostCombatMultiRedBlue++; }
+                if (isPostCombat && vf.Length >= 2) { fa.PostCombatMulti++; if (vfRbNext == nextTile) fa.PostCombatMultiRedBlue++; }
                 else if (isFreshSpawn && vf.Length == 1) { fa.SpawnF1++; if (vf[0] == nextTile) fa.SpawnF1Actual++; if (vf[0] == rbNext) fa.SpawnF1RedBlue++; }
                 else if (!isFreshSpawn && !isPostCombat)
                 {
                     if (vf.Length == 1) { fa.StopF1++; if (vf[0] == nextTile) fa.StopF1Actual++; if (vf[0] == rbNext) fa.StopF1RedBlue++; }
-                    else if (vf.Length >= 2) { fa.StopMulti++; if (rbNext == nextTile) fa.StopMultiRedBlue++; }
+                    else if (vf.Length >= 2) { fa.StopMulti++; if (vfRbNext == nextTile) fa.StopMultiRedBlue++; }
                 }
             }
 
@@ -131,6 +136,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                 LandId = p.NodeId,
                 IsAlive = p.Hp > 0,
                 IsTargetable = !p.NotSelect,
+                CanBeAttacked = !p.BuffIds.Contains(1270202),
                 Gold = p.Gold,
                 CrimeNum = p.CrimeNum,
                 HasProblemStudentMark = p.BuffIds.Contains(2101001),
@@ -144,9 +150,6 @@ namespace MonsterPathPredictor.ReplayCertifier
                 PostCombatMode = PostCombatMode.ContinueByGuide
             });
 
-            var forkPred = plan.Forks.FirstOrDefault(f => f.ForkLandId == curTile);
-            if (forkPred == null || forkPred.Exits.Count == 0) return;
-
             string bucketKey = isThief ? "ThiefFork"
                 : isPostCombat ? "PostCombatFork"
                 : isFreshSpawn ? "SpawnFork"
@@ -156,6 +159,21 @@ namespace MonsterPathPredictor.ReplayCertifier
 
             var bStat = summary.Buckets[bucketKey];
             bStat.Total++;
+
+            var forkPred = plan.Forks.FirstOrDefault(f => f.ForkLandId == curTile);
+            if (forkPred == null || forkPred.Exits.Count == 0)
+            {
+                summary.MissingPredictions++;
+                bStat.DetTotal++;
+                if (isThief) mapStat.ThiefDetTotal++; else mapStat.DetTotal++;
+                if (bStat.Mismatches.Count < 15)
+                {
+                    bStat.Mismatches.Add(
+                        $"{replayId} map={mapId} R{curRound} F{fi} m={m.Id}(h={m.HeroId},mt={m.MonsterType}) " +
+                        $"tile={curTile} from={fromTile} front=[{string.Join(",", m.FrontNodeIds)}] pred=NONE actual={nextTile}");
+                }
+                return;
+            }
 
             if (forkPred.Exits.Count == 1)
             {
@@ -180,15 +198,65 @@ namespace MonsterPathPredictor.ReplayCertifier
             {
                 bStat.ProbTotal++;
                 mapStat.ProbTotal++;
-                foreach (var exit in forkPred.Exits)
-                {
-                    string binKey = ProbabilityFormat.Percent(exit.ConditionalProbability);
-                    if (!summary.ProbBins.TryGetValue(binKey, out var pb)) summary.ProbBins[binKey] = pb = new ProbBin();
-                    pb.Opp++;
-                    pb.SumPred += exit.ConditionalProbability;
-                    if (exit.NextLandId == nextTile) pb.Chosen++;
-                }
+                RecordMultiBranchCalibration(board, curTile, forkPred.Exits, nextTile, summary.ProbBins);
             }
+        }
+
+        /// <summary>
+        /// Records probabilistic calibration observations for a multi-branch fork.
+        /// For symmetric/equal-probability bins (e.g. 50%/50% or 33.3%x3), scores ONLY ONE
+        /// deterministically chosen reference exit selected BEFORE observing actualNext
+        /// (earliest neighbor in raw BoardGraph Red>Blue order), preventing directional
+        /// bias from self-canceling to 50.00% / z=0.00.
+        /// </summary>
+        public static void RecordMultiBranchCalibration(
+            BoardGraph board,
+            int forkLandId,
+            IReadOnlyList<ForkExitPrediction> exits,
+            int actualNext,
+            Dictionary<string, ProbBin> probBins)
+        {
+            if (exits == null || exits.Count < 2) return;
+            var rawNeighbors = board.GetValidNeighbors(forkLandId);
+            var byBin = new Dictionary<string, List<ForkExitPrediction>>(StringComparer.Ordinal);
+            for (int i = 0; i < exits.Count; i++)
+            {
+                string binKey = ProbabilityFormat.Percent(exits[i].ConditionalProbability);
+                if (!byBin.TryGetValue(binKey, out var group)) byBin[binKey] = group = new List<ForkExitPrediction>();
+                group.Add(exits[i]);
+            }
+
+            foreach (var kv in byBin)
+            {
+                string binKey = kv.Key;
+                var group = kv.Value;
+                ForkExitPrediction selected = group[0];
+                if (group.Count > 1)
+                {
+                    int bestOrder = int.MaxValue;
+                    for (int i = 0; i < group.Count; i++)
+                    {
+                        int idx = IndexOfNeighbor(rawNeighbors, group[i].NextLandId);
+                        if (idx < bestOrder || (idx == bestOrder && group[i].NextLandId < selected.NextLandId))
+                        {
+                            bestOrder = idx;
+                            selected = group[i];
+                        }
+                    }
+                }
+
+                if (!probBins.TryGetValue(binKey, out var pb)) probBins[binKey] = pb = new ProbBin();
+                pb.Opp++;
+                pb.SumPred += selected.ConditionalProbability;
+                if (selected.NextLandId == actualNext) pb.Chosen++;
+            }
+        }
+
+        private static int IndexOfNeighbor(IReadOnlyList<int> neighbors, int targetId)
+        {
+            for (int i = 0; i < neighbors.Count; i++)
+                if (neighbors[i] == targetId) return i;
+            return int.MaxValue;
         }
     }
 }

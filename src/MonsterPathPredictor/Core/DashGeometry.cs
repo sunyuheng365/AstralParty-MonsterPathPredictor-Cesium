@@ -124,62 +124,100 @@ namespace MonsterPathPredictor.Core
 
             if (directHits.Count > 1)
             {
-                MonsterHitBox best = directHits[0];
-                for (int i = 1; i < directHits.Count; i++)
+                // Order-independent selection: find global closest depth first, then pick best
+                // normalized center distance within the fixed depth tie band (ties by depth, then ID).
+                float minDepth = float.MaxValue;
+                for (int i = 0; i < directHits.Count; i++)
+                {
+                    if (directHits[i].CameraDepth < minDepth) minDepth = directHits[i].CameraDepth;
+                }
+
+                MonsterHitBox best = null;
+                float bestCenterDist = float.MaxValue;
+                for (int i = 0; i < directHits.Count; i++)
                 {
                     var cand = directHits[i];
-                    float depthDiff = cand.CameraDepth - best.CameraDepth;
-                    if (depthDiff <= -CoplanarDepthThreshold)
+                    if (cand.CameraDepth > minDepth + CoplanarDepthThreshold) continue;
+
+                    float candCenterDist = cand.Rect.NormalizedCenterDistanceSq(click);
+                    if (best == null ||
+                        candCenterDist < bestCenterDist - 0.001f ||
+                        (Math.Abs(candCenterDist - bestCenterDist) <= 0.001f &&
+                         (cand.CameraDepth < best.CameraDepth - 0.0001f ||
+                          (Math.Abs(cand.CameraDepth - best.CameraDepth) <= 0.0001f && cand.MonsterId < best.MonsterId))))
                     {
-                        // Candidate is clearly closer to camera (rendered in front)
                         best = cand;
-                    }
-                    else if (Math.Abs(depthDiff) < CoplanarDepthThreshold)
-                    {
-                        // Side-by-side / stacked on same tile: pick whichever sprite center the click is closer to
-                        float candCenterDist = cand.Rect.NormalizedCenterDistanceSq(click);
-                        float bestCenterDist = best.Rect.NormalizedCenterDistanceSq(click);
-                        if (candCenterDist < bestCenterDist - 0.001f ||
-                            (Math.Abs(candCenterDist - bestCenterDist) <= 0.001f && cand.CameraDepth < best.CameraDepth))
-                        {
-                            best = cand;
-                        }
+                        bestCenterDist = candCenterDist;
                     }
                 }
-                return best.MonsterId;
+                return best != null ? best.MonsterId : 0;
             }
 
-            // Near-miss fallback: closest distance to any sprite bounding box boundary
+            // Near-miss fallback: global closest distance to any sprite bounding box boundary
             float maxDist = Math.Max(0f, nearMissRadius);
             if (maxDist <= 0f) return 0;
 
-            MonsterHitBox nearest = null;
-            float bestEdgeDist = maxDist;
+            float minEdgeDist = maxDist;
             for (int i = 0; i < boxes.Count; i++)
             {
                 var box = boxes[i];
                 if (box == null) continue;
                 float edgeDist = box.Rect.DistanceToPoint(click);
-                if (edgeDist > bestEdgeDist) continue;
+                if (edgeDist < minEdgeDist) minEdgeDist = edgeDist;
+            }
 
-                if (nearest == null || edgeDist < bestEdgeDist - 1.5f)
+            MonsterHitBox nearest = null;
+            float bestCenter = float.MaxValue;
+            for (int i = 0; i < boxes.Count; i++)
+            {
+                var box = boxes[i];
+                if (box == null) continue;
+                float edgeDist = box.Rect.DistanceToPoint(click);
+                if (edgeDist > maxDist || edgeDist > minEdgeDist + 1.5f) continue;
+
+                float dCand = box.Rect.Center.DistanceTo(click);
+                if (nearest == null ||
+                    dCand < bestCenter - 1f ||
+                    (Math.Abs(dCand - bestCenter) <= 1f &&
+                     (box.CameraDepth < nearest.CameraDepth - 0.0001f ||
+                      (Math.Abs(box.CameraDepth - nearest.CameraDepth) <= 0.0001f && box.MonsterId < nearest.MonsterId))))
                 {
-                    bestEdgeDist = edgeDist;
                     nearest = box;
-                }
-                else if (Math.Abs(edgeDist - bestEdgeDist) <= 1.5f)
-                {
-                    float dCand = box.Rect.Center.DistanceTo(click);
-                    float dBest = nearest.Rect.Center.DistanceTo(click);
-                    if (dCand < dBest || (Math.Abs(dCand - dBest) < 1f && box.CameraDepth < nearest.CameraDepth))
-                    {
-                        bestEdgeDist = edgeDist;
-                        nearest = box;
-                    }
+                    bestCenter = dCand;
                 }
             }
 
             return nearest != null ? nearest.MonsterId : 0;
+        }
+    }
+
+    public readonly struct DashQuad
+    {
+        public readonly Point2 P0;
+        public readonly Point2 P1;
+        public readonly Point2 P2;
+        public readonly Point2 P3;
+
+        public DashQuad(Point2 p0, Point2 p1, Point2 p2, Point2 p3)
+        {
+            P0 = p0;
+            P1 = p1;
+            P2 = p2;
+            P3 = p3;
+        }
+    }
+
+    public readonly struct ArrowTriangle
+    {
+        public readonly Point2 P0;
+        public readonly Point2 P1;
+        public readonly Point2 P2;
+
+        public ArrowTriangle(Point2 p0, Point2 p1, Point2 p2)
+        {
+            P0 = p0;
+            P1 = p1;
+            P2 = p2;
         }
     }
 
@@ -189,6 +227,128 @@ namespace MonsterPathPredictor.Core
     /// </summary>
     public static class DashGeometry
     {
+        /// <summary>
+        /// Zero-allocation helper: appends positive-winding dash quads directly into <paramref name="output"/>.
+        /// </summary>
+        public static void BuildDashedSegmentsInto(
+            List<DashQuad> output,
+            Point2 start,
+            Point2 end,
+            float dashLength,
+            float gapLength,
+            float thickness,
+            float trimStart = 0f,
+            float trimEnd = 0f,
+            float phaseOffset = 0f)
+        {
+            if (output == null) return;
+            output.Clear();
+            if (dashLength <= 0.5f || thickness <= 0.25f) return;
+            gapLength = Math.Max(0f, gapLength);
+
+            float dx = end.X - start.X;
+            float dy = end.Y - start.Y;
+            float totalLength = (float)Math.Sqrt(dx * dx + dy * dy);
+            if (float.IsNaN(totalLength) || float.IsInfinity(totalLength) || totalLength <= 1f)
+                return;
+
+            float usableStart = Math.Max(0f, trimStart);
+            float usableEnd = Math.Max(usableStart, totalLength - Math.Max(0f, trimEnd));
+            float usableLength = usableEnd - usableStart;
+            if (usableLength < 2f) return;
+
+            float ux = dx / totalLength;
+            float uy = dy / totalLength;
+            float nx = -uy * (thickness * 0.5f);
+            float ny = ux * (thickness * 0.5f);
+
+            float period = dashLength + gapLength;
+            if (period <= 0.5f) return;
+
+            float shift = 0f;
+            if (!float.IsNaN(phaseOffset) && !float.IsInfinity(phaseOffset))
+            {
+                shift = phaseOffset % period;
+                if (shift < 0f) shift += period;
+            }
+
+            float cursor = usableStart + shift - period;
+            int safety = 0;
+            while (cursor < usableEnd - 0.5f && safety++ < 256)
+            {
+                float segStart = Math.Max(usableStart, cursor);
+                float segEnd = Math.Min(usableEnd, cursor + dashLength);
+                if (segEnd - segStart >= 1.5f)
+                {
+                    float x0 = start.X + ux * segStart;
+                    float y0 = start.Y + uy * segStart;
+                    float x1 = start.X + ux * segEnd;
+                    float y1 = start.Y + uy * segEnd;
+
+                    var a = new Point2(x0 + nx, y0 + ny);
+                    var b = new Point2(x1 + nx, y1 + ny);
+                    var c = new Point2(x1 - nx, y1 - ny);
+                    var d = new Point2(x0 - nx, y0 - ny);
+                    output.Add(MakePositiveWinding(a, b, c, d));
+                }
+
+                cursor += period;
+            }
+        }
+
+        private static DashQuad MakePositiveWinding(Point2 a, Point2 b, Point2 c, Point2 d)
+        {
+            double area2 =
+                (double)a.X * b.Y - (double)b.X * a.Y +
+                (double)b.X * c.Y - (double)c.X * b.Y +
+                (double)c.X * d.Y - (double)d.X * c.Y +
+                (double)d.X * a.Y - (double)a.X * d.Y;
+            return area2 < 0.0 ? new DashQuad(d, c, b, a) : new DashQuad(a, b, c, d);
+        }
+
+        /// <summary>
+        /// Zero-allocation arrowhead helper returning a positive-winding triangle.
+        /// </summary>
+        public static bool TryBuildArrowHead(
+            Point2 start,
+            Point2 end,
+            float arrowLength,
+            float arrowHalfWidth,
+            out ArrowTriangle triangle,
+            float tipRatio = 0.62f)
+        {
+            triangle = default;
+            if (arrowLength <= 1f || arrowHalfWidth <= 0.5f) return false;
+
+            float dx = end.X - start.X;
+            float dy = end.Y - start.Y;
+            float length = (float)Math.Sqrt(dx * dx + dy * dy);
+            if (float.IsNaN(length) || float.IsInfinity(length) || length < 6f) return false;
+
+            float ux = dx / length;
+            float uy = dy / length;
+            float clampedRatio = Math.Max(0.25f, Math.Min(0.92f, tipRatio));
+            float effectiveLen = Math.Min(arrowLength, length * 0.45f);
+            float effectiveHalfW = Math.Min(arrowHalfWidth, effectiveLen * 0.85f);
+
+            float tipDist = length * clampedRatio;
+            var tip = new Point2(start.X + ux * tipDist, start.Y + uy * tipDist);
+            float baseX = tip.X - ux * effectiveLen;
+            float baseY = tip.Y - uy * effectiveLen;
+            float nx = -uy * effectiveHalfW;
+            float ny = ux * effectiveHalfW;
+
+            var p0 = tip;
+            var p1 = new Point2(baseX + nx, baseY + ny);
+            var p2 = new Point2(baseX - nx, baseY - ny);
+            double area2 =
+                (double)p0.X * p1.Y - (double)p1.X * p0.Y +
+                (double)p1.X * p2.Y - (double)p2.X * p1.Y +
+                (double)p2.X * p0.Y - (double)p0.X * p2.Y;
+            triangle = area2 < 0.0 ? new ArrowTriangle(p2, p1, p0) : new ArrowTriangle(p0, p1, p2);
+            return true;
+        }
+
         /// <summary>
         /// Generates a sequence of 4-vertex dash quads along <paramref name="start"/> -&gt; <paramref name="end"/>.
         /// Increasing <paramref name="phaseOffset"/> smoothly marches the dashes forward in the travel direction.
@@ -203,65 +363,14 @@ namespace MonsterPathPredictor.Core
             float trimEnd = 0f,
             float phaseOffset = 0f)
         {
-            var quads = new List<Point2[]>();
-            if (dashLength <= 0.5f || thickness <= 0.25f) return quads;
-            gapLength = Math.Max(0f, gapLength);
-
-            float dx = end.X - start.X;
-            float dy = end.Y - start.Y;
-            float totalLength = (float)Math.Sqrt(dx * dx + dy * dy);
-            if (float.IsNaN(totalLength) || float.IsInfinity(totalLength) || totalLength <= 1f)
+            var raw = new List<DashQuad>();
+            BuildDashedSegmentsInto(raw, start, end, dashLength, gapLength, thickness, trimStart, trimEnd, phaseOffset);
+            var quads = new List<Point2[]>(raw.Count);
+            for (int i = 0; i < raw.Count; i++)
             {
-                return quads;
+                var q = raw[i];
+                quads.Add(new[] { q.P0, q.P1, q.P2, q.P3 });
             }
-
-            float usableStart = Math.Max(0f, trimStart);
-            float usableEnd = Math.Max(usableStart, totalLength - Math.Max(0f, trimEnd));
-            float usableLength = usableEnd - usableStart;
-            if (usableLength < 2f) return quads;
-
-            float ux = dx / totalLength;
-            float uy = dy / totalLength;
-            float nx = -uy * (thickness * 0.5f);
-            float ny = ux * (thickness * 0.5f);
-
-            float period = dashLength + gapLength;
-            if (period <= 0.5f) return quads;
-
-            float shift = 0f;
-            if (!float.IsNaN(phaseOffset) && !float.IsInfinity(phaseOffset))
-            {
-                shift = phaseOffset % period;
-                if (shift < 0f) shift += period;
-            }
-
-            // Start one period before usableStart so emerging dashes slide smoothly in from the start
-            float cursor = usableStart + shift - period;
-            int safety = 0;
-            while (cursor < usableEnd - 0.5f && safety++ < 256)
-            {
-                float segStart = Math.Max(usableStart, cursor);
-                float segEnd = Math.Min(usableEnd, cursor + dashLength);
-                if (segEnd - segStart >= 1.5f)
-                {
-                    float x0 = start.X + ux * segStart;
-                    float y0 = start.Y + uy * segStart;
-                    float x1 = start.X + ux * segEnd;
-                    float y1 = start.Y + uy * segEnd;
-
-                    var quad = EnsurePositiveWinding(new[]
-                    {
-                        new Point2(x0 + nx, y0 + ny),
-                        new Point2(x1 + nx, y1 + ny),
-                        new Point2(x1 - nx, y1 - ny),
-                        new Point2(x0 - nx, y0 - ny)
-                    });
-                    quads.Add(quad);
-                }
-
-                cursor += period;
-            }
-
             return quads;
         }
 

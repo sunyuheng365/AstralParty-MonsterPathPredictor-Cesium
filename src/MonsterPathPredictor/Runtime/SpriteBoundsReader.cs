@@ -8,10 +8,14 @@ namespace MonsterPathPredictor.Runtime
 {
     internal struct MonsterVisualBounds
     {
-        /// <summary>4 world-space corners of the monster sprite (BL, BR, TL, TR).</summary>
-        public Vector3[] Corners;
+        /// <summary>4 world-space corners of the monster sprite (inline value fields, zero heap allocation).</summary>
+        public Vector3 BL;
+        public Vector3 BR;
+        public Vector3 TL;
+        public Vector3 TR;
         public Vector3 CenterWorld;
         public Vector3 TopWorld;
+        public bool HasCorners;
         public bool FromSprite;
     }
 
@@ -61,9 +65,13 @@ namespace MonsterPathPredictor.Runtime
 
             return new MonsterVisualBounds
             {
-                Corners = new[] { bl, br, tl, tr },
+                BL = bl,
+                BR = br,
+                TL = tl,
+                TR = tr,
                 CenterWorld = anchor + camUp * (height * 0.5f),
                 TopWorld = anchor + camUp * height,
+                HasCorners = true,
                 FromSprite = false
             };
         }
@@ -91,9 +99,13 @@ namespace MonsterPathPredictor.Runtime
 
                 bounds = new MonsterVisualBounds
                 {
-                    Corners = new[] { bl, br, tl, tr },
+                    BL = bl,
+                    BR = br,
+                    TL = tl,
+                    TR = tr,
                     CenterWorld = center,
                     TopWorld = top,
+                    HasCorners = true,
                     FromSprite = true
                 };
                 return true;

@@ -22,8 +22,6 @@ namespace MonsterPathPredictor.Core
     /// </summary>
     public static class MonsterPathEngine
     {
-        private const double Epsilon = 1e-9;
-
         private struct StepOutcome
         {
             public List<(int NextLandId, double Prob)> Transitions;
@@ -425,9 +423,10 @@ namespace MonsterPathPredictor.Core
             int from = monster.FromLandId;
             bool isFork = board.IsFork(cur);
 
-            // 0. Taunt override (嘲讽 — allows U-turning or overriding current facing before combat;
-            //    uses the exact same pre-combat gating as DecideMidWalkStep so multi-step forecast matches arrival recomputation).
-            if (!monster.JustFoughtOnCurrentFork && !monster.HasLaunchedFightThisTurn &&
+            // 0. Taunt override (嘲讽 — allows overriding facing / U-turning before combat at turn start or forks;
+            //    matches DecideMidWalkStep so straight-road continuation past an unattackable taunter never diverges).
+            if ((!monster.IsCurrentlyMovingMidTurn || isFork) &&
+                !monster.JustFoughtOnCurrentFork && !monster.HasLaunchedFightThisTurn &&
                 monster.IsTaunted && monster.TauntTargetPlayerId != 0 &&
                 TryDecideTauntStep(board, cur, monster.TauntTargetPlayerId, activePlayers, cache, out var tauntOutcome))
             {
@@ -439,18 +438,18 @@ namespace MonsterPathPredictor.Core
             //   - 1047 铜盏鸳鸯 (园林中庭) -> buff 10470101
             //   Allows overriding facing / U-turning before combat at turn start (straight road or fork) and at mid-walk forks
             //   (excluding players standing on the monster's turn-start tile, which monsters never engage on that turn).
+            int excludedTurnStartLand = ResolveExcludedTurnStartLandId(monster, isMidTurn: monster.IsCurrentlyMovingMidTurn);
             if ((!monster.IsCurrentlyMovingMidTurn || isFork) &&
                 !monster.JustFoughtOnCurrentFork && !monster.HasLaunchedFightThisTurn &&
                 monster.SkillMoveKind == SkillMoveKind.None &&
                 (monster.ChasesProblemStudent || monster.ChasesMandarinDuckMark))
             {
-                var marked = GetPriorityMarkedPlayers(monster, activePlayers, clearedMarkLandId: -1);
-                int excludeStartLand = monster.IsCurrentlyMovingMidTurn ? monster.TurnStartLandId : -1;
+                var marked = GetPriorityMarkedPlayers(monster, activePlayers, clearedMarkLandId: -1, excludedTurnStartLandId: excludedTurnStartLand);
                 if (marked.Count > 0 &&
                     TryDecideMarkedTargetTurnStartStep(
                         board,
                         cur,
-                        excludeStartLand,
+                        excludedTurnStartLand,
                         marked,
                         cache,
                         monster.ChasesProblemStudent ? "追问题生" : "追标记",
@@ -526,34 +525,35 @@ namespace MonsterPathPredictor.Core
                     }
                 }
 
-                int excludedStartMarkLand = monster.IsCurrentlyMovingMidTurn ? monster.TurnStartLandId : -1;
                 return EvaluateMidWalkFork(
                     board,
                     monster,
                     cur,
                     from,
                     activePlayers,
-                    clearedMarkLandId: excludedStartMarkLand,
-                    cache,
+                    clearedMarkLandId: -1,
+                    excludedTurnStartLandId: excludedTurnStartLand,
+                    cache: cache,
                     isAfterCombat: monster.HasLaunchedFightThisTurn);
             }
 
-            // 3. Normal tile (non-fork, degree <= 2): prefer explicit single FrontNodeIds arrow if present
+            // 3. Normal tile (non-fork, degree <= 2):
+            //    If already moving mid-turn into a dead-end (only neighbor is FromLandId), stop cleanly
+            //    like DecideMidWalkStep even when FrontNodeIds contains FromLandId.
+            var forward = board.GetForwardNeighbors(cur, from);
+            if (forward.Count == 0 && monster.IsCurrentlyMovingMidTurn && board.IsValidNeighbor(cur, from))
+            {
+                return EmptyOutcome();
+            }
+
             if (validFront.Count == 1)
             {
                 return SingleTransition(validFront[0], isForkDecision: false, ForkReasonKind.CurrentFacing, string.Empty);
             }
 
-            var forward = board.GetForwardNeighbors(cur, from);
             if (forward.Count == 1)
             {
                 return SingleTransition(forward[0], isForkDecision: false, ForkReasonKind.MidForkChasePlayer, string.Empty);
-            }
-
-            // Already moving mid-turn into a dead-end (only neighbor is FromLandId): stop cleanly like DecideMidWalkStep
-            if (forward.Count == 0 && monster.IsCurrentlyMovingMidTurn && board.IsValidNeighbor(cur, from))
-            {
-                return EmptyOutcome();
             }
 
             if (validFront.Count > 1)
@@ -675,17 +675,17 @@ namespace MonsterPathPredictor.Core
 
             // Marked-target free-direction chase at mid-walk forks BEFORE combat:
             // 1047 铜盏鸳鸯 and 1018 学院安全官 may U-turn at a pre-combat mid-walk fork toward a still-marked player
-            // (excluding players standing on the monster's turn-start tile). Once combat occurs, no more U-turning.
-            int effectiveExcludedMarkLand = clearedMarkLandId;
+            // (excluding players standing on the monster's turn-start tile). Once combat occurs, no more U-turning,
+            // while turn-start exclusion remains consistent with DecideFirstStep across both pre- and post-combat forks.
+            int excludedTurnStartLand = ResolveExcludedTurnStartLandId(monster, isMidTurn: true);
             if (!isAfterCombat && monster != null && (monster.ChasesMandarinDuckMark || monster.ChasesProblemStudent))
             {
-                var marked = GetPriorityMarkedPlayers(monster, activePlayers, clearedMarkLandId);
-                int turnStartTile = monster.TurnStartLandId >= 0 ? monster.TurnStartLandId : monster.CurrentLandId;
+                var marked = GetPriorityMarkedPlayers(monster, activePlayers, clearedMarkLandId, excludedTurnStartLand);
                 if (marked.Count > 0 &&
                     TryDecideMarkedTargetTurnStartStep(
                         board,
                         landId,
-                        turnStartTile,
+                        excludedTurnStartLand,
                         marked,
                         cache,
                         monster.ChasesProblemStudent ? "追问题生" : "追标记",
@@ -693,12 +693,10 @@ namespace MonsterPathPredictor.Core
                 {
                     return markOutcome;
                 }
-                // Prevent a skipped turn-start marked player from regaining PriorityTier=0 in fallback ranking
-                if (effectiveExcludedMarkLand < 0) effectiveExcludedMarkLand = turnStartTile;
             }
 
             // Canonical guide rule: "之后再遇岔，看当时站位"
-            return EvaluateMidWalkFork(board, monster, landId, fromLandId, activePlayers, effectiveExcludedMarkLand, cache, isAfterCombat);
+            return EvaluateMidWalkFork(board, monster, landId, fromLandId, activePlayers, clearedMarkLandId, excludedTurnStartLand, cache, isAfterCombat);
         }
 
         private static StepOutcome EvaluateMidWalkFork(
@@ -708,6 +706,7 @@ namespace MonsterPathPredictor.Core
             int incomingLandId,
             List<TrackedPlayer> activePlayers,
             int clearedMarkLandId,
+            int excludedTurnStartLandId,
             Dictionary<int, ShortestPathField> cache,
             bool isAfterCombat)
         {
@@ -736,7 +735,7 @@ namespace MonsterPathPredictor.Core
                 }
                 int d = field.GetDistance(forkLandId);
                 if (d == int.MaxValue || d <= 0) continue;
-                int tier = IsPriorityMarked(monster, p, clearedMarkLandId) ? 0 : 1;
+                int tier = IsPriorityMarked(monster, p, clearedMarkLandId, excludedTurnStartLandId) ? 0 : 1;
                 ranked.Add((p, tier, d, field));
             }
 
@@ -765,7 +764,7 @@ namespace MonsterPathPredictor.Core
             int primaryDist = 0;
             bool usedMultiShortestPath = false;
 
-            for (int i = 0; i < ranked.Count && remainingProb > Epsilon; i++)
+            for (int i = 0; i < ranked.Count && remainingProb > 0.0; i++)
             {
                 if (restrictToTopTargetOnly && i > 0) break;
                 var item = ranked[i];
@@ -818,7 +817,7 @@ namespace MonsterPathPredictor.Core
             }
 
             bool usedUTurnFallback = false;
-            if (remainingProb > Epsilon)
+            if (remainingProb > 0.0)
             {
                 usedUTurnFallback = true;
                 double share = remainingProb / forward.Count;
@@ -833,7 +832,7 @@ namespace MonsterPathPredictor.Core
             {
                 int fwd = forward[i];
                 double p = exitProbs[fwd];
-                if (p > Epsilon) transitions.Add((fwd, p));
+                if (p > 0.0) transitions.Add((fwd, p));
             }
 
             transitions.Sort((a, b) => b.Prob.CompareTo(a.Prob));
@@ -957,19 +956,36 @@ namespace MonsterPathPredictor.Core
 
             if (outcome.Reason != pf.ReasonKind || !string.Equals(outcome.SummaryLabel, pf.SummaryLabel, StringComparison.Ordinal))
             {
-                if (pf.Exits.Count > 1)
+                if (outcome.Reason != pf.ReasonKind)
                 {
-                    pf.ReasonKind = ForkReasonKind.MidForkMultiShortestPath;
+                    pf.ReasonKind = ForkReasonKind.Mixed;
                 }
                 string other = outcome.SummaryLabel ?? string.Empty;
                 if (!string.IsNullOrEmpty(other) && !string.Equals(pf.SummaryLabel, other, StringComparison.Ordinal))
                 {
                     if (string.IsNullOrEmpty(pf.SummaryLabel))
+                    {
                         pf.SummaryLabel = other;
-                    else if (pf.SummaryLabel.IndexOf(other, StringComparison.Ordinal) < 0)
-                        pf.SummaryLabel = pf.SummaryLabel.StartsWith("混合(", StringComparison.Ordinal) && pf.SummaryLabel.EndsWith(")", StringComparison.Ordinal)
-                            ? pf.SummaryLabel.Substring(0, pf.SummaryLabel.Length - 1) + "/" + other + ")"
-                            : "混合(" + pf.SummaryLabel + "/" + other + ")";
+                    }
+                    else
+                    {
+                        var parts = new List<string>();
+                        if (pf.SummaryLabel.StartsWith("混合(", StringComparison.Ordinal) && pf.SummaryLabel.EndsWith(")", StringComparison.Ordinal))
+                        {
+                            string inner = pf.SummaryLabel.Substring(3, pf.SummaryLabel.Length - 4);
+                            foreach (var token in inner.Split('/'))
+                            {
+                                if (!string.IsNullOrEmpty(token) && !parts.Contains(token)) parts.Add(token);
+                            }
+                        }
+                        else
+                        {
+                            parts.Add(pf.SummaryLabel);
+                        }
+                        if (!parts.Contains(other)) parts.Add(other);
+                        parts.Sort(StringComparer.Ordinal);
+                        pf.SummaryLabel = "混合(" + string.Join("/", parts) + ")";
+                    }
                 }
             }
         }
@@ -1177,10 +1193,18 @@ namespace MonsterPathPredictor.Core
             return culprits;
         }
 
+        private static int ResolveExcludedTurnStartLandId(MonsterState monster, bool isMidTurn)
+        {
+            if (monster == null || !isMidTurn) return -1;
+            if (monster.TurnStartLandId >= 0) return monster.TurnStartLandId;
+            return monster.IsCurrentlyMovingMidTurn ? -1 : monster.CurrentLandId;
+        }
+
         private static List<TrackedPlayer> GetPriorityMarkedPlayers(
             MonsterState monster,
             List<TrackedPlayer> activePlayers,
-            int clearedMarkLandId)
+            int clearedMarkLandId,
+            int excludedTurnStartLandId)
         {
             var marked = new List<TrackedPlayer>();
             if (monster == null || (!monster.ChasesProblemStudent && !monster.ChasesMandarinDuckMark))
@@ -1189,24 +1213,26 @@ namespace MonsterPathPredictor.Core
             for (int i = 0; i < activePlayers.Count; i++)
             {
                 var p = activePlayers[i];
-                if (IsPriorityMarked(monster, p, clearedMarkLandId)) marked.Add(p);
+                if (IsPriorityMarked(monster, p, clearedMarkLandId, excludedTurnStartLandId)) marked.Add(p);
             }
             return marked;
         }
 
-        private static bool IsPriorityMarked(MonsterState monster, TrackedPlayer p, int clearedMarkLandId)
+        private static bool IsPriorityMarked(MonsterState monster, TrackedPlayer p, int clearedMarkLandId, int excludedTurnStartLandId)
         {
             if (monster == null || p == null) return false;
             if (monster.ChasesProblemStudent)
             {
                 if (!p.HasProblemStudentMark) return false;
                 if (clearedMarkLandId >= 0 && p.LandId == clearedMarkLandId) return false;
+                if (excludedTurnStartLandId >= 0 && p.LandId == excludedTurnStartLandId) return false;
                 return true;
             }
             if (monster.ChasesMandarinDuckMark)
             {
                 if (!p.HasMandarinDuckMark) return false;
                 if (clearedMarkLandId >= 0 && p.LandId == clearedMarkLandId) return false;
+                if (excludedTurnStartLandId >= 0 && p.LandId == excludedTurnStartLandId) return false;
                 return true;
             }
             return false;

@@ -57,7 +57,8 @@ namespace MonsterPathPredictor.Core
         MidForkMultiShortestPath,
         MidForkAllUTurnFallback,
         MidForkNoTargetFallback,
-        UnknownFacingSplit
+        UnknownFacingSplit,
+        Mixed
     }
 
     public sealed class MonsterState

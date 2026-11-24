@@ -111,7 +111,7 @@ namespace MonsterPathPredictor.Core
             {
                 var box = boxes[i];
                 if (box == null) continue;
-                if (box.Rect.Contains(click, margin: 3f))
+                if (box.Rect.Contains(click, margin: 0f))
                 {
                     directHits.Add(box);
                 }

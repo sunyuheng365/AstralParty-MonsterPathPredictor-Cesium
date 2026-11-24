@@ -35,6 +35,7 @@ namespace MonsterPathPredictor.ReplayCertifier
         public long ProbTotal;
         public long ThiefDetTotal;
         public long ThiefDetHits;
+        public long ThiefProbTotal;
 
         public void MergeFrom(MapStats o)
         {
@@ -44,6 +45,7 @@ namespace MonsterPathPredictor.ReplayCertifier
             ProbTotal += o.ProbTotal;
             ThiefDetTotal += o.ThiefDetTotal;
             ThiefDetHits += o.ThiefDetHits;
+            ThiefProbTotal += o.ThiefProbTotal;
         }
     }
 

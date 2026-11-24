@@ -440,8 +440,212 @@ namespace MonsterPathPredictor.Tests
             var plan = MonsterPathEngine.Plan(board, m, players, new PlanOptions { MaxSteps = 4, SimulateCombatOnFork = true });
             var fork5 = plan.Forks.Single(f => f.ForkLandId == 5 && f.StepIndex == 3);
             Assert.Equal(2, fork5.Exits.Count);
-            Assert.Equal(ForkReasonKind.MidForkMultiShortestPath, fork5.ReasonKind);
+            Assert.Equal(ForkReasonKind.Mixed, fork5.ReasonKind);
             Assert.StartsWith("混合(", fork5.SummaryLabel);
+        }
+
+        [Fact]
+        public void SingleFork30DiamondsVsSingleChain_ExactModeKeepsTinyPositiveExit()
+        {
+            // Round 3 (#8): Fork 1 (from 0) has two equal-length paths to Target (999):
+            //   - Path A: 30 chained diamonds (length 60, 2^30 shortest paths)
+            //   - Path B: single chain (length 60, 1 shortest path)
+            // Conditional probability of Path B is 1 / (2^30 + 1) ≈ 9.3132e-10 (< 1e-9). Exact mode MUST preserve it!
+            var adj = new Dictionary<int, List<int>>();
+            void Link(int u, int v)
+            {
+                if (!adj.TryGetValue(u, out var lu)) adj[u] = lu = new List<int>();
+                if (!adj.TryGetValue(v, out var lv)) adj[v] = lv = new List<int>();
+                if (!lu.Contains(v)) lu.Add(v);
+                if (!lv.Contains(u)) lv.Add(u);
+            }
+
+            Link(0, 1);
+            // Path A: 1 -> (1000..1030 hubs with 2 parallel bridges per segment -> dist 60 to 999)
+            // Segment k (0..29): hub(k) -> top(k), bot(k) -> hub(k+1), where hub(0)=1, hub(30)=999
+            // Wait: to have two distinct forward exits from Fork 1, split 1 -> A_start(10) and 1 -> B_start(20),
+            // each of length 61 to 999: A_start(10) runs 30 diamonds (dist 60 to 999), B_start(20) runs 60-step chain to 999.
+            Link(1, 10);
+            Link(1, 20);
+            int curA = 10;
+            for (int k = 0; k < 30; k++)
+            {
+                int top = 100 + k * 3;
+                int bot = 101 + k * 3;
+                int nxt = (k == 29) ? 999 : (102 + k * 3);
+                Link(curA, top);
+                Link(curA, bot);
+                Link(top, nxt);
+                Link(bot, nxt);
+                curA = nxt;
+            }
+            int curB = 20;
+            for (int k = 0; k < 60; k++)
+            {
+                int nxt = (k == 59) ? 999 : (500 + k);
+                Link(curB, nxt);
+                curB = nxt;
+            }
+
+            var nodes = adj.Select(kv => new LandNodeSnapshot(kv.Key, kv.Value.ToArray())).ToArray();
+            var board = new BoardGraph(nodes);
+            var players = new List<TrackedPlayer>
+            {
+                new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = 999, IsAlive = true, IsTargetable = true }
+            };
+            var m = new MonsterState { MonsterId = 930, CurrentLandId = 1, FromLandId = 0, IsCurrentlyMovingMidTurn = true };
+
+            var plan = MonsterPathEngine.Plan(board, m, players, new PlanOptions { MaxSteps = 1, MinBranchProbability = 0.0 });
+            var fork = plan.Forks.Single(f => f.ForkLandId == 1);
+            Assert.Equal(2, fork.Exits.Count);
+            double expectedB = 1.0 / (Math.Pow(2.0, 30) + 1.0);
+            Assert.Contains(fork.Exits, e => e.NextLandId == 20 && Math.Abs(e.ConditionalProbability - expectedB) < 1e-16);
+            Assert.Equal(1.0, fork.Exits.Sum(e => e.ConditionalProbability), 12);
+            Assert.Equal(0.0, plan.PrunedProbability, 12);
+        }
+
+        [Fact]
+        public void MidTurnDeadEndRecomputation_WithNonEmptyFrontContainingFrom_StillStopsCleanly()
+        {
+            // Round 3 (#9): A(1)-B(2), arriving at B mid-turn with From=A(1) and Front=[A(1)] MUST stop (not U-turn).
+            var board = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(1, new[] { 2 }),
+                new LandNodeSnapshot(2, new[] { 1 })
+            });
+            var atB = new MonsterState
+            {
+                MonsterId = 931, CurrentLandId = 2, FromLandId = 1,
+                FrontNodeIds = new[] { 1 }, IsCurrentlyMovingMidTurn = true
+            };
+            var plan = MonsterPathEngine.Plan(board, atB, new List<TrackedPlayer>(), new PlanOptions { MaxSteps = 3 });
+            Assert.Empty(plan.Edges);
+            Assert.True(plan.Endpoints.Single().IsDeadEnd);
+        }
+
+        [Fact]
+        public void PostCombatTurnStartMarkExclusion_LongForecastMatchesArrivalRecomputation()
+        {
+            // Round 3 (#10): 1047 walks 1 -> 2 (fights unmarked P3) -> Fork 3 (Red=4->1[marked P1], Blue=5[unmarked P2]).
+            // Both long forecast from 1 and fresh arrival recomputation at 3 must agree 100%!
+            var board = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(1, new[] { 2, 4 }),
+                new LandNodeSnapshot(2, new[] { 3, 1 }),
+                new LandNodeSnapshot(3, new[] { 4, 5, 2 }),
+                new LandNodeSnapshot(4, new[] { 1, 3 }),
+                new LandNodeSnapshot(5, new[] { 3 })
+            });
+            var players = new List<TrackedPlayer>
+            {
+                new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = 1, IsAlive = true, IsTargetable = true, HasMandarinDuckMark = true },
+                new TrackedPlayer { PlayerId = 2, Slot = 1, LandId = 5, IsAlive = true, IsTargetable = true },
+                new TrackedPlayer { PlayerId = 3, Slot = 2, LandId = 2, IsAlive = true, IsTargetable = true }
+            };
+
+            var fromStart = new MonsterState
+            {
+                MonsterId = 932, HeroId = 1047, ChasesMandarinDuckMark = true,
+                CurrentLandId = 1, FromLandId = -1, FrontNodeIds = new[] { 2 }, TurnStartLandId = 1
+            };
+            var longPlan = MonsterPathEngine.Plan(board, fromStart, players, new PlanOptions { MaxSteps = 3 });
+            var longExits = longPlan.Forks.Single(f => f.ForkLandId == 3).Exits;
+
+            var atFork = new MonsterState
+            {
+                MonsterId = 932, HeroId = 1047, ChasesMandarinDuckMark = true,
+                CurrentLandId = 3, FromLandId = 2, TurnStartLandId = 1,
+                IsCurrentlyMovingMidTurn = true, HasLaunchedFightThisTurn = true
+            };
+            var arrivalPlan = MonsterPathEngine.Plan(board, atFork, players, new PlanOptions { MaxSteps = 1 });
+            var arrivalExits = arrivalPlan.Forks.Single(f => f.ForkLandId == 3).Exits;
+
+            Assert.Single(longExits);
+            Assert.Single(arrivalExits);
+            Assert.Equal(5, longExits[0].NextLandId);
+            Assert.Equal(longExits[0].NextLandId, arrivalExits[0].NextLandId);
+        }
+
+        [Fact]
+        public void StraightRoadPassingUnattackableTaunter_LongForecastMatchesArrivalRecomputation()
+        {
+            // Round 3 (#11): A(1)-B(2)-C(3)-D(4), stealth taunter (CanBeAttacked=false) at B(2).
+            // Monster walks A -> B (no combat) -> C: both long forecast from A and arrival recomputation at C continue C -> D!
+            var board = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(1, new[] { 2 }),
+                new LandNodeSnapshot(2, new[] { 3, 1 }),
+                new LandNodeSnapshot(3, new[] { 4, 2 }),
+                new LandNodeSnapshot(4, new[] { 3 })
+            });
+            var players = new List<TrackedPlayer>
+            {
+                new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = 2, IsAlive = true, IsTargetable = true, CanBeAttacked = false }
+            };
+
+            var fromA = new MonsterState
+            {
+                MonsterId = 933, CurrentLandId = 1, FromLandId = -1, FrontNodeIds = new[] { 2 },
+                IsTaunted = true, TauntTargetPlayerId = 1
+            };
+            var longPlan = MonsterPathEngine.Plan(board, fromA, players, new PlanOptions { MaxSteps = 3 });
+            Assert.Contains(longPlan.Edges, e => e.FromLandId == 3 && e.ToLandId == 4);
+
+            var atC = new MonsterState
+            {
+                MonsterId = 933, CurrentLandId = 3, FromLandId = 2, FrontNodeIds = new[] { 4 },
+                IsCurrentlyMovingMidTurn = true, IsTaunted = true, TauntTargetPlayerId = 1
+            };
+            var arrivalPlan = MonsterPathEngine.Plan(board, atC, players, new PlanOptions { MaxSteps = 1 });
+            Assert.Single(arrivalPlan.Edges);
+            Assert.Equal(4, arrivalPlan.Edges[0].ToLandId);
+        }
+
+        [Fact]
+        public void SingleExitMergedForkWithDifferingReasons_SetsReasonKindMixed()
+        {
+            // Round 3 (#12): Moving P2 to tile 6 makes BOTH upper (chase P2) and lower (PostCombat Red) exit to tile 6.
+            // Even with a single merged exit, ReasonKind MUST become Mixed (not first-path-dependent)!
+            var board = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(0, new[] { 1 }),
+                new LandNodeSnapshot(1, new[] { 2, 3, 0 }),
+                new LandNodeSnapshot(2, new[] { 4, 1 }),
+                new LandNodeSnapshot(3, new[] { 4, 1 }),
+                new LandNodeSnapshot(4, new[] { 5, 2, 3 }),
+                new LandNodeSnapshot(5, new[] { 6, 7, 4 }),
+                new LandNodeSnapshot(6, new[] { 5 }),
+                new LandNodeSnapshot(7, new[] { 5 })
+            });
+            var players = new List<TrackedPlayer>
+            {
+                new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = 5, IsAlive = true, IsTargetable = true },
+                new TrackedPlayer { PlayerId = 2, Slot = 1, LandId = 6, IsAlive = true, IsTargetable = true },
+                new TrackedPlayer { PlayerId = 3, Slot = 2, LandId = 2, IsAlive = true, IsTargetable = true }
+            };
+            var m = new MonsterState
+            {
+                MonsterId = 934, CurrentLandId = 1, FromLandId = -1,
+                SkillMoveKind = SkillMoveKind.ShirleyThrow
+            };
+
+            var plan = MonsterPathEngine.Plan(board, m, players, new PlanOptions { MaxSteps = 4, SimulateCombatOnFork = true });
+            var fork5 = plan.Forks.Single(f => f.ForkLandId == 5 && f.StepIndex == 3);
+            Assert.Single(fork5.Exits);
+            Assert.Equal(6, fork5.Exits[0].NextLandId);
+            Assert.Equal(ForkReasonKind.Mixed, fork5.ReasonKind);
+            Assert.StartsWith("混合(", fork5.SummaryLabel);
+        }
+
+        [Fact]
+        public void DirectHitExactRect_AlwaysBeatsCloserDepthOutsideNearMiss()
+        {
+            // Round 3 (#17): Click (0,0) is strictly inside A [-20,20]x[-20,20] (depth 10),
+            // and 2px outside B [2,32]x[-20,20] (depth 9). Direct hit A MUST win over near-miss B!
+            var a = new MonsterHitBox { MonsterId = 10, Rect = new HitRect2D(-20f, -20f, 20f, 20f), CameraDepth = 10f };
+            var b = new MonsterHitBox { MonsterId = 20, Rect = new HitRect2D(2f, -20f, 32f, 20f), CameraDepth = 9f };
+            Assert.Equal(10, MonsterHitTester.PickMonster(new Point2(0f, 0f), new[] { a, b }, 28f));
+            Assert.Equal(10, MonsterHitTester.PickMonster(new Point2(0f, 0f), new[] { b, a }, 28f));
         }
     }
 }

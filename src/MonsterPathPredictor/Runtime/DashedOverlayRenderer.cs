@@ -51,7 +51,9 @@ namespace MonsterPathPredictor.Runtime
         private readonly Dictionary<long, float> _stableHeaderHeight = new Dictionary<long, float>();
         private readonly Dictionary<int, Point2> _screenCache = new Dictionary<int, Point2>();
         private readonly Dictionary<int, int> _forkTagStack = new Dictionary<int, int>();
+        private readonly Dictionary<int, float> _forkTagNextTopY = new Dictionary<int, float>();
         private readonly Dictionary<long, int> _forkExitLabelStack = new Dictionary<long, int>();
+        private readonly Dictionary<long, float> _forkExitNextTopY = new Dictionary<long, float>();
         private readonly HashSet<int> _combatLandSet = new HashSet<int>();
         private readonly List<DashQuad> _dashQuadBuf = new List<DashQuad>(32);
         private readonly List<Vector2> _vertBuf = new List<Vector2>(4);
@@ -210,8 +212,10 @@ namespace MonsterPathPredictor.Runtime
 
             // 3. Fork directional arrows & probability percentage badges (de-overlapped across multi-visit forks)
             _forkTagStack.Clear();
+            _forkTagNextTopY.Clear();
             _forkExitLabelStack.Clear();
-            float tagLineHeight = Math.Max(20f, settings.FontSize + 5f);
+            _forkExitNextTopY.Clear();
+            const float StackGapPx = 4f;
             for (int i = 0; i < plan.Forks.Count; i++)
             {
                 var fork = plan.Forks[i];
@@ -244,12 +248,13 @@ namespace MonsterPathPredictor.Runtime
                         string pctText = (visitIndex > 0 || exitVisit > 0)
                             ? ("第" + fork.StepIndex + "步 " + exit.FormatConditionalPercent())
                             : exit.FormatConditionalPercent();
-                        float lat = fork.Exits.Count <= 2
-                            ? (e == 0 ? -16f : 16f)
-                            : ((e - (fork.Exits.Count - 1) * 0.5f) * 20f);
-                        var baseAnchor = DashGeometry.ComputeEdgeLabelAnchor(forkPt, exitPt, alongRatio: 0.56f, lateralOffset: lat);
-                        var anchor = new Point2(baseAnchor.X, baseAnchor.Y - exitVisit * tagLineHeight);
-                        DrawPillLabel(anchor, pctText, settings.FontSize, exitColor);
+
+                        // Fixed edge base anchor per (ForkLandId, NextLandId), independent of visit-local exit index,
+                        // stacked strictly upward by measured pill height so repeated visits can never collide.
+                        var baseAnchor = DashGeometry.ComputeEdgeLabelAnchor(forkPt, exitPt, alongRatio: 0.56f, lateralOffset: 0f);
+                        bool hasPriorTop = _forkExitNextTopY.TryGetValue(exitKey, out float prevTopY);
+                        float nextTopY = DrawStackedPillLabel(baseAnchor, hasPriorTop, prevTopY, StackGapPx, pctText, settings.FontSize, exitColor);
+                        _forkExitNextTopY[exitKey] = nextTopY;
                     }
                 }
 
@@ -258,8 +263,10 @@ namespace MonsterPathPredictor.Runtime
                     string reasonText = visitIndex > 0
                         ? ("第" + fork.StepIndex + "步·" + fork.SummaryLabel)
                         : fork.SummaryLabel;
-                    var tagPos = new Point2(forkPt.X, forkPt.Y - settings.FontSize - 14f - visitIndex * tagLineHeight);
-                    DrawPillLabel(tagPos, reasonText, Math.Max(12, settings.FontSize - 3), forkAccent);
+                    var baseTagPos = new Point2(forkPt.X, forkPt.Y - settings.FontSize - 14f);
+                    bool hasPriorTagTop = _forkTagNextTopY.TryGetValue(fork.ForkLandId, out float prevTagTopY);
+                    float nextTagTopY = DrawStackedPillLabel(baseTagPos, hasPriorTagTop, prevTagTopY, StackGapPx, reasonText, Math.Max(12, settings.FontSize - 3), forkAccent);
+                    _forkTagNextTopY[fork.ForkLandId] = nextTagTopY;
                 }
 
                 _forkTagStack[fork.ForkLandId] = visitIndex + 1;
@@ -486,7 +493,7 @@ namespace MonsterPathPredictor.Runtime
             if (!g.visible) g.visible = true;
         }
 
-        private void DrawPillLabel(Point2 center, string text, int fontSize, Color textColor, bool compact = false)
+        private PooledPill PreparePill(string text, int fontSize, Color textColor, bool compact)
         {
             var pill = AcquirePill();
             text = text ?? string.Empty;
@@ -532,6 +539,11 @@ namespace MonsterPathPredictor.Runtime
                 pill.HasContent = true;
             }
 
+            return pill;
+        }
+
+        private static void PlacePill(PooledPill pill, Point2 center)
+        {
             float left = (float)Math.Round(center.X - pill.Width * 0.5f);
             float top = (float)Math.Round(center.Y - pill.Height * 0.5f);
             if (!pill.HasPos || Math.Abs(left - pill.LastX) >= 0.5f || Math.Abs(top - pill.LastY) >= 0.5f)
@@ -543,6 +555,22 @@ namespace MonsterPathPredictor.Runtime
             }
 
             if (!pill.Root.visible) pill.Root.visible = true;
+        }
+
+        private void DrawPillLabel(Point2 center, string text, int fontSize, Color textColor, bool compact = false)
+        {
+            var pill = PreparePill(text, fontSize, textColor, compact);
+            PlacePill(pill, center);
+        }
+
+        private float DrawStackedPillLabel(Point2 baseCenter, bool hasPriorTop, float priorTopY, float gapPx, string text, int fontSize, Color textColor)
+        {
+            var pill = PreparePill(text, fontSize, textColor, compact: false);
+            float centerY = hasPriorTop
+                ? (priorTopY - gapPx - pill.Height * 0.5f)
+                : baseCenter.Y;
+            PlacePill(pill, new Point2(baseCenter.X, centerY));
+            return centerY - pill.Height * 0.5f;
         }
 
         private static bool ColorsEqual(Color a, Color b)

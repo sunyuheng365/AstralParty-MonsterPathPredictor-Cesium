@@ -148,6 +148,13 @@ namespace MonsterPathPredictor.Runtime
                 // (stays active across FightWindow so combat events resolve accurately upon return).
                 _tracker.SetEventCollectionEnabled(true);
 
+                // Keep authoritative turn-boundary tracking advancing even while FightWindow / settings popups
+                // or transient camera hiccups temporarily suspend visual overlay rendering (prevents A->B->A miss).
+                if (_tracker.ObserveTurnBoundary(battle))
+                {
+                    ClearSelectionAndOverlay();
+                }
+
                 // Combat window or in-battle pause/settings popup: temporarily hide overlay AND popup
                 // without dropping the locked monster so tracking resumes automatically afterwards.
                 if (IsTemporaryOverlayOpen())

@@ -32,19 +32,6 @@ namespace MonsterPathPredictor.ReplayCertifier
             return (list, truncated);
         }
 
-        public static bool HasCompleteFrameStreamAndFinishAnchor(byte[] bytes)
-        {
-            var (frames, isTruncated) = ReadFrames(bytes);
-            if (isTruncated || frames.Count == 0) return false;
-            bool hasStart = false, hasFinish = false;
-            foreach (var (cmd, payload) in frames)
-            {
-                if (cmd == 1003 && payload.Length > 0) hasStart = true;
-                if (cmd == 1016 && payload.Length > 0) hasFinish = true;
-            }
-            return hasStart && hasFinish;
-        }
-
         private static int[] ToIntArray(IEnumerable items)
         {
             if (items == null) return Array.Empty<int>();
@@ -157,13 +144,18 @@ namespace MonsterPathPredictor.ReplayCertifier
                 if (eff.Place != null && eff.Place.Place != null)
                 {
                     dynamic pl = eff.Place.Place;
+                    int oldNode = target.NodeId;
                     int newNode = (int)pl.NodeId;
                     int newBack = (int)pl.BackNodeId;
                     int[] newFront = ToIntArray((IEnumerable)pl.FrontNodeIds);
                     if (newNode >= 0) target.NodeId = newNode;
                     target.BackNodeId = newBack;
                     if (newFront.Length > 0) target.FrontNodeIds = newFront;
-                    if (target.IsMonster && fromSkillMove) target.DisplacedBySkill = true;
+                    if (fromSkillMove && newNode >= 0 && newNode != oldNode)
+                    {
+                        target.SkillDisplacedFromNode = oldNode;
+                        target.SkillDisplacedToNode = newNode;
+                    }
                 }
             }
             return thiefStole;

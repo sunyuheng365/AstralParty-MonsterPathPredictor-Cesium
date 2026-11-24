@@ -42,10 +42,32 @@ namespace MonsterPathPredictor.ReplayCertifier
 
             if (players.TryGetValue(moverId, out var mp))
             {
+                if (IsExactSkillDisplacementEcho(mp, nodeIds))
+                {
+                    mp.SkillDisplacedFromNode = -1;
+                    mp.SkillDisplacedToNode = -1;
+                    ConsumePendingMoveEffects(moverId, mp.NodeId, pendingMoveEffects, players, monsters, curTurnActor, ref thiefStoleOnTile);
+                    return;
+                }
+                mp.SkillDisplacedFromNode = -1;
+                mp.SkillDisplacedToNode = -1;
+
                 int prev = mp.NodeId;
                 foreach (int nid in nodeIds)
                 {
-                    if (nid != prev) { mp.BackNodeId = prev; prev = nid; mp.NodeId = prev; }
+                    if (nid == prev)
+                    {
+                        ConsumePendingMoveEffects(moverId, prev, pendingMoveEffects, players, monsters, curTurnActor, ref thiefStoleOnTile);
+                        continue;
+                    }
+                    bool validPlayerEdge = board.Contains(prev) && board.Contains(nid) && board.IsValidNeighbor(prev, nid);
+                    if (!validPlayerEdge)
+                    {
+                        summary.IllegalMoveEdges++;
+                    }
+                    mp.BackNodeId = prev;
+                    prev = nid;
+                    mp.NodeId = prev;
                     ConsumePendingMoveEffects(moverId, prev, pendingMoveEffects, players, monsters, curTurnActor, ref thiefStoleOnTile);
                 }
                 return;
@@ -55,6 +77,18 @@ namespace MonsterPathPredictor.ReplayCertifier
             bool isNormalAggro = m.MonsterType == 2 || m.MonsterType == 10 || m.MonsterType == 11 || m.MonsterType == 12;
             bool isThief = m.MonsterType == 1;
 
+            // Only deduplicate a MoveS2C that echoes the exact (From -> To) skill displacement already applied by 1096.Place;
+            // any subsequent normal move leaving the landing tile MUST be validated and scored normally.
+            if (IsExactSkillDisplacementEcho(m, nodeIds))
+            {
+                m.SkillDisplacedFromNode = -1;
+                m.SkillDisplacedToNode = -1;
+                ConsumePendingMoveEffects(moverId, m.NodeId, pendingMoveEffects, players, monsters, curTurnActor, ref thiefStoleOnTile);
+                return;
+            }
+            m.SkillDisplacedFromNode = -1;
+            m.SkillDisplacedToNode = -1;
+
             var pathSteps = new List<int>();
             foreach (int nid in nodeIds)
             {
@@ -63,18 +97,19 @@ namespace MonsterPathPredictor.ReplayCertifier
                 pathSteps.Add(nid);
             }
 
+            bool isActiveTurnMonster = (moverId == curTurnActor);
             for (int s = 0; s < pathSteps.Count; s++)
             {
                 int curTile = m.NodeId, nextTile = pathSteps[s], fromTile = m.BackNodeId;
                 bool validEdge = board.Contains(curTile) && board.Contains(nextTile) && board.IsValidNeighbor(curTile, nextTile);
 
-                if (!m.DisplacedBySkill && (isNormalAggro || isThief))
+                if (isNormalAggro || isThief)
                 {
                     if (!validEdge)
                     {
                         summary.IllegalMoveEdges++;
                     }
-                    else if (board.IsFork(curTile))
+                    else if (isActiveTurnMonster && board.IsFork(curTile))
                     {
                         ScoreForkDecision(m, isNormalAggro, isThief, curTile, fromTile, nextTile,
                             replayId, mapId, curRound, fi, board, players, spawnedAtTile,
@@ -85,13 +120,26 @@ namespace MonsterPathPredictor.ReplayCertifier
                 m.BackNodeId = curTile;
                 m.NodeId = nextTile;
                 m.FrontNodeIds = board.GetForwardNeighbors(nextTile, curTile).ToArray();
-                m.DisplacedBySkill = false;
-                stepped = true;
-                foughtOnTile = false;
-                thiefStoleOnTile = false;
+                if (isActiveTurnMonster)
+                {
+                    stepped = true;
+                    foughtOnTile = false;
+                    thiefStoleOnTile = false;
+                }
                 if (spawnedAtTile.TryGetValue(m.Id, out int spt) && spt != nextTile) spawnedAtTile.Remove(m.Id);
                 ConsumePendingMoveEffects(moverId, nextTile, pendingMoveEffects, players, monsters, curTurnActor, ref thiefStoleOnTile);
             }
+        }
+
+        private static bool IsExactSkillDisplacementEcho(UnitSim u, int[] nodeIds)
+        {
+            if (u.SkillDisplacedToNode < 0 || u.NodeId != u.SkillDisplacedToNode || nodeIds.Length == 0)
+                return false;
+            if (nodeIds.Length == 1 && nodeIds[0] == u.SkillDisplacedToNode)
+                return true;
+            if (nodeIds.Length == 2 && nodeIds[0] == u.SkillDisplacedFromNode && nodeIds[1] == u.SkillDisplacedToNode)
+                return true;
+            return false;
         }
 
         private static void ScoreForkDecision(
@@ -227,31 +275,57 @@ namespace MonsterPathPredictor.ReplayCertifier
                         $"tile={curTile} from={fromTile} front=[{string.Join(",", m.FrontNodeIds)}] pred={predNext}({forkPred.SummaryLabel}) actual={nextTile} | {pDesc}");
                 }
             }
-            else if (isNormalAggro)
+            else
             {
+                // Multi-branch decision for ALL evaluated monsters (both Aggressive AND Thief):
+                // ALWAYS verify positive-probability support so out-of-support moves fail GATE 0.
                 bStat.ProbTotal++;
-                mapStat.ProbTotal++;
-                if (!RecordMultiBranchCalibration(board, curTile, forkPred.Exits, nextTile, summary.ProbBins))
+                if (isThief) mapStat.ThiefProbTotal++; else mapStat.ProbTotal++;
+
+                bool inSupport;
+                if (isNormalAggro)
+                {
+                    inSupport = RecordMultiBranchCalibration(board, curTile, forkPred.Exits, nextTile, summary.ProbBins);
+                }
+                else
+                {
+                    inSupport = IsInPredictedSupport(forkPred.Exits, nextTile);
+                }
+
+                if (!inSupport)
                 {
                     summary.OutOfSupportPredictions++;
                     if (bStat.Mismatches.Count < 15)
                     {
                         string predList = string.Join(",", forkPred.Exits.Select(e => $"{e.NextLandId}:{e.FormatConditionalPercent()}"));
                         bStat.Mismatches.Add(
-                            $"{replayId} map={mapId} R{curRound} F{fi} m={m.Id} tile={curTile} from={fromTile} pred=[{predList}] actual={nextTile} (OUT_OF_SUPPORT)");
+                            $"{replayId} map={mapId} R{curRound} F{fi} m={m.Id}(h={m.HeroId},mt={m.MonsterType}) tile={curTile} from={fromTile} pred=[{predList}] actual={nextTile} (OUT_OF_SUPPORT)");
                     }
                 }
             }
+        }
+
+        public static bool IsInPredictedSupport(IReadOnlyList<ForkExitPrediction> exits, int actualNext)
+        {
+            if (exits == null || exits.Count == 0) return false;
+            for (int i = 0; i < exits.Count; i++)
+            {
+                if (exits[i].NextLandId == actualNext && exits[i].ConditionalProbability > 0.0)
+                    return true;
+            }
+            return false;
         }
 
         /// <summary>
         /// Records probabilistic calibration observations for a multi-branch fork.
         /// 1. First verifies that <paramref name="actualNext"/> is in the predicted support (positive probability);
         ///    returns false if out-of-support so GATE 0 fails instead of hiding zero-probability outcomes.
-        /// 2. For 2-way equal-probability bins (e.g. 50%/50%), scores ONE deterministically chosen reference exit
-        ///    selected BEFORE observing actualNext (earliest in raw BoardGraph Red>Blue order).
-        /// 3. For k>=3 equal-probability exits (e.g. 33.3% x 3), scores all k-1 independent slots ordered by raw
-        ///    neighbor priority ("33.3%#1", "33.3%#2", ...) so non-uniform distributions like 30/60/0 are caught!
+        /// 2. For a 2-exit equal-probability fork (50%/50%), scores ONE deterministically chosen reference exit
+        ///    selected BEFORE observing actualNext (earliest in raw BoardGraph Red>Blue order); the complementary
+        ///    exit has identical |z| and opposite sign.
+        /// 3. For k>=3 exits, every exit in any equal-probability subgroup is scored in its own rank-tagged bin
+        ///    ("<pct>#1", "<pct>#2", ..., "<pct>#m") ordered by raw neighbor priority — omitting zero subgroups
+        ///    so biases like 1/3,1/3,1/6,1/6 -> 40/60/20/0 or 32/32/16/40 can NEVER hide!
         /// </summary>
         public static bool RecordMultiBranchCalibration(
             BoardGraph board,
@@ -261,22 +335,15 @@ namespace MonsterPathPredictor.ReplayCertifier
             Dictionary<string, ProbBin> probBins)
         {
             if (exits == null || exits.Count < 2) return false;
-
-            bool inSupport = false;
-            for (int i = 0; i < exits.Count; i++)
-            {
-                if (exits[i].NextLandId == actualNext && exits[i].ConditionalProbability > 0.0)
-                {
-                    inSupport = true;
-                    break;
-                }
-            }
-            if (!inSupport) return false;
+            if (!IsInPredictedSupport(exits, actualNext)) return false;
 
             var rawNeighbors = board.GetValidNeighbors(forkLandId);
             var byBin = new Dictionary<string, List<ForkExitPrediction>>(StringComparer.Ordinal);
+            int positiveExitsCount = 0;
             for (int i = 0; i < exits.Count; i++)
             {
+                if (exits[i].ConditionalProbability <= 0.0) continue;
+                positiveExitsCount++;
                 string binKey = ProbabilityFormat.Percent(exits[i].ConditionalProbability);
                 if (!byBin.TryGetValue(binKey, out var group)) byBin[binKey] = group = new List<ForkExitPrediction>();
                 group.Add(exits[i]);
@@ -299,13 +366,16 @@ namespace MonsterPathPredictor.ReplayCertifier
                         return ia != ib ? ia.CompareTo(ib) : a.NextLandId.CompareTo(b.NextLandId);
                     });
 
-                    if (group.Count == 2)
+                    if (positiveExitsCount == 2 && group.Count == 2)
                     {
+                        // Exact binary complement: z(exit2) = -z(exit1), so scoring reference exit #1 covers both without self-cancellation.
                         AddCalibrationObs(probBins, binKey, group[0], actualNext);
                     }
                     else
                     {
-                        for (int r = 0; r < group.Count - 1; r++)
+                        // Score EVERY member of an equal-probability subgroup in its own rank-tagged bin
+                        // so no bias across multiple equal-prob subgroups (e.g. 1/3,1/3,1/6,1/6) can ever be omitted.
+                        for (int r = 0; r < group.Count; r++)
                         {
                             AddCalibrationObs(probBins, $"{binKey}#{r + 1}", group[r], actualNext);
                         }

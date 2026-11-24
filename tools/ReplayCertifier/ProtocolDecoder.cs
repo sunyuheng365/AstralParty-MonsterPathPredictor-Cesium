@@ -6,11 +6,16 @@ using System.Runtime.Loader;
 
 namespace MonsterPathPredictor.ReplayCertifier
 {
+    internal interface IProtocolDecoder
+    {
+        dynamic TryDecode(string typeName, byte[] payload);
+    }
+
     /// <summary>
     /// Thread-safe reflection wrapper around game protobuf types loaded from a user-supplied Protocol directory.
     /// Avoids compile-time dependencies on Unity/game assemblies.
     /// </summary>
-    internal sealed class ProtocolDecoder
+    internal sealed class ProtocolDecoder : IProtocolDecoder
     {
         private readonly Assembly _gameAsm;
         private readonly ConcurrentDictionary<string, (object Parser, MethodInfo ParseFrom)> _cache = new(StringComparer.Ordinal);

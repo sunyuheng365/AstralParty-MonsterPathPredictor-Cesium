@@ -40,12 +40,14 @@ namespace MonsterPathPredictor.ReplayCertifier
         public long AggroDetTotal { get; set; }
         public long AggroDetHits { get; set; }
         public long AggroProbTotal { get; set; }
-        public double AggroAccuracy { get; set; }
-        public double WilsonLow { get; set; }
-        public double WilsonHigh { get; set; }
+        public double? AggroAccuracy { get; set; }
+        public double? WilsonLow { get; set; }
+        public double? WilsonHigh { get; set; }
         public long ThiefDetTotal { get; set; }
         public long ThiefDetHits { get; set; }
-        public double ThiefAccuracy { get; set; }
+        public long ThiefProbTotal { get; set; }
+        public double? ThiefAccuracy { get; set; }
+        public bool BucketCountsConsistent { get; set; }
         public int EvaluatedBins { get; set; }
         public double WorstAbsZ { get; set; }
         public double DownloadFailRatio { get; set; }
@@ -60,12 +62,19 @@ namespace MonsterPathPredictor.ReplayCertifier
             long aggroDetTotal = aggroKeys.Sum(k => s.Buckets[k].DetTotal);
             long aggroDetHits = aggroKeys.Sum(k => s.Buckets[k].DetHits);
             long aggroProbTotal = aggroKeys.Sum(k => s.Buckets[k].ProbTotal);
-            double aggroAcc = aggroDetTotal > 0 ? (double)aggroDetHits / aggroDetTotal : 0.0;
-            var (wLow, wHigh) = CertificationSummary.Wilson95(aggroDetHits, aggroDetTotal);
+            double? aggroAcc = aggroDetTotal > 0 ? (double)aggroDetHits / aggroDetTotal : (double?)null;
+            double? wLow = null, wHigh = null;
+            if (aggroDetTotal > 0)
+            {
+                var w = CertificationSummary.Wilson95(aggroDetHits, aggroDetTotal);
+                wLow = w.Lower;
+                wHigh = w.Upper;
+            }
 
             var thiefB = s.Buckets["ThiefFork"];
-            double thiefAcc = thiefB.DetTotal > 0 ? (double)thiefB.DetHits / thiefB.DetTotal : 0.0;
+            double? thiefAcc = thiefB.DetTotal > 0 ? (double)thiefB.DetHits / thiefB.DetTotal : (double?)null;
 
+            bool bucketCountsConsistent = s.Buckets.Values.All(b => b.Total == b.DetTotal + b.ProbTotal);
             double dlFailRatio = s.ReplaysAttempted > 0 ? (double)s.DownloadFailed / s.ReplaysAttempted : 1.0;
 
             GateStatus coverageGate;
@@ -73,18 +82,18 @@ namespace MonsterPathPredictor.ReplayCertifier
                 coverageGate = GateStatus.InsufficientSample;
             else if (s.MissingMap > 0 || s.ParseErrors > 0 || s.TruncatedOrCorrupt > 0 ||
                      s.MissingPredictions > 0 || s.OutOfSupportPredictions > 0 || s.IllegalMoveEdges > 0 ||
-                     dlFailRatio > t.MaxDownloadFailRatio)
+                     !bucketCountsConsistent || dlFailRatio > t.MaxDownloadFailRatio)
                 coverageGate = GateStatus.Fail;
             else
                 coverageGate = GateStatus.Pass;
 
             GateStatus aggroGate = aggroDetTotal < t.MinAggroSamples
                 ? GateStatus.InsufficientSample
-                : (aggroAcc >= t.MinDetAccuracy ? GateStatus.Pass : GateStatus.Fail);
+                : (aggroAcc.GetValueOrDefault() >= t.MinDetAccuracy ? GateStatus.Pass : GateStatus.Fail);
 
             GateStatus thiefGate = thiefB.DetTotal < t.MinThiefSamples
                 ? GateStatus.InsufficientSample
-                : (thiefAcc >= t.MinThiefAccuracy ? GateStatus.Pass : GateStatus.Fail);
+                : (thiefAcc.GetValueOrDefault() >= t.MinThiefAccuracy ? GateStatus.Pass : GateStatus.Fail);
 
             int evaluatedBins = 0;
             double worstZ = 0.0;
@@ -102,7 +111,9 @@ namespace MonsterPathPredictor.ReplayCertifier
                 WilsonHigh = wHigh,
                 ThiefDetTotal = thiefB.DetTotal,
                 ThiefDetHits = thiefB.DetHits,
+                ThiefProbTotal = thiefB.ProbTotal,
                 ThiefAccuracy = thiefAcc,
+                BucketCountsConsistent = bucketCountsConsistent,
                 DownloadFailRatio = dlFailRatio
             };
 
@@ -158,12 +169,15 @@ namespace MonsterPathPredictor.ReplayCertifier
             long aggroDetHits = eval.AggroDetHits;
             long aggroDetTotal = eval.AggroDetTotal;
             long aggroProbTotal = eval.AggroProbTotal;
-            double aggroAcc = eval.AggroAccuracy;
-            double wLow = eval.WilsonLow;
-            double wHigh = eval.WilsonHigh;
-            double thiefAcc = eval.ThiefAccuracy;
+            double? aggroAcc = eval.AggroAccuracy;
+            double? wLow = eval.WilsonLow;
+            double? wHigh = eval.WilsonHigh;
+            double? thiefAcc = eval.ThiefAccuracy;
             double worstZ = eval.WorstAbsZ;
             var thiefB = s.Buckets["ThiefFork"];
+            string wilsonStr = (wLow.HasValue && wHigh.HasValue)
+                ? $"[{wLow.Value * 100:F4}%, {wHigh.Value * 100:F4}%]"
+                : "[N/A]";
 
             Console.WriteLine();
             Console.WriteLine("=========================================================================");
@@ -177,9 +191,9 @@ namespace MonsterPathPredictor.ReplayCertifier
                 Console.WriteLine($"  {b.Name,-44} Total={b.Total,7:N0} | Det={b.DetHits,7:N0}/{b.DetTotal,-7:N0} ({accStr,8}) | Prob={b.ProbTotal,5:N0}");
             }
             Console.WriteLine("-------------------------------------------------------------------------");
-            Console.WriteLine($"  [GATE 0] Coverage & Integrity: verified={s.ReplaysVerified:N0}/{s.ReplaysAttempted:N0} (dlFail={eval.DownloadFailRatio * 100:F2}% <= {t.MaxDownloadFailRatio * 100:F1}%, corrupt={s.TruncatedOrCorrupt}, missingPred={s.MissingPredictions}, outOfSupport={s.OutOfSupportPredictions}, illegalEdge={s.IllegalMoveEdges}) => {FormatGate(eval.CoverageGate)}");
-            Console.WriteLine($"  [GATE 1] Aggressive 100%-Det : {aggroDetHits:N0}/{aggroDetTotal:N0} = {FormatAccuracy(aggroDetHits, aggroDetTotal)} (95% Wilson [{wLow * 100:F4}%, {wHigh * 100:F4}%], req >= {t.MinDetAccuracy * 100:F2}%, n >= {t.MinAggroSamples}) => {FormatGate(eval.AggroGate)}");
-            Console.WriteLine($"  [GATE 2] Thief 100%-Det      : {thiefB.DetHits:N0}/{thiefB.DetTotal:N0} = {FormatAccuracy(thiefB.DetHits, thiefB.DetTotal)} (req >= {t.MinThiefAccuracy * 100:F2}%, n >= {t.MinThiefSamples}) => {FormatGate(eval.ThiefGate)}");
+            Console.WriteLine($"  [GATE 0] Coverage & Integrity: verified={s.ReplaysVerified:N0}/{s.ReplaysAttempted:N0} (dlFail={eval.DownloadFailRatio * 100:F2}% <= {t.MaxDownloadFailRatio * 100:F1}%, corrupt={s.TruncatedOrCorrupt}, missingPred={s.MissingPredictions}, outOfSupport={s.OutOfSupportPredictions}, illegalEdge={s.IllegalMoveEdges}, bucketSumOk={eval.BucketCountsConsistent}) => {FormatGate(eval.CoverageGate)}");
+            Console.WriteLine($"  [GATE 1] Aggressive 100%-Det : {aggroDetHits:N0}/{aggroDetTotal:N0} = {FormatAccuracy(aggroDetHits, aggroDetTotal)} (95% Wilson {wilsonStr}, req >= {t.MinDetAccuracy * 100:F2}%, n >= {t.MinAggroSamples}) => {FormatGate(eval.AggroGate)}");
+            Console.WriteLine($"  [GATE 2] Thief 100%-Det      : {thiefB.DetHits:N0}/{thiefB.DetTotal:N0} = {FormatAccuracy(thiefB.DetHits, thiefB.DetTotal)} (multi-branch={thiefB.ProbTotal:N0}, req >= {t.MinThiefAccuracy * 100:F2}%, n >= {t.MinThiefSamples}) => {FormatGate(eval.ThiefGate)}");
             Console.WriteLine($"  [GATE 3] Prob Calibration    : {aggroProbTotal:N0} multi-branch forks, {eval.EvaluatedBins} bins (n>=30), max |z|={worstZ:F2} (req <= {t.MaxAbsZ:F1}) => {FormatGate(eval.CalibrationGate)}");
             Console.WriteLine("-------------------------------------------------------------------------");
 
@@ -188,7 +202,7 @@ namespace MonsterPathPredictor.ReplayCertifier
             {
                 var ms = kv.Value;
                 string accStr = FormatAccuracy(ms.DetHits, ms.DetTotal, 3);
-                Console.WriteLine($"  {kv.Key} ({catalog.GetMapName(kv.Key),-8}): replays={ms.Replays,4:N0} | Det={ms.DetHits,7:N0}/{ms.DetTotal,-7:N0} ({accStr,8}) | Prob={ms.ProbTotal,5:N0} | Thief={ms.ThiefDetHits}/{ms.ThiefDetTotal}");
+                Console.WriteLine($"  {kv.Key} ({catalog.GetMapName(kv.Key),-8}): replays={ms.Replays,4:N0} | Det={ms.DetHits,7:N0}/{ms.DetTotal,-7:N0} ({accStr,8}) | Prob={ms.ProbTotal,5:N0} | Thief={ms.ThiefDetHits}/{ms.ThiefDetTotal} (+{ms.ThiefProbTotal} prob)");
             }
 
             Console.WriteLine("\n=== PROBABILISTIC BRANCH CALIBRATION (n >= 20) ===");
@@ -238,9 +252,9 @@ namespace MonsterPathPredictor.ReplayCertifier
                         evaluatedBins = eval.EvaluatedBins
                     },
                     aggressiveDeterministic = new { hits = aggroDetHits, total = aggroDetTotal, accuracy = aggroAcc, wilson95Low = wLow, wilson95High = wHigh },
-                    thiefDeterministic = new { hits = thiefB.DetHits, total = thiefB.DetTotal, accuracy = thiefAcc },
+                    thiefDeterministic = new { hits = thiefB.DetHits, total = thiefB.DetTotal, probTotal = thiefB.ProbTotal, accuracy = thiefAcc },
                     buckets = s.Buckets.Values.Select(b => new { b.Key, b.Name, b.Total, b.DetHits, b.DetTotal, b.ProbTotal, mismatchCount = b.DetTotal - b.DetHits, samples = b.Mismatches.Take(15) }),
-                    byMap = s.ByMap.OrderBy(k => k.Key).Select(k => new { mapId = k.Key, mapName = catalog.GetMapName(k.Key), k.Value.Replays, k.Value.DetHits, k.Value.DetTotal, k.Value.ProbTotal, k.Value.ThiefDetHits, k.Value.ThiefDetTotal }),
+                    byMap = s.ByMap.OrderBy(k => k.Key).Select(k => new { mapId = k.Key, mapName = catalog.GetMapName(k.Key), k.Value.Replays, k.Value.DetHits, k.Value.DetTotal, k.Value.ProbTotal, k.Value.ThiefDetHits, k.Value.ThiefDetTotal, k.Value.ThiefProbTotal }),
                     calibration = eval.CalibrationRows,
                     frontAudit = fa
                 };
@@ -255,8 +269,8 @@ namespace MonsterPathPredictor.ReplayCertifier
                 sb.AppendLine($"# Replay Certification Report ({(passed ? "PASSED" : "FAILED")})");
                 sb.AppendLine();
                 sb.AppendLine($"- **Verified PVE Replays**: {s.ReplaysVerified:N0} ({s.ByMap.Count} maps, {elapsedSec:F1}s)");
-                sb.AppendLine($"- **Aggressive 100%-Deterministic Accuracy**: **{aggroDetHits:N0} / {aggroDetTotal:N0} = {FormatAccuracy(aggroDetHits, aggroDetTotal)}** (95% Wilson `[{wLow * 100:F4}%, {wHigh * 100:F4}%]`)");
-                sb.AppendLine($"- **Thief 100%-Deterministic Accuracy**: **{thiefB.DetHits:N0} / {thiefB.DetTotal:N0} = {FormatAccuracy(thiefB.DetHits, thiefB.DetTotal)}**");
+                sb.AppendLine($"- **Aggressive 100%-Deterministic Accuracy**: **{aggroDetHits:N0} / {aggroDetTotal:N0} = {FormatAccuracy(aggroDetHits, aggroDetTotal)}** (95% Wilson `{wilsonStr}`)");
+                sb.AppendLine($"- **Thief 100%-Deterministic Accuracy**: **{thiefB.DetHits:N0} / {thiefB.DetTotal:N0} = {FormatAccuracy(thiefB.DetHits, thiefB.DetTotal)}** (multi-branch: {thiefB.ProbTotal:N0})");
                 sb.AppendLine($"- **Probabilistic Multi-Branch Calibration**: {aggroProbTotal:N0} forks, {eval.EvaluatedBins} bins, max `|z| = {worstZ:F2}`");
                 sb.AppendLine();
                 sb.AppendLine("| Bucket | Total | Det Hits / Total | Accuracy | Multi-Branch |");

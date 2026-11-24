@@ -7,6 +7,13 @@ using MonsterPathPredictor.Core;
 
 namespace MonsterPathPredictor.ReplayCertifier
 {
+    internal enum StreamLifecycleState
+    {
+        Unstarted = 0,
+        Running = 1,
+        Finished = 2
+    }
+
     internal static partial class ReplayEvaluator
     {
         private sealed class UnitSim
@@ -23,13 +30,14 @@ namespace MonsterPathPredictor.ReplayCertifier
             public int Gold;
             public int CrimeNum;
             public bool NotSelect;
-            public bool DisplacedBySkill;
+            public int SkillDisplacedFromNode = -1;
+            public int SkillDisplacedToNode = -1;
             public int TauntSkillId;
             public bool WardenRevealed;
             public HashSet<int> BuffIds = new();
         }
 
-        public static CertificationSummary EvaluateBytes(string replayId, byte[] bytes, ProtocolDecoder decoder, BoardCatalog catalog)
+        public static CertificationSummary EvaluateBytes(string replayId, byte[] bytes, IProtocolDecoder decoder, BoardCatalog catalog)
         {
             var summary = new CertificationSummary { ReplaysAttempted = 1 };
             var (frames, isTruncated) = ReadFrames(bytes);
@@ -39,27 +47,13 @@ namespace MonsterPathPredictor.ReplayCertifier
                 return summary;
             }
 
-            var runningFrame = frames.FirstOrDefault(f => f.CmdId == 1003 && f.Payload.Length > 0);
-            if (runningFrame.Payload == null)
-            {
-                summary.TruncatedOrCorrupt = 1;
-                return summary;
-            }
-
-            dynamic running = decoder.TryDecode("party.protocol.RunningGameS2C", runningFrame.Payload);
-            if (running?.Room == null)
-            {
-                summary.ParseErrors = 1;
-                return summary;
-            }
-
-            int mapId = (int)running.Room.MapId;
-            int mapIndex = (int)running.Room.MapIndex;
-            if (mapId < 82000 || mapId >= 84000) { summary.SkippedNonPve = 1; return summary; }
-            if (!catalog.TryGetGraph(mapId, mapIndex, out var board)) { summary.MissingMap = 1; return summary; }
-
-            var mapStat = new MapStats();
-            summary.ByMap[mapId] = mapStat;
+            BoardGraph board = null;
+            MapStats mapStat = null;
+            int mapId = 0;
+            int mapIndex = 0;
+            int curRound = 0;
+            int turnStartLandId = -1;
+            bool startedOnFork = false, stepped = false, foughtOnTile = false, foughtTurn = false, thiefStoleOnTile = false;
 
             var players = new Dictionary<long, UnitSim>();
             var monsters = new Dictionary<long, UnitSim>();
@@ -68,32 +62,25 @@ namespace MonsterPathPredictor.ReplayCertifier
             var pendingMoveEffects = new Dictionary<long, Dictionary<int, List<dynamic>>>();
             long curTurnActor = 0;
             bool unknownLayout = false;
+            bool parseError = false;
             bool decodeFailed = false;
-            bool hasFinishAnchor = false;
-
-            void FlushPendingEffectsForActor(long actorId)
-            {
-                if (actorId == 0 || !pendingMoveEffects.TryGetValue(actorId, out var byTile)) return;
-                foreach (var kv in byTile)
-                {
-                    foreach (var effAttr in kv.Value)
-                    {
-                        ApplyAttr(effAttr, players, monsters, true, curTurnActor);
-                    }
-                }
-                pendingMoveEffects.Remove(actorId);
-            }
+            var lifecycle = StreamLifecycleState.Unstarted;
 
             void SyncRoom(dynamic room)
             {
                 int newIdx = (int)room.MapIndex;
-                if (newIdx != mapIndex)
+                if (board == null || newIdx != mapIndex)
                 {
                     if (catalog.TryGetGraph(mapId, newIdx, out var nb)) { mapIndex = newIdx; board = nb; }
                     else { unknownLayout = true; return; }
                 }
                 pendingMoveEffects.Clear();
-                var prevDisp = monsters.Where(kv => kv.Value.DisplacedBySkill).Select(kv => kv.Key).ToHashSet();
+                var prevDisp = new Dictionary<long, (int From, int To)>();
+                foreach (var kv in monsters)
+                {
+                    if (kv.Value.SkillDisplacedToNode >= 0)
+                        prevDisp[kv.Key] = (kv.Value.SkillDisplacedFromNode, kv.Value.SkillDisplacedToNode);
+                }
                 players.Clear();
                 monsters.Clear();
                 if (room.Players != null)
@@ -104,42 +91,91 @@ namespace MonsterPathPredictor.ReplayCertifier
                         if (m?.Hero != null)
                         {
                             UnitSim u = BuildUnit(m, true);
-                            if (prevDisp.Contains(u.Id)) u.DisplacedBySkill = true;
+                            if (prevDisp.TryGetValue(u.Id, out var disp) && u.NodeId == disp.To)
+                            {
+                                u.SkillDisplacedFromNode = disp.From;
+                                u.SkillDisplacedToNode = disp.To;
+                            }
                             monsters[u.Id] = u;
                             if (seenMonsters.Add(u.Id)) spawnedAtTile[u.Id] = u.NodeId;
                         }
             }
 
-            SyncRoom(running.Room);
-
-            int curRound = (int)running.Room.Round;
-            int turnStartLandId = -1;
-            bool startedOnFork = false, stepped = false, foughtOnTile = false, foughtTurn = false, thiefStoleOnTile = false;
-
-            for (int fi = 0; fi < frames.Count && !unknownLayout; fi++)
+            for (int fi = 0; fi < frames.Count && !unknownLayout && !decodeFailed && !parseError; fi++)
             {
                 var (cmd, payload) = frames[fi];
+                bool isStateFrame = cmd == 1003 || cmd == 1016 || cmd == 1113 || cmd == 1018 || cmd == 5022 ||
+                                    cmd == 1040 || cmd == 1096 || cmd == 5214 || cmd == 1007 || cmd == 1115 || cmd == 5028;
                 if (payload.Length == 0)
                 {
                     // State-carrying protocol frames must never have empty payload
-                    if (cmd == 1003 || cmd == 1016 || cmd == 1113 || cmd == 1018 || cmd == 5022 ||
-                        cmd == 1040 || cmd == 1096 || cmd == 5214 || cmd == 1007 || cmd == 1115 || cmd == 5028)
+                    if (isStateFrame) decodeFailed = true;
+                    continue;
+                }
+
+                // Strict stream lifecycle state machine: Unstarted -> (1003) -> Running -> (1016) -> Finished
+                if (cmd == 1003)
+                {
+                    if (lifecycle != StreamLifecycleState.Unstarted) { decodeFailed = true; break; }
+                    dynamic running = decoder.TryDecode("party.protocol.RunningGameS2C", payload);
+                    if (running?.Room == null) { parseError = true; break; }
+
+                    mapId = (int)running.Room.MapId;
+                    mapIndex = (int)running.Room.MapIndex;
+                    if (mapId < 82000 || mapId >= 84000) { summary.SkippedNonPve = 1; return summary; }
+                    if (!catalog.TryGetGraph(mapId, mapIndex, out board)) { unknownLayout = true; break; }
+
+                    mapStat = new MapStats();
+                    summary.ByMap[mapId] = mapStat;
+                    SyncRoom(running.Room);
+                    if (unknownLayout) break;
+                    curRound = (int)running.Room.Round;
+                    lifecycle = StreamLifecycleState.Running;
+                    continue;
+                }
+
+                if (lifecycle == StreamLifecycleState.Unstarted)
+                {
+                    if (cmd == 1040)
                     {
-                        decodeFailed = true;
+                        // Real replays may prepend pre-match setup 1040 attr frames before 1003; verify decodable only.
+                        if (decoder.TryDecode("party.protocol.UpdateHeroAttrS2C", payload) == null)
+                        {
+                            decodeFailed = true;
+                            break;
+                        }
+                        continue;
                     }
+                    if (isStateFrame) { decodeFailed = true; break; }
+                    continue;
+                }
+
+                if (lifecycle == StreamLifecycleState.Finished)
+                {
+                    if (cmd == 1040)
+                    {
+                        // Real replays may append post-finish settlement 1040 attr frames; verify decodable only.
+                        if (decoder.TryDecode("party.protocol.UpdateHeroAttrS2C", payload) == null)
+                        {
+                            decodeFailed = true;
+                            break;
+                        }
+                        continue;
+                    }
+                    if (isStateFrame) { decodeFailed = true; break; }
                     continue;
                 }
 
                 if (cmd == 1016)
                 {
                     dynamic fin = decoder.TryDecode("party.protocol.GameFinishS2C", payload);
-                    if (fin == null) { decodeFailed = true; continue; }
-                    hasFinishAnchor = true;
+                    if (fin == null) { decodeFailed = true; break; }
+                    lifecycle = StreamLifecycleState.Finished;
                 }
                 else if (cmd == 1113)
                 {
                     dynamic snap = decoder.TryDecode("party.protocol.ReplaySnapshotS2C", payload);
-                    if (snap?.Room == null) { decodeFailed = true; continue; }
+                    if (snap?.Room == null) { decodeFailed = true; break; }
                     SyncRoom(snap.Room);
                     if (unknownLayout) break;
                     curRound = (int)snap.Room.Round;
@@ -151,7 +187,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                 else if (cmd == 1018)
                 {
                     dynamic mr = decoder.TryDecode("party.protocol.MonsterRefreshS2C", payload);
-                    if (mr == null) { decodeFailed = true; continue; }
+                    if (mr == null) { decodeFailed = true; break; }
                     if (mr.Monster?.Hero != null)
                     {
                         UnitSim u = BuildUnit(mr.Monster, true);
@@ -163,15 +199,22 @@ namespace MonsterPathPredictor.ReplayCertifier
                 else if (cmd == 5022)
                 {
                     dynamic td = decoder.TryDecode("party.protocol.ThrowDiceS2C", payload);
-                    if (td == null) { decodeFailed = true; continue; }
+                    if (td == null) { decodeFailed = true; break; }
                     long actorId = (long)td.PlayerId;
-                    FlushPendingEffectsForActor(curTurnActor);
+                    // Discard unreached deferred 1096 tile effects from the previous actor instead of falsely applying them.
+                    if (curTurnActor != 0) pendingMoveEffects.Remove(curTurnActor);
+                    // Always advance active turn context even when a player (non-monster) rolls dice.
+                    curTurnActor = actorId;
+                    stepped = foughtOnTile = foughtTurn = thiefStoleOnTile = false;
                     if (monsters.TryGetValue(actorId, out var ma))
                     {
-                        curTurnActor = ma.Id;
-                        stepped = foughtOnTile = foughtTurn = thiefStoleOnTile = false;
                         turnStartLandId = ma.NodeId;
                         startedOnFork = board.IsFork(ma.NodeId);
+                    }
+                    else
+                    {
+                        turnStartLandId = -1;
+                        startedOnFork = false;
                     }
                 }
                 else if (cmd == 1040)
@@ -265,14 +308,18 @@ namespace MonsterPathPredictor.ReplayCertifier
             {
                 summary.MissingMap = 1;
             }
-            else if (isTruncated || decodeFailed || !hasFinishAnchor)
+            else if (parseError)
+            {
+                summary.ParseErrors = 1;
+            }
+            else if (isTruncated || decodeFailed || lifecycle != StreamLifecycleState.Finished)
             {
                 summary.TruncatedOrCorrupt = 1;
             }
             else
             {
                 summary.ReplaysVerified = 1;
-                mapStat.Replays = 1;
+                if (mapStat != null) mapStat.Replays = 1;
             }
 
             return summary;

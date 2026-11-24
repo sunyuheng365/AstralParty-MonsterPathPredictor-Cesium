@@ -39,6 +39,7 @@ namespace MonsterPathPredictor.Config
             settings.ClickRadius = config.GetFloat("clickRadius", settings.ClickRadius);
             settings.ClearOnEmptyClick = config.GetBool("clearOnEmptyClick", settings.ClearOnEmptyClick);
             settings.ShowReasonTag = config.GetBool("showReasonTag", settings.ShowReasonTag);
+            settings.ShowStepNumbers = config.GetBool("showStepNumbers", settings.ShowStepNumbers);
             settings.ShowDeterministicPercent = config.GetBool("showDeterministicPercent", settings.ShowDeterministicPercent);
             settings.SimulateCombatOnFork = config.GetBool("simulateCombatOnFork", settings.SimulateCombatOnFork);
             settings.PostCombatMode = PredictorSettings.ParsePostCombatMode(config.GetString("postCombatMode", "continue"));
@@ -116,9 +117,14 @@ namespace MonsterPathPredictor.Config
                 "Clear selected monster when clicking empty board space (default false: stay locked until re-clicked, switched, or dead)"));
 
             cfg.SetDefault("showReasonTag", true, ConfigDoc.Of(
-                "在岔路口旁显示简短判定依据（如 起步·红箭 / →P1(2格) / 掉头平分）",
-                "在岔路口旁顯示簡短判定依據（如 起步·紅箭 / →P1(2格) / 掉頭平分）",
+                "在岔路口旁显示简短判定依据（如 起步·红箭 / 追P1·距2 / 掉头平分）",
+                "在岔路口旁顯示簡短判定依據（如 起步·紅箭 / 追P1·距2 / 掉頭平分）",
                 "Show concise decision tags at forks"));
+
+            cfg.SetDefault("showStepNumbers", true, ConfigDoc.Of(
+                "沿预测路径每格显示正计数步数（起点 0，依次递增至终点 X 格）",
+                "沿預測路徑每格顯示正計數步數（起點 0，依序遞增至終點 X 格）",
+                "Show forward step numbers (0 at start up to X at endpoint) on each predicted tile"));
 
             cfg.SetDefault("showDeterministicPercent", false, ConfigDoc.Of(
                 "岔路口只有唯一确定方向时是否也显示 100%（多分支时始终显示百分比）",

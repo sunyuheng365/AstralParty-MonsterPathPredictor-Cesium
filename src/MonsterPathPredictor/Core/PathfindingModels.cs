@@ -192,6 +192,28 @@ namespace MonsterPathPredictor.Core
         public bool IsAfterCombat { get; set; }
     }
 
+    public sealed class PredictedTileStep
+    {
+        public int LandId { get; set; }
+        public int StepIndex { get; set; }
+        public List<int> StepIndices { get; } = new List<int>();
+        public double Probability { get; set; }
+        public bool IsAfterCombat { get; set; }
+        public bool IsEndpoint { get; set; }
+        public bool IsDeadEnd { get; set; }
+
+        public string FormatStepBadge()
+        {
+            string stepsText = StepIndices.Count > 0
+                ? string.Join("/", StepIndices)
+                : StepIndex.ToString(CultureInfo.InvariantCulture);
+
+            if (IsDeadEnd) return "终点(" + stepsText + "格)";
+            if (IsEndpoint && StepIndex > 0) return stepsText + "格";
+            return stepsText;
+        }
+    }
+
     public sealed class PathPlan
     {
         public long MonsterId { get; set; }
@@ -205,6 +227,7 @@ namespace MonsterPathPredictor.Core
         public List<PredictedFork> Forks { get; } = new List<PredictedFork>();
         public List<PredictedCombat> Combats { get; } = new List<PredictedCombat>();
         public List<PredictedEndpoint> Endpoints { get; } = new List<PredictedEndpoint>();
+        public List<PredictedTileStep> TileSteps { get; } = new List<PredictedTileStep>();
     }
 
     public static class ProbabilityFormat

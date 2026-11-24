@@ -20,6 +20,7 @@ namespace MonsterPathPredictor.Core
         public float ClickRadius { get; set; } = 28f;
         public bool ClearOnEmptyClick { get; set; } = false;
         public bool ShowReasonTag { get; set; } = true;
+        public bool ShowStepNumbers { get; set; } = true;
         public bool ShowDeterministicPercent { get; set; } = false;
         public bool SimulateCombatOnFork { get; set; } = true;
         public PostCombatMode PostCombatMode { get; set; } = PostCombatMode.ContinueByGuide;

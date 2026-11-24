@@ -34,6 +34,7 @@ namespace MonsterPathPredictor.Runtime
             public string LastText;
             public int LastFontSize;
             public Color LastColor;
+            public bool LastCompact;
             public float Width;
             public float Height;
             public float LastX;
@@ -138,9 +139,9 @@ namespace MonsterPathPredictor.Runtime
             Vector3 headerWorld = GetStableHeaderAnchorWorld(selectedMonster);
             if (TryProjectWorld(layer, camera, camPos, camForward, headerWorld, out var headerPt))
             {
-                string headerText = plan.MonsterName + " · " + plan.StepsRequested + "格";
-                if (!string.IsNullOrEmpty(plan.HeadlineNote))
-                    headerText += " (" + plan.HeadlineNote + ")";
+                string headerText = !string.IsNullOrEmpty(plan.HeadlineNote)
+                    ? plan.MonsterName + " (" + plan.HeadlineNote + ")"
+                    : plan.MonsterName;
                 DrawPillLabel(new Point2(headerPt.X, headerPt.Y - 12f), headerText, Math.Max(13, settings.FontSize - 2), RingColor);
             }
 
@@ -244,26 +245,55 @@ namespace MonsterPathPredictor.Runtime
                 Color badgeColor = combat.IsSteal ? MajorBranchColor : CombatBadgeColor;
                 DrawDot(cPt, 7.5f, badgeColor);
                 string prefix = combat.IsSteal ? "偷" : "⚔遇";
-                string cLabel = prefix + combat.TargetLabel + "(" + combat.StepIndex + "格)";
-                DrawPillLabel(new Point2(cPt.X, cPt.Y + 18f), cLabel, Math.Max(12, settings.FontSize - 3), badgeColor);
+                string cLabel = prefix + combat.TargetLabel + "(第" + combat.StepIndex + "格)";
+                DrawPillLabel(new Point2(cPt.X, cPt.Y + 20f), cLabel, Math.Max(12, settings.FontSize - 3), badgeColor);
             }
 
-            // 5. Endpoint markers at the end of X steps (skip if a combat marker already sits on that exact tile)
-            var combatLands = new HashSet<int>();
-            for (int i = 0; i < plan.Combats.Count; i++) combatLands.Add(plan.Combats[i].LandId);
-
-            for (int i = 0; i < plan.Endpoints.Count; i++)
+            // 5. Forward step count badges along the predicted path (0 at monster -> 1, 2, ... -> X格 at endpoint)
+            if (settings.ShowStepNumbers && plan.TileSteps.Count > 0)
             {
-                var ep = plan.Endpoints[i];
-                if (ep.StoppedAtCombat && combatLands.Contains(ep.LandId)) continue;
-                if (!TryProjectTile(ep.LandId, out var epPt)) continue;
+                int stepFont = Math.Max(11, settings.FontSize - 5);
+                int endFont = Math.Max(12, settings.FontSize - 3);
 
-                Color epColor = PickEdgeColor(ep.Probability, ep.IsAfterCombat);
-                DrawDot(epPt, 6.5f, epColor);
+                for (int i = 0; i < plan.TileSteps.Count; i++)
+                {
+                    var ts = plan.TileSteps[i];
+                    if (!TryProjectTile(ts.LandId, out var tilePt)) continue;
 
-                string epLabel = ep.IsDeadEnd ? "终点" : (ep.StepIndex + "格");
-                float yOff = combatLands.Contains(ep.LandId) ? -22f : 16f;
-                DrawPillLabel(new Point2(epPt.X, epPt.Y + yOff), epLabel, Math.Max(12, settings.FontSize - 4), epColor);
+                    Color stepColor = ts.StepIndex == 0
+                        ? RingColor
+                        : PickEdgeColor(ts.Probability, ts.IsAfterCombat);
+
+                    if (ts.IsEndpoint)
+                    {
+                        DrawDot(tilePt, 6.5f, stepColor);
+                        DrawPillLabel(tilePt, ts.FormatStepBadge(), endFont, stepColor, compact: false);
+                    }
+                    else
+                    {
+                        DrawPillLabel(tilePt, ts.FormatStepBadge(), stepFont, stepColor, compact: true);
+                    }
+                }
+            }
+            else
+            {
+                // Fallback endpoint-only markers when per-tile step numbers are disabled
+                var combatLands = new HashSet<int>();
+                for (int i = 0; i < plan.Combats.Count; i++) combatLands.Add(plan.Combats[i].LandId);
+
+                for (int i = 0; i < plan.Endpoints.Count; i++)
+                {
+                    var ep = plan.Endpoints[i];
+                    if (ep.StoppedAtCombat && combatLands.Contains(ep.LandId)) continue;
+                    if (!TryProjectTile(ep.LandId, out var epPt)) continue;
+
+                    Color epColor = PickEdgeColor(ep.Probability, ep.IsAfterCombat);
+                    DrawDot(epPt, 6.5f, epColor);
+
+                    string epLabel = ep.IsDeadEnd ? ("终点(" + ep.StepIndex + "格)") : (ep.StepIndex + "格");
+                    float yOff = combatLands.Contains(ep.LandId) ? -22f : 16f;
+                    DrawPillLabel(new Point2(epPt.X, epPt.Y + yOff), epLabel, Math.Max(12, settings.FontSize - 4), epColor);
+                }
             }
 
             for (int i = _usedLineGraphs; i < _lineGraphPool.Count; i++)
@@ -413,20 +443,21 @@ namespace MonsterPathPredictor.Runtime
             if (!g.visible) g.visible = true;
         }
 
-        private void DrawPillLabel(Point2 center, string text, int fontSize, Color textColor)
+        private void DrawPillLabel(Point2 center, string text, int fontSize, Color textColor, bool compact = false)
         {
             var pill = AcquirePill();
             text = text ?? string.Empty;
 
             bool contentChanged = !pill.HasContent ||
                 pill.LastFontSize != fontSize ||
+                pill.LastCompact != compact ||
                 !string.Equals(pill.LastText, text, StringComparison.Ordinal) ||
                 !ColorsEqual(pill.LastColor, textColor);
 
             if (contentChanged)
             {
-                const float padX = 7f;
-                const float padY = 3f;
+                float padX = compact ? 5f : 7f;
+                float padY = compact ? 1.5f : 3f;
 
                 pill.Text.textFormat = new TextFormat
                 {
@@ -438,19 +469,23 @@ namespace MonsterPathPredictor.Runtime
                 };
                 pill.Text.text = text;
 
-                float w = (float)Math.Ceiling(Math.Max(18f, pill.Text.width + padX * 2f));
-                float h = (float)Math.Ceiling(Math.Max(16f, pill.Text.height + padY * 2f));
+                float h = (float)Math.Ceiling(Math.Max(compact ? 18f : 16f, pill.Text.height + padY * 2f));
+                float minW = compact ? h : 18f;
+                float w = (float)Math.Ceiling(Math.Max(minW, pill.Text.width + padX * 2f));
 
                 pill.Root.SetSize(w, h);
                 pill.Bg.SetSize(w, h);
                 pill.Bg.DrawRoundRect(w, h, BadgeBg, PillCornerRadii);
-                pill.Text.SetXY(padX, padY);
+                pill.Text.SetXY(
+                    (float)Math.Round((w - pill.Text.width) * 0.5f),
+                    (float)Math.Round((h - pill.Text.height) * 0.5f));
 
                 pill.Width = w;
                 pill.Height = h;
                 pill.LastText = text;
                 pill.LastFontSize = fontSize;
                 pill.LastColor = textColor;
+                pill.LastCompact = compact;
                 pill.HasContent = true;
             }
 

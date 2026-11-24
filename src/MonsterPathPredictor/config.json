@@ -11,6 +11,7 @@
   "clickRadius": 28.0,
   "clearOnEmptyClick": false,
   "showReasonTag": true,
+  "showStepNumbers": true,
   "showDeterministicPercent": false,
   "simulateCombatOnFork": true,
   "postCombatMode": "continue",
@@ -61,8 +62,12 @@
       "en": "Clear selected monster when clicking empty board space (default false: stay locked until re-clicked, switched, or dead)"
     },
     "showReasonTag": {
-      "zh-Hans": "在岔路口旁显示简短判定依据（如 起步·红箭 / →P1(2格) / 掉头平分）",
+      "zh-Hans": "在岔路口旁显示简短判定依据（如 起步·红箭 / 追P1·距2 / 掉头平分）",
       "en": "Show concise decision tags at forks"
+    },
+    "showStepNumbers": {
+      "zh-Hans": "沿预测路径每格显示正计数步数（起点 0，依次递增至终点 X 格）",
+      "en": "Show forward step numbers (0 at start up to X at endpoint) on each predicted tile"
     },
     "showDeterministicPercent": {
       "zh-Hans": "岔路口只有唯一确定方向时是否也显示 100%（多分支时始终显示百分比）",

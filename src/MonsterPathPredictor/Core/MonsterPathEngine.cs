@@ -152,8 +152,12 @@ namespace MonsterPathPredictor.Core
             var forkMap = new Dictionary<ForkRecordKey, PredictedFork>();
             var combatMap = new Dictionary<int, PredictedCombat>();
             var endpointMap = new Dictionary<(int LandId, int Step, bool DeadEnd, bool StoppedAtCombat, bool AfterCombat), double>();
+            var tileStepMap = new Dictionary<int, PredictedTileStep>();
+            var tileStepHasPreCombat = new HashSet<int>();
 
             bool initialCombatState = monster.HasLaunchedFightThisTurn || monster.JustFoughtOnCurrentFork;
+            RecordTileStep(tileStepMap, tileStepHasPreCombat, monster.CurrentLandId, step: 0, probability: 1.0, isAfterCombat: initialCombatState);
+
             var currentLayer = new Dictionary<WalkStateKey, double>
             {
                 [new WalkStateKey(monster.CurrentLandId, monster.FromLandId, initialCombatState, -1)] = 1.0
@@ -274,6 +278,8 @@ namespace MonsterPathPredictor.Core
                         pe.Probability = Math.Min(1.0, pe.Probability + branchProb);
                         if (step < pe.EarliestStep) pe.EarliestStep = step;
 
+                        RecordTileStep(tileStepMap, tileStepHasPreCombat, nextId, step + 1, branchProb, postCombatNow);
+
                         var nextKey = new WalkStateKey(nextId, state.LandId, postCombatNow, clearedMarkLandId);
                         if (nextLayer.TryGetValue(nextKey, out double existing))
                             nextLayer[nextKey] = existing + branchProb;
@@ -341,8 +347,26 @@ namespace MonsterPathPredictor.Core
                     IsAfterCombat = ep.Key.AfterCombat,
                     Probability = Math.Min(1.0, ep.Value)
                 });
+
+                if (tileStepMap.TryGetValue(ep.Key.LandId, out var ts))
+                {
+                    ts.IsEndpoint = true;
+                    if (ep.Key.DeadEnd) ts.IsDeadEnd = true;
+                }
             }
             plan.Endpoints.Sort((a, b) => b.Probability.CompareTo(a.Probability));
+
+            foreach (var ts in tileStepMap.Values)
+            {
+                ts.StepIndices.Sort();
+                if (ts.StepIndices.Count > 0) ts.StepIndex = ts.StepIndices[0];
+                plan.TileSteps.Add(ts);
+            }
+            plan.TileSteps.Sort((a, b) =>
+            {
+                int c = a.StepIndex.CompareTo(b.StepIndex);
+                return c != 0 ? c : a.LandId.CompareTo(b.LandId);
+            });
 
             if (string.IsNullOrEmpty(plan.HeadlineNote))
             {
@@ -789,7 +813,7 @@ namespace MonsterPathPredictor.Core
             {
                 reason = ForkReasonKind.MidForkChasePlayer;
                 label = primaryTarget != null
-                    ? prefix + "→" + primaryTarget.SeatTag + "(" + primaryDist + "格)"
+                    ? (isAfterCombat ? "续行·追" : "追") + primaryTarget.SeatTag + "·距" + primaryDist
                     : "直行";
             }
 
@@ -904,7 +928,7 @@ namespace MonsterPathPredictor.Core
                 Transitions = transitions,
                 IsForkDecision = board.IsFork(curLandId),
                 Reason = ForkReasonKind.TauntChase,
-                SummaryLabel = "嘲讽→" + target.SeatTag + "(" + dist + "格)"
+                SummaryLabel = "嘲讽·追" + target.SeatTag + "·距" + dist
             };
             return true;
         }
@@ -1028,7 +1052,7 @@ namespace MonsterPathPredictor.Core
                 Transitions = transitions,
                 IsForkDecision = board.IsFork(curLandId),
                 Reason = ForkReasonKind.MarkedTargetChase,
-                SummaryLabel = labelPrefix + "→" + bestTarget.SeatTag + "(" + bestDist + "格)"
+                SummaryLabel = labelPrefix + "·" + bestTarget.SeatTag + "·距" + bestDist
             };
             return true;
         }
@@ -1119,6 +1143,47 @@ namespace MonsterPathPredictor.Core
                 }
             }
             return list;
+        }
+
+        private static void RecordTileStep(
+            Dictionary<int, PredictedTileStep> map,
+            HashSet<int> hasPreCombat,
+            int landId,
+            int step,
+            double probability,
+            bool isAfterCombat)
+        {
+            if (!map.TryGetValue(landId, out var ts))
+            {
+                ts = new PredictedTileStep
+                {
+                    LandId = landId,
+                    StepIndex = step,
+                    Probability = Math.Min(1.0, probability),
+                    IsAfterCombat = isAfterCombat
+                };
+                ts.StepIndices.Add(step);
+                map[landId] = ts;
+            }
+            else
+            {
+                if (!ts.StepIndices.Contains(step))
+                {
+                    ts.StepIndices.Add(step);
+                }
+                if (step < ts.StepIndex) ts.StepIndex = step;
+                ts.Probability = Math.Min(1.0, ts.Probability + probability);
+            }
+
+            if (!isAfterCombat)
+            {
+                hasPreCombat.Add(landId);
+                ts.IsAfterCombat = false;
+            }
+            else if (!hasPreCombat.Contains(landId))
+            {
+                ts.IsAfterCombat = true;
+            }
         }
 
         private static void AccumulateEndpoint(

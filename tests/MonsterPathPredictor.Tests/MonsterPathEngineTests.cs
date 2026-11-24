@@ -480,7 +480,7 @@ namespace MonsterPathPredictor.Tests
             var monster = new MonsterState { MonsterId = 301, CurrentLandId = 2, FromLandId = 1 };
 
             // 1. ContinueByGuide (default): marks combat at tile 4, continues past it with IsAfterCombat=true,
-            //    and at Fork2(6) skips behind-player P1 to follow P2 on Blue(8) with "续行→P2(2格)"
+            //    and at Fork2(6) skips behind-player P1 to follow P2 on Blue(8) with "续行·追P2·距2"
             var planContinue = MonsterPathEngine.Plan(board, monster, players, new PlanOptions
             {
                 MaxSteps = 6,
@@ -492,7 +492,7 @@ namespace MonsterPathPredictor.Tests
             var fork2Continue = planContinue.Forks.Single(f => f.ForkLandId == 6);
             Assert.True(fork2Continue.IsAfterCombat);
             Assert.Equal(8, fork2Continue.Exits[0].NextLandId);
-            Assert.StartsWith("续行→P2", fork2Continue.SummaryLabel);
+            Assert.StartsWith("续行·追P2·距", fork2Continue.SummaryLabel);
             Assert.True(planContinue.Edges.Single(e => e.FromLandId == 6 && e.ToLandId == 8).IsAfterCombat);
             Assert.False(planContinue.Edges.Single(e => e.FromLandId == 2 && e.ToLandId == 3).IsAfterCombat);
 
@@ -639,6 +639,88 @@ namespace MonsterPathPredictor.Tests
             };
             var planNoSteal = MonsterPathEngine.Plan(board, thief, zeroGold, new PlanOptions { MaxSteps = 3, SimulateCombatOnFork = true });
             Assert.Equal(55, planNoSteal.Forks.Single(f => f.ForkLandId == 23).Exits[0].NextLandId);
+        }
+
+        [Fact]
+        public void TileStepsCountForwardFromZeroAtMonsterToMaxStepsAtEndpoint()
+        {
+            // Linear path: 0 -> 1 -> 2 -> ... -> 12
+            var nodes = new List<LandNodeSnapshot>();
+            for (int i = 0; i <= 12; i++)
+            {
+                var nbs = new List<int>();
+                if (i > 0) nbs.Add(i - 1);
+                if (i < 12) nbs.Add(i + 1);
+                nodes.Add(new LandNodeSnapshot(i, nbs.ToArray()));
+            }
+            var board = new BoardGraph(nodes);
+            var monster = new MonsterState
+            {
+                MonsterId = 401,
+                CurrentLandId = 0,
+                FromLandId = -1,
+                FrontNodeIds = new[] { 1 }
+            };
+
+            var plan = MonsterPathEngine.Plan(board, monster, new List<TrackedPlayer>(), new PlanOptions { MaxSteps = 12 });
+
+            Assert.Equal(13, plan.TileSteps.Count);
+            for (int step = 0; step <= 12; step++)
+            {
+                var ts = plan.TileSteps[step];
+                Assert.Equal(step, ts.LandId);
+                Assert.Equal(step, ts.StepIndex);
+                if (step == 0)
+                {
+                    Assert.False(ts.IsEndpoint);
+                    Assert.Equal("0", ts.FormatStepBadge());
+                }
+                else if (step < 12)
+                {
+                    Assert.False(ts.IsEndpoint);
+                    Assert.Equal(step.ToString(), ts.FormatStepBadge());
+                }
+                else
+                {
+                    Assert.True(ts.IsEndpoint);
+                    Assert.False(ts.IsDeadEnd);
+                    Assert.Equal("12格", ts.FormatStepBadge());
+                }
+            }
+        }
+
+        [Fact]
+        public void TileStepsMergeRevisitedLoopStepsAndDeadEndLabelsCleanly()
+        {
+            // 4-tile ring: 1 -> 2 -> 3 -> 4 -> 1 (6 steps: 1@0/4, 2@1/5, 3@2/6(endpoint), 4@3)
+            var ring = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(1, new[] { 2, 4 }),
+                new LandNodeSnapshot(2, new[] { 3, 1 }),
+                new LandNodeSnapshot(3, new[] { 4, 2 }),
+                new LandNodeSnapshot(4, new[] { 1, 3 })
+            });
+            var mRing = new MonsterState { MonsterId = 402, CurrentLandId = 1, FromLandId = 4, FrontNodeIds = new[] { 2 } };
+            var ringPlan = MonsterPathEngine.Plan(ring, mRing, new List<TrackedPlayer>(), new PlanOptions { MaxSteps = 6 });
+
+            Assert.Equal("0/4", ringPlan.TileSteps.Single(t => t.LandId == 1).FormatStepBadge());
+            Assert.Equal("1/5", ringPlan.TileSteps.Single(t => t.LandId == 2).FormatStepBadge());
+            Assert.Equal("2/6格", ringPlan.TileSteps.Single(t => t.LandId == 3).FormatStepBadge());
+            Assert.Equal("3", ringPlan.TileSteps.Single(t => t.LandId == 4).FormatStepBadge());
+
+            // Dead end at step 3 on a 4-tile line (requested 12 steps)
+            var line = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(10, new[] { 11 }),
+                new LandNodeSnapshot(11, new[] { 10, 12 }),
+                new LandNodeSnapshot(12, new[] { 11, 13 }),
+                new LandNodeSnapshot(13, new[] { 12 })
+            });
+            var mLine = new MonsterState { MonsterId = 403, CurrentLandId = 10, FromLandId = -1, FrontNodeIds = new[] { 11 } };
+            var linePlan = MonsterPathEngine.Plan(line, mLine, new List<TrackedPlayer>(), new PlanOptions { MaxSteps = 12 });
+            var deadEnd = linePlan.TileSteps.Single(t => t.LandId == 13);
+            Assert.True(deadEnd.IsDeadEnd);
+            Assert.Equal("终点(3格)", deadEnd.FormatStepBadge());
         }
     }
 }

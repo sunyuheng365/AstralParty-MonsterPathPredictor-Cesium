@@ -109,6 +109,7 @@ namespace MonsterPathPredictor.ReplayCertifier
         public int DownloadFailed;
         public int ParseErrors;
         public int TruncatedOrCorrupt;
+        public int DuplicateReplays;
         public long MissingPredictions;
         public long OutOfSupportPredictions;
         public long IllegalMoveEdges;
@@ -140,6 +141,7 @@ namespace MonsterPathPredictor.ReplayCertifier
             DownloadFailed += other.DownloadFailed;
             ParseErrors += other.ParseErrors;
             TruncatedOrCorrupt += other.TruncatedOrCorrupt;
+            DuplicateReplays += other.DuplicateReplays;
             MissingPredictions += other.MissingPredictions;
             OutOfSupportPredictions += other.OutOfSupportPredictions;
             IllegalMoveEdges += other.IllegalMoveEdges;

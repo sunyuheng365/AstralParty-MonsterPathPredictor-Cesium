@@ -42,34 +42,42 @@ namespace MonsterPathPredictor.ReplayCertifier
             long curTurnActor,
             ref bool thiefStoleOnTile)
         {
-            for (int hop = 0; hop < 16; hop++)
+            // Decouple landing-tile 1096 effect execution from optional MoveS2C echo stripping:
+            // whenever an effect moves u.NodeId (chained self-teleports 2->3->4), ALWAYS continue
+            // consuming pending 1096 effects on the new landing tile even if MoveS2C omitted echoes!
+            for (int hop = 0; hop < 32; hop++)
             {
+                int beforeNode = u.NodeId;
+                int hopsBefore = u.PendingDisplacementHops.Count;
                 ConsumePendingMoveEffects(moverId, u.NodeId, board, pendingMoveEffects, players, monsters, curTurnActor, ref thiefStoleOnTile);
-                if (u.SkillDisplacedToNode < 0 || u.NodeId != u.SkillDisplacedToNode)
-                    break;
 
-                int fromN = u.SkillDisplacedFromNode;
-                int toN = u.SkillDisplacedToNode;
-                bool consumedEcho = false;
-                if (idx + 1 < nodeIds.Length && nodeIds[idx] == fromN && nodeIds[idx + 1] == toN)
+                if (u.PendingDisplacementHops.Count > hopsBefore)
                 {
-                    idx += 2;
-                    consumedEcho = true;
-                }
-                else if (idx < nodeIds.Length && nodeIds[idx] == toN)
-                {
-                    idx += 1;
-                    consumedEcho = true;
+                    bool anyEchoConsumed = false;
+                    for (int h = hopsBefore; h < u.PendingDisplacementHops.Count; h++)
+                    {
+                        var (fromN, toN) = u.PendingDisplacementHops[h];
+                        if (idx + 1 < nodeIds.Length && nodeIds[idx] == fromN && nodeIds[idx + 1] == toN)
+                        {
+                            idx += 2;
+                            anyEchoConsumed = true;
+                        }
+                        else if (idx < nodeIds.Length && nodeIds[idx] == toN)
+                        {
+                            idx += 1;
+                            anyEchoConsumed = true;
+                        }
+                    }
+
+                    // Clear pending hops when consumed inline or when remaining steps exist in this frame;
+                    // preserve them only if we reached the end of this frame so a split follow-up 5028 can strip them.
+                    if (anyEchoConsumed || idx < nodeIds.Length)
+                    {
+                        u.PendingDisplacementHops.Clear();
+                    }
                 }
 
-                // Clear pending echo when consumed inline or when this frame continues with non-echo steps;
-                // preserve it only if we reached the end of this frame so a split follow-up 5028 can strip it.
-                if (consumedEcho || idx < nodeIds.Length)
-                {
-                    u.SkillDisplacedFromNode = -1;
-                    u.SkillDisplacedToNode = -1;
-                }
-                if (!consumedEcho) break;
+                if (u.NodeId == beforeNode) break;
             }
         }
 
@@ -119,10 +127,9 @@ namespace MonsterPathPredictor.ReplayCertifier
             bool isThief = isKnownMonster && m.MonsterType == 1;
             bool isActiveTurnMonster = isKnownMonster && (moverId == curTurnActor);
 
-            // Strip any MoveS2C prefix echoing an exact (From -> To) skill displacement already applied by 1040/1096.Place.
+            // Strip any MoveS2C prefix echoing one or more ordered (From -> To) skill displacements applied by 1040/1096.Place.
             int idx = StripSkillDisplacementPrefix(mover, nodeIds);
-            mover.SkillDisplacedFromNode = -1;
-            mover.SkillDisplacedToNode = -1;
+            mover.PendingDisplacementHops.Clear();
 
             if (idx >= nodeIds.Length)
             {
@@ -158,9 +165,10 @@ namespace MonsterPathPredictor.ReplayCertifier
                 }
                 else if (isKnownMonster && (isNormalAggro || isThief) && isActiveTurnMonster)
                 {
-                    bool thiefStoleHere = isThief && stepped && !foughtOnTile && thiefStoleOnTile;
-                    bool isMidTurnMoving = stepped && !foughtOnTile && !thiefStoleHere;
-                    if (board.IsForkForContext(curTile, fromTile, isMidTurnMoving))
+                    // Directed 2-exit arrival forks remain forks even after combat/steal on that tile;
+                    // combat only changes the exit selection rule (Red > Blue), never whether the decision is scored.
+                    bool arrivedFromEdge = stepped || foughtOnTile;
+                    if (board.IsForkForContext(curTile, fromTile, arrivedFromEdge))
                     {
                         ScoreForkDecision(m, isNormalAggro, isThief, curTile, fromTile, nextTile,
                             replayId, mapId, curRound, fi, board, players, spawnedAtTile,
@@ -198,14 +206,40 @@ namespace MonsterPathPredictor.ReplayCertifier
 
         private static int StripSkillDisplacementPrefix(UnitSim u, int[] nodeIds)
         {
-            if (u.SkillDisplacedToNode < 0 || u.NodeId != u.SkillDisplacedToNode || nodeIds.Length == 0)
+            var hops = u.PendingDisplacementHops;
+            if (hops.Count == 0 || u.NodeId != hops[^1].To || nodeIds.Length == 0)
                 return 0;
-            // Merged or standalone echo [From, To, ...]: strip From so iteration begins cleanly at To (u.NodeId).
-            if (nodeIds.Length >= 2 && nodeIds[0] == u.SkillDisplacedFromNode && nodeIds[1] == u.SkillDisplacedToNode)
-                return nodeIds.Length == 2 ? 2 : 1;
-            if (nodeIds.Length == 1 && nodeIds[0] == u.SkillDisplacedToNode)
-                return 1;
-            return 0;
+
+            // Match either full chained sequence (e.g. hops (1,2),(2,3) -> [1,2,3,...] or disconnected [1,2,5,6,...])
+            // or a single-node landing echo [To] when only 1 hop is pending.
+            int pos = 0;
+            for (int h = 0; h < hops.Count; h++)
+            {
+                var (fromN, toN) = hops[h];
+                if (pos == 0)
+                {
+                    if (nodeIds.Length >= 2 && nodeIds[0] == fromN && nodeIds[1] == toN)
+                        pos = 2;
+                    else if (hops.Count == 1 && nodeIds.Length == 1 && nodeIds[0] == toN)
+                        pos = 1;
+                    else
+                        return 0;
+                }
+                else if (nodeIds[pos - 1] == fromN && pos < nodeIds.Length && nodeIds[pos] == toN)
+                {
+                    pos += 1;
+                }
+                else if (pos + 1 < nodeIds.Length && nodeIds[pos] == fromN && nodeIds[pos + 1] == toN)
+                {
+                    pos += 2;
+                }
+                else
+                {
+                    return 0;
+                }
+            }
+
+            return pos;
         }
 
         private static void ScoreForkDecision(
@@ -423,64 +457,80 @@ namespace MonsterPathPredictor.ReplayCertifier
                 return e.ConditionalProbability > 0.0 ? Math.Log(e.ConditionalProbability) : double.NegativeInfinity;
             }
 
-            positiveExits.Sort((a, b) =>
-            {
-                double diff = b.ConditionalProbability - a.ConditionalProbability;
-                if (Math.Abs(diff) > 1e-9) return diff > 0 ? 1 : -1;
-                if (a.ConditionalProbability < 1e-9 || b.ConditionalProbability < 1e-9)
-                {
-                    double ldiff = EffectiveLogProb(b) - EffectiveLogProb(a);
-                    if (Math.Abs(ldiff) > 1e-6) return ldiff > 0 ? 1 : -1;
-                }
-                int ia = IndexOfNeighbor(rawNeighbors, a.NextLandId);
-                int ib = IndexOfNeighbor(rawNeighbors, b.NextLandId);
-                return ia != ib ? ia.CompareTo(ib) : a.NextLandId.CompareTo(b.NextLandId);
-            });
-
-            // Cluster exits by exact numeric equality (<= 1e-9 in probability, or <= 1e-6 in log-prob when < 1e-9).
-            var clusters = new List<(double Prob, double LogProb, List<ForkExitPrediction> Exits)>();
+            // Compute each exit's OWN context-independent canonical key (equivalence-class grouping — reflexive,
+            // symmetric, transitive, order-independent) so no exit inherits a sibling's probability key and
+            // near-50/50 forks like [0.5000000004, 0.4999999996] NEVER contaminate the exact 2-way "50%" bin.
+            var keyedExits = new List<(ForkExitPrediction Exit, string CanonicalKey, double LogProb)>(positiveExits.Count);
             for (int i = 0; i < positiveExits.Count; i++)
             {
                 var ex = positiveExits[i];
-                double exLog = EffectiveLogProb(ex);
-                bool sameCluster = false;
-                if (clusters.Count > 0)
-                {
-                    var prev = clusters[^1];
-                    if (prev.Prob >= 1e-9 || ex.ConditionalProbability >= 1e-9)
-                        sameCluster = Math.Abs(prev.Prob - ex.ConditionalProbability) <= 1e-9;
-                    else
-                        sameCluster = Math.Abs(prev.LogProb - exLog) <= 1e-6;
-                }
-                if (sameCluster)
-                {
-                    clusters[^1].Exits.Add(ex);
-                }
-                else
-                {
-                    clusters.Add((ex.ConditionalProbability, exLog, new List<ForkExitPrediction> { ex }));
-                }
+                double lp = EffectiveLogProb(ex);
+                keyedExits.Add((ex, FormatCanonicalBaseProbKey(ex.ConditionalProbability, lp), lp));
             }
 
-            string shape = string.Join("/", positiveExits.Select(e => e.FormatConditionalPercent().TrimEnd('%')));
-
-            // Exact 2-way uniform 50/50 gets the dedicated "50%" bin (Red-most reference exit).
-            if (positiveExits.Count == 2 && clusters.Count == 1)
+            keyedExits.Sort((a, b) =>
             {
-                AddCalibrationObs(probBins, "50%", clusters[0].Exits[0], actualNext, shape);
+                int pc = b.Exit.ConditionalProbability.CompareTo(a.Exit.ConditionalProbability);
+                if (pc != 0) return pc;
+                int lc = b.LogProb.CompareTo(a.LogProb);
+                if (lc != 0) return lc;
+                int ia = IndexOfNeighbor(rawNeighbors, a.Exit.NextLandId);
+                int ib = IndexOfNeighbor(rawNeighbors, b.Exit.NextLandId);
+                return ia != ib ? ia.CompareTo(ib) : a.Exit.NextLandId.CompareTo(b.Exit.NextLandId);
+            });
+
+            string shape = string.Join("/", keyedExits.Select(e => e.Exit.FormatConditionalPercent().TrimEnd('%')));
+
+            // Exact 2-way uniform 50/50 ONLY: both exits must map to canonical "50%" AND agree to within 1e-12.
+            if (keyedExits.Count == 2 &&
+                string.Equals(keyedExits[0].CanonicalKey, "50%", StringComparison.Ordinal) &&
+                string.Equals(keyedExits[1].CanonicalKey, "50%", StringComparison.Ordinal) &&
+                Math.Abs(keyedExits[0].Exit.ConditionalProbability - keyedExits[1].Exit.ConditionalProbability) <= 1e-12)
+            {
+                // Reference exit is the Red-most exit in raw board adjacency order.
+                var orderedPair = keyedExits
+                    .OrderBy(k => IndexOfNeighbor(rawNeighbors, k.Exit.NextLandId))
+                    .ThenBy(k => k.Exit.NextLandId)
+                    .ToList();
+                AddCalibrationObs(probBins, "50%", orderedPair[0].Exit, actualNext, shape);
                 return inSupport;
             }
 
-            for (int c = 0; c < clusters.Count; c++)
+            // Group strictly by exact canonical key equality (never by loose non-transitive tolerance).
+            var byKey = new Dictionary<string, List<ForkExitPrediction>>(StringComparer.Ordinal);
+            var keyOrder = new List<string>();
+            for (int i = 0; i < keyedExits.Count; i++)
             {
-                string binKey = FormatCanonicalProbKey(clusters[c].Prob, clusters[c].LogProb, positiveExits.Count);
-                var group = clusters[c].Exits;
+                string baseKey = keyedExits[i].CanonicalKey;
+                if (string.Equals(baseKey, "50%", StringComparison.Ordinal))
+                {
+                    baseKey = $"50%(k={keyedExits.Count})";
+                }
+                if (!byKey.TryGetValue(baseKey, out var grp))
+                {
+                    grp = new List<ForkExitPrediction>();
+                    byKey[baseKey] = grp;
+                    keyOrder.Add(baseKey);
+                }
+                grp.Add(keyedExits[i].Exit);
+            }
+
+            for (int k = 0; k < keyOrder.Count; k++)
+            {
+                string binKey = keyOrder[k];
+                var group = byKey[binKey];
                 if (group.Count == 1)
                 {
                     AddCalibrationObs(probBins, binKey, group[0], actualNext, shape);
                 }
                 else
                 {
+                    group.Sort((a, b) =>
+                    {
+                        int ia = IndexOfNeighbor(rawNeighbors, a.NextLandId);
+                        int ib = IndexOfNeighbor(rawNeighbors, b.NextLandId);
+                        return ia != ib ? ia.CompareTo(ib) : a.NextLandId.CompareTo(b.NextLandId);
+                    });
                     for (int r = 0; r < group.Count; r++)
                     {
                         AddCalibrationObs(probBins, $"{binKey}#{r + 1}", group[r], actualNext, shape);
@@ -491,7 +541,7 @@ namespace MonsterPathPredictor.ReplayCertifier
             return inSupport;
         }
 
-        private static string FormatCanonicalProbKey(double prob, double logProb, int totalPositiveExits)
+        private static string FormatCanonicalBaseProbKey(double prob, double logProb)
         {
             if (prob < 1e-10)
             {
@@ -499,15 +549,10 @@ namespace MonsterPathPredictor.ReplayCertifier
                 return $"exp({roundedLog.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)})";
             }
 
-            // Context-independent canonical percent key quantized to 1e-8% (= 1e-10 probability, 10x finer than
-            // cluster tolerance 1e-9) with trailing zeros trimmed: 0.25 -> "25%", 0.2502 -> "25.02%", 0.50004 -> "50.004%".
+            // Context-independent canonical percent key quantized to 1e-8% (= 1e-10 probability) with trailing zeros trimmed:
+            // 0.25 -> "25%", 0.2000000002 -> "20.00000002%", 0.5000000004 -> "50.00000004%", 0.5 -> "50%".
             double pct = Math.Round(prob * 100.0, 8, MidpointRounding.AwayFromZero);
-            string key = pct.ToString("0.########", System.Globalization.CultureInfo.InvariantCulture) + "%";
-            if (string.Equals(key, "50%", StringComparison.Ordinal))
-            {
-                return $"50%(k={totalPositiveExits})";
-            }
-            return key;
+            return pct.ToString("0.########", System.Globalization.CultureInfo.InvariantCulture) + "%";
         }
 
         private static void AddCalibrationObs(Dictionary<string, ProbBin> probBins, string binKey, ForkExitPrediction exit, int actualNext, string shape)

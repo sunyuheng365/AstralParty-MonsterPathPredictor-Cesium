@@ -50,7 +50,10 @@ namespace MonsterPathPredictor.ReplayCertifier
                     foreach (var prop in mapEl.GetProperty("layouts").EnumerateObject())
                     {
                         if (!int.TryParse(prop.Name, out int sceneId)) continue;
-                        scenes.Add((sceneId, ParseNodes(prop.Value.GetProperty("nodes"))));
+                        var graph = ParseNodes(prop.Value.GetProperty("nodes"));
+                        if (!graph.ActiveNodes().Any())
+                            throw new InvalidDataException($"Map {mapId} layout {sceneId} in \"{jsonPath}\" contains zero active nodes.");
+                        scenes.Add((sceneId, graph));
                     }
                     scenes.Sort((a, b) => a.SceneId.CompareTo(b.SceneId));
                     if (scenes.Count > 0)
@@ -67,8 +70,11 @@ namespace MonsterPathPredictor.ReplayCertifier
                 int mapId = idEl.GetInt32();
                 string name = root.TryGetProperty("name", out var nEl) ? (nEl.GetString() ?? mapId.ToString()) : mapId.ToString();
                 int sceneId = root.TryGetProperty("scene", out var sEl) ? sEl.GetInt32() : 0;
+                var graph = ParseNodes(nodesEl);
+                if (!graph.ActiveNodes().Any())
+                    throw new InvalidDataException($"Map {mapId} layout {sceneId} in \"{jsonPath}\" contains zero active nodes.");
                 _names[mapId] = name;
-                _byMap[mapId] = new List<(int, BoardGraph)> { (sceneId, ParseNodes(nodesEl)) };
+                _byMap[mapId] = new List<(int, BoardGraph)> { (sceneId, graph) };
                 return 1;
             }
 

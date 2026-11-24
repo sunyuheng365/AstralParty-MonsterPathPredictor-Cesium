@@ -901,6 +901,11 @@ namespace MonsterPathPredictor.Tests
             var exitB = fork.Exits.Single(e => e.NextLandId == 3);
             Assert.True(exitB.IsPositiveSupport);
             Assert.Equal("<0.1%", exitB.FormatConditionalPercent());
+
+            // Round 7 (#19): Positive-support underflowed exit 1->3 MUST also propagate into Edges, TileSteps, and Endpoints!
+            Assert.Contains(plan.Edges, e => e.FromLandId == 1 && e.ToLandId == 3);
+            Assert.Contains(plan.TileSteps, ts => ts.LandId == 3 && ts.StepIndex == 1);
+            Assert.Contains(plan.Endpoints, ep => ep.LandId == 3 && ep.StepIndex == 1);
         }
 
         [Fact]
@@ -933,7 +938,7 @@ namespace MonsterPathPredictor.Tests
 
             // Round 6 (#18): (-2^36, 50) -> (2^36, 50) clipped to [0,0,800,100] preserves full 800px segment
             float huge = (float)Math.Pow(2.0, 36);
-            bool okClip = DashGeometry.TryClipSegmentToRect(new Point2(-huge, 50f), new Point2(huge, 50f), 0f, 0f, 800f, 100f, out var ca, out var cb, out _);
+            bool okClip = DashGeometry.TryClipSegmentToRect(new Point2(-huge, 50f), new Point2(huge, 50f), 0f, 0f, 800f, 100f, out var ca, out var cb, out double _);
             Assert.True(okClip);
             Assert.Equal(0f, ca.X, 3);
             Assert.Equal(800f, cb.X, 3);
@@ -952,6 +957,71 @@ namespace MonsterPathPredictor.Tests
             var field = diamondBoard.ComputeShortestPathsTo(9);
             Assert.Equal(8.0, field.GetPathCount(0));
             Assert.Equal(8, (int)field.GetPathCount(0));
+        }
+
+        [Fact]
+        public void Round7CoreRegressions_DirectedPostCombat_StraightMidTurn_UnknownFrom_LinglingDirected_ExtremeClip_DoublePhase()
+        {
+            // Round 7 (#4): Directed 0->1, 1->[2,3], P1 at 1, P2 at 3. Post-combat arrival recomputation at 1
+            // (JustFoughtOnCurrentFork=true, From=0) MUST match long forecast from 0 -> Red(2).
+            var dirBoard = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(0, new[] { 1 }),
+                new LandNodeSnapshot(1, new[] { 2, 3 }),
+                new LandNodeSnapshot(2, Array.Empty<int>()),
+                new LandNodeSnapshot(3, Array.Empty<int>())
+            });
+            var dirPlayers = new List<TrackedPlayer>
+            {
+                new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = 1, IsAlive = true, IsTargetable = true },
+                new TrackedPlayer { PlayerId = 2, Slot = 1, LandId = 3, IsAlive = true, IsTargetable = true }
+            };
+            var longDir = MonsterPathEngine.Plan(dirBoard, new MonsterState { MonsterId = 970, CurrentLandId = 0, FromLandId = -1, FrontNodeIds = new[] { 1 } }, dirPlayers, new PlanOptions { MaxSteps = 2 });
+            var postCombatDir = MonsterPathEngine.Plan(dirBoard, new MonsterState { MonsterId = 970, CurrentLandId = 1, FromLandId = 0, JustFoughtOnCurrentFork = true, HasLaunchedFightThisTurn = true }, dirPlayers, new PlanOptions { MaxSteps = 1 });
+            Assert.Equal(2, longDir.Forks.Single(f => f.ForkLandId == 1).Exits.Single().NextLandId);
+            Assert.Equal(2, postCombatDir.Forks.Single(f => f.ForkLandId == 1).Exits.Single().NextLandId);
+
+            // Round 7 (#8): Lingling 1-hop push 0->1 on directed 0->1, 1->[2,3,4], 2->0:
+            // TryInferForwardArrivalPredecessor(0, 1) MUST return 0 (NOT 2), so Lingling picks Red(2)!
+            var lingBoard = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(0, new[] { 1 }),
+                new LandNodeSnapshot(1, new[] { 2, 3, 4 }),
+                new LandNodeSnapshot(2, new[] { 0 }),
+                new LandNodeSnapshot(3, Array.Empty<int>()),
+                new LandNodeSnapshot(4, Array.Empty<int>())
+            });
+            Assert.True(lingBoard.TryInferForwardArrivalPredecessor(0, 1, out int pred));
+            Assert.Equal(0, pred);
+            var lingPlan = MonsterPathEngine.Plan(lingBoard, new MonsterState { MonsterId = 971, CurrentLandId = 1, SkillMoveKind = SkillMoveKind.LinglingPush, SkillMovePushFromLandId = pred }, new List<TrackedPlayer>(), new PlanOptions { MaxSteps = 1 });
+            Assert.Equal(2, lingPlan.Forks.Single(f => f.ForkLandId == 1).Exits.Single().NextLandId);
+
+            // Round 7 (#9 & #10): Bidirectional straight road 0-1-2:
+            //   #9: At 1, From=0, Front=[0], IsCurrentlyMovingMidTurn=true MUST continue to 2 (no U-turn!).
+            //   #10: At 1, From=-1, Front=[2], IsCurrentlyMovingMidTurn=true with player at 0 MUST follow Front=[2] (NOT treat as directed fork!).
+            var lineBoard = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(0, new[] { 1 }),
+                new LandNodeSnapshot(1, new[] { 0, 2 }),
+                new LandNodeSnapshot(2, new[] { 1 })
+            });
+            var midLine = MonsterPathEngine.Plan(lineBoard, new MonsterState { MonsterId = 972, CurrentLandId = 1, FromLandId = 0, FrontNodeIds = new[] { 0 }, IsCurrentlyMovingMidTurn = true }, new List<TrackedPlayer>(), new PlanOptions { MaxSteps = 1 });
+            Assert.Equal(2, midLine.Edges.Single().ToLandId);
+            var unkFromLine = MonsterPathEngine.Plan(lineBoard, new MonsterState { MonsterId = 973, CurrentLandId = 1, FromLandId = -1, FrontNodeIds = new[] { 2 }, IsCurrentlyMovingMidTurn = true }, new List<TrackedPlayer> { new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = 0, IsAlive = true, IsTargetable = true } }, new PlanOptions { MaxSteps = 1 });
+            Assert.Equal(2, unkFromLine.Edges.Single().ToLandId);
+            Assert.Empty(unkFromLine.Forks);
+
+            // Round 7 (#21): Double-precision dash phase modulo at huge clip distance 67,108,864 px (period=20 -> exact 6.0f, not 4.0f)
+            float phaseBig = DashGeometry.ComputeClippedDashPhase(0.0, 10.0, 67108864.0, 0.0, 20.0);
+            Assert.Equal(6.0f, phaseBig, 3);
+
+            // Round 7 (#22): H = 2^64 diagonal (-H,-H)->(H,H) clipped to [0,800]x[0,100] MUST yield (0,0)->(100,100), NOT (0,0)->(800,0)!
+            float h64 = (float)Math.Pow(2.0, 64);
+            Assert.True(DashGeometry.TryClipSegmentToRect(new Point2(-h64, -h64), new Point2(h64, h64), 0f, 0f, 800f, 100f, out var ca, out var cb, out double _));
+            Assert.Equal(0f, ca.X, 2);
+            Assert.Equal(0f, ca.Y, 2);
+            Assert.Equal(100f, cb.X, 2);
+            Assert.Equal(100f, cb.Y, 2);
         }
     }
 }

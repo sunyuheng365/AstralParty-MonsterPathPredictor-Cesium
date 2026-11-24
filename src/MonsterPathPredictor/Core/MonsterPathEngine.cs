@@ -181,20 +181,21 @@ namespace MonsterPathPredictor.Core
             bool initialCombatState = monster.HasLaunchedFightThisTurn || monster.JustFoughtOnCurrentFork;
             RecordTileStep(tileStepMap, tileStepHasPreCombat, monster.CurrentLandId, step: 0, probability: 1.0, isAfterCombat: initialCombatState);
 
-            var currentLayer = new Dictionary<WalkStateKey, double>
+            var currentLayer = new Dictionary<WalkStateKey, (double Prob, double LogProb)>
             {
-                [new WalkStateKey(monster.CurrentLandId, monster.FromLandId, initialCombatState, -1)] = 1.0
+                [new WalkStateKey(monster.CurrentLandId, monster.FromLandId, initialCombatState, -1)] = (1.0, 0.0)
             };
 
             for (int step = 0; step < maxSteps && currentLayer.Count > 0; step++)
             {
-                var nextLayer = new Dictionary<WalkStateKey, double>();
+                var nextLayer = new Dictionary<WalkStateKey, (double Prob, double LogProb)>();
 
                 foreach (var entry in currentLayer)
                 {
                     var state = entry.Key;
-                    double arrivalProb = entry.Value;
-                    if (arrivalProb <= 0.0) continue;
+                    double arrivalProb = entry.Value.Prob;
+                    double arrivalLogProb = entry.Value.LogProb;
+                    if (double.IsNegativeInfinity(arrivalLogProb)) continue;
                     if (step > 0 && minProb > 0.0 && arrivalProb < minProb)
                     {
                         plan.PrunedProbability += arrivalProb;
@@ -267,7 +268,7 @@ namespace MonsterPathPredictor.Core
 
                     if (outcome.IsForkDecision)
                     {
-                        RecordFork(board, forkMap, state.LandId, state.FromLandId, step, arrivalProb, postCombatNow, clearedMarkLandId, outcome);
+                        RecordFork(board, forkMap, state.LandId, state.FromLandId, step, arrivalProb, arrivalLogProb, postCombatNow, clearedMarkLandId, outcome);
                         if (step == 0 && string.IsNullOrEmpty(plan.HeadlineNote))
                         {
                             plan.HeadlineNote = outcome.SummaryLabel;
@@ -280,10 +281,11 @@ namespace MonsterPathPredictor.Core
 
                     for (int i = 0; i < outcome.Transitions.Count; i++)
                     {
-                        int nextId = outcome.Transitions[i].NextLandId;
-                        double condProb = outcome.Transitions[i].Prob;
-                        double branchProb = arrivalProb * condProb;
-                        if (branchProb <= 0.0) continue;
+                        var tr = outcome.Transitions[i];
+                        int nextId = tr.NextLandId;
+                        double branchLogProb = arrivalLogProb + tr.LogProb;
+                        if (double.IsNegativeInfinity(branchLogProb)) continue;
+                        double branchProb = arrivalProb * tr.Prob;
 
                         var ek = new EdgeKey(state.LandId, nextId);
                         if (!edgeMap.TryGetValue(ek, out var pe))
@@ -317,10 +319,10 @@ namespace MonsterPathPredictor.Core
                         RecordTileStep(tileStepMap, tileStepHasPreCombat, nextId, step + 1, branchProb, postCombatNow);
 
                         var nextKey = new WalkStateKey(nextId, state.LandId, postCombatNow, clearedMarkLandId);
-                        if (nextLayer.TryGetValue(nextKey, out double existing))
-                            nextLayer[nextKey] = existing + branchProb;
+                        if (nextLayer.TryGetValue(nextKey, out var existing))
+                            nextLayer[nextKey] = (existing.Prob + branchProb, BoardGraph.LogAddExp(existing.LogProb, branchLogProb));
                         else
-                            nextLayer[nextKey] = branchProb;
+                            nextLayer[nextKey] = (branchProb, branchLogProb);
                     }
                 }
 
@@ -331,14 +333,15 @@ namespace MonsterPathPredictor.Core
             // and detect final-step dead-ends consistently regardless of whether MaxSteps hit exact length.
             foreach (var finalState in currentLayer)
             {
-                if (finalState.Value <= 0.0) continue;
+                if (double.IsNegativeInfinity(finalState.Value.LogProb)) continue;
+                double finalProb = finalState.Value.Prob;
                 bool stoppedCombat = false;
                 bool afterCombat = finalState.Key.HasEncounteredPlayer;
                 if (maxSteps > 0 && !afterCombat)
                 {
                     if (monster.IsNormalAggressive && combatPlayersByLand.TryGetValue(finalState.Key.LandId, out var endTargets))
                     {
-                        RecordCombat(combatMap, finalState.Key.LandId, maxSteps, finalState.Value, endTargets, isSteal: false);
+                        RecordCombat(combatMap, finalState.Key.LandId, maxSteps, finalProb, endTargets, isSteal: false);
                         afterCombat = true;
                         stoppedCombat = (options.PostCombatMode == PostCombatMode.StopAtFirstCombat);
                     }
@@ -347,7 +350,7 @@ namespace MonsterPathPredictor.Core
                         var stealTargets = FilterStealablePlayers(endStealCandidates);
                         if (stealTargets.Count > 0)
                         {
-                            RecordCombat(combatMap, finalState.Key.LandId, maxSteps, finalState.Value, stealTargets, isSteal: true);
+                            RecordCombat(combatMap, finalState.Key.LandId, maxSteps, finalProb, stealTargets, isSteal: true);
                             afterCombat = true;
                             stoppedCombat = (options.PostCombatMode == PostCombatMode.StopAtFirstCombat);
                         }
@@ -360,7 +363,7 @@ namespace MonsterPathPredictor.Core
                     isDeadEnd = board.GetForwardNeighbors(finalState.Key.LandId, finalState.Key.FromLandId).Count == 0;
                 }
 
-                AccumulateEndpoint(endpointMap, finalState.Key.LandId, maxSteps, isDeadEnd, stoppedCombat, afterCombat, finalState.Value);
+                AccumulateEndpoint(endpointMap, finalState.Key.LandId, maxSteps, isDeadEnd, stoppedCombat, afterCombat, finalProb);
             }
 
             plan.Edges.AddRange(edgeMap.Values);
@@ -443,7 +446,8 @@ namespace MonsterPathPredictor.Core
             int cur = monster.CurrentLandId;
             int from = monster.FromLandId;
             var forward = board.GetForwardNeighbors(cur, from);
-            bool isFork = board.IsForkForContext(cur, from, monster.IsCurrentlyMovingMidTurn);
+            bool arrivedFromEdge = monster.IsCurrentlyMovingMidTurn || monster.JustFoughtOnCurrentFork;
+            bool isFork = board.IsForkForContext(cur, from, arrivedFromEdge);
 
             // 0. Taunt override (嘲讽 — allows overriding facing / U-turning before combat at turn start or forks;
             //    matches DecideMidWalkStep so straight-road continuation past an unattackable taunter never diverges).
@@ -561,11 +565,14 @@ namespace MonsterPathPredictor.Core
             }
 
             // 3. Normal tile (non-fork, at most 1 forward neighbor when moving mid-turn):
-            //    If already moving mid-turn into a dead-end (only neighbor is FromLandId), stop cleanly
-            //    like DecideMidWalkStep even when FrontNodeIds contains FromLandId.
-            if (forward.Count == 0 && monster.IsCurrentlyMovingMidTurn && board.IsValidNeighbor(cur, from))
+            //    When already moving mid-turn from a known incoming edge, honor the unique forward neighbor
+            //    (or dead-end stop) BEFORE consulting FrontNodeIds so a stale Front=[from] cannot trigger a U-turn.
+            if (monster.IsCurrentlyMovingMidTurn && from >= 0 &&
+                (board.IsValidNeighbor(cur, from) || board.IsValidNeighbor(from, cur)))
             {
-                return EmptyOutcome();
+                if (forward.Count == 0) return EmptyOutcome();
+                if (forward.Count == 1)
+                    return SingleTransition(forward[0], isForkDecision: false, ForkReasonKind.MidForkChasePlayer, string.Empty);
             }
 
             if (validFront.Count == 1)
@@ -907,6 +914,7 @@ namespace MonsterPathPredictor.Core
             int incomingLandId,
             int stepIndex,
             double arrivalProb,
+            double arrivalLogProb,
             bool isAfterCombat,
             int clearedMarkLandId,
             StepOutcome outcome)
@@ -949,7 +957,7 @@ namespace MonsterPathPredictor.Core
             double newTotalArrival = oldArrival + arrivalProb;
             pf.ArrivalProbability = Math.Min(1.0, newTotalArrival);
             double oldLogArrival = oldArrival > 0.0 ? Math.Log(oldArrival) : double.NegativeInfinity;
-            double newLogArrival = arrivalProb > 0.0 ? Math.Log(arrivalProb) : double.NegativeInfinity;
+            double newLogArrival = arrivalLogProb;
             double totalLogArrival = BoardGraph.LogAddExp(oldLogArrival, newLogArrival);
 
             var updatedExitIds = new HashSet<int>();

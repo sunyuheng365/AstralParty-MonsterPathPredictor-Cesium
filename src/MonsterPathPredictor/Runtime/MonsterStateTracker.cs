@@ -599,7 +599,7 @@ namespace MonsterPathPredictor.Runtime
                     int actualCombatTile = combatEvt.LandId >= 0
                         ? combatEvt.LandId
                         : ((!isNew && !movedSinceLastSnapshot) ? landId : -1);
-                    if (actualCombatTile >= 0 && board.IsFork(actualCombatTile))
+                    if (actualCombatTile >= 0 && board.IsForkForContext(actualCombatTile, fromLandId, arrivedFromIncomingEdge: true))
                     {
                         mem.JustFoughtOnFork = true;
                         mem.CombatForkLandId = actualCombatTile;
@@ -618,7 +618,7 @@ namespace MonsterPathPredictor.Runtime
                     int actualStealTile = stealEvt.LandId >= 0
                         ? stealEvt.LandId
                         : ((!isNew && !movedSinceLastSnapshot) ? landId : -1);
-                    if (actualStealTile >= 0 && board.IsFork(actualStealTile))
+                    if (actualStealTile >= 0 && board.IsForkForContext(actualStealTile, fromLandId, arrivedFromIncomingEdge: true))
                     {
                         mem.JustFoughtOnFork = true;
                         mem.CombatForkLandId = actualStealTile;
@@ -635,7 +635,7 @@ namespace MonsterPathPredictor.Runtime
                                   mem.JustFoughtOnFork &&
                                   mem.CombatTurnSequence == _turnSequence &&
                                   mem.CombatForkLandId == landId &&
-                                  board.IsFork(landId);
+                                  board.IsForkForContext(landId, fromLandId, arrivedFromIncomingEdge: true);
                 bool isMovingMidTurn = (curActorId == mid) && _activeActorSteppedThisTurn && !justFought;
                 bool launchedFightThisTurn = (curActorId == mid) &&
                                              (SafeIsLaunchFight(pd) || (isThief && mem.StolenTurnSequence == _turnSequence));
@@ -910,59 +910,53 @@ namespace MonsterPathPredictor.Runtime
                 return ExactPlaceLookup.NotFound;
             }
 
-            var pl = list[matchIdx];
-            bool leftAndReturnedInBatch = false;
-            int actualPrevLandId = -1;
-            if (matchIdx > 0)
+            // Sequentially fold entries 0..matchIdx in exact arrival order so multi-event batches
+            // (e.g. [A->F(30601), F->F(ordinary)] or [A->B, B->F(12801)]) match frame-by-frame sampling identically.
+            int simLand = oldLandId;
+            for (int i = 0; i <= matchIdx; i++)
             {
-                for (int i = matchIdx - 1; i >= 0; i--)
-                {
-                    int prevNode = list[i].NewLandId;
-                    if (prevNode >= 0 && prevNode != newLandId)
-                    {
-                        actualPrevLandId = prevNode;
-                        leftAndReturnedInBatch = true;
-                        break;
-                    }
-                }
-            }
-            if (actualPrevLandId < 0)
-            {
-                if (oldLandId >= 0 && oldLandId != newLandId) actualPrevLandId = oldLandId;
-                else if (pl.BackLandId >= 0 && pl.BackLandId != newLandId) actualPrevLandId = pl.BackLandId;
-            }
-
-            // Consume entries 0..matchIdx (retaining any newer ahead-of-visual entries after matchIdx).
-            list.RemoveRange(0, matchIdx + 1);
-            if (list.Count == 0) _pendingPlaceByMonster.Remove(monsterId);
-
-            SkillMoveKind exactKind = IdentifyDisplacementSkill(pl.SkillId, pl.CasterPlayerId, allUnits);
-            if (exactKind == SkillMoveKind.None)
-            {
-                if (leftAndReturnedInBatch || leftPreviousTile)
+                var rec = list[i];
+                int nextLand = rec.NewLandId >= 0 ? rec.NewLandId : newLandId;
+                bool hopChangedTile = (nextLand != simLand);
+                if (hopChangedTile)
                 {
                     mem.SkillMoveKind = SkillMoveKind.None;
                     mem.SkillMoveLandId = -1;
                     mem.SkillMovePushDirId = -1;
                     mem.SkillMovePushFromId = -1;
                 }
-                return ExactPlaceLookup.KnownOtherCause;
+
+                SkillMoveKind kind = IdentifyDisplacementSkill(rec.SkillId, rec.CasterPlayerId, allUnits);
+                if (kind != SkillMoveKind.None)
+                {
+                    bool duplicateSameTileLingling =
+                        !hopChangedTile &&
+                        kind == SkillMoveKind.LinglingPush &&
+                        mem.SkillMoveKind == SkillMoveKind.LinglingPush &&
+                        mem.SkillMoveLandId == nextLand &&
+                        mem.SkillMovePushFromId >= 0;
+
+                    if (!duplicateSameTileLingling)
+                    {
+                        int pushOrigin = hopChangedTile
+                            ? simLand
+                            : (rec.BackLandId >= 0 && rec.BackLandId != nextLand ? rec.BackLandId : -1);
+                        ApplyDisplacementTag(board, mem, kind, pushOrigin, nextLand, rec.CasterPlayerId, playerPositions);
+                    }
+                }
+                // Same-tile ordinary Place (!hopChangedTile && kind == None) intentionally preserves any
+                // already-active skill displacement tag on nextLand (matching two-frame sampling).
+
+                simLand = nextLand;
             }
 
-            bool duplicateSameTileLingling =
-                !leftPreviousTile &&
-                !leftAndReturnedInBatch &&
-                oldLandId == newLandId &&
-                exactKind == SkillMoveKind.LinglingPush &&
-                mem.SkillMoveKind == SkillMoveKind.LinglingPush &&
-                mem.SkillMoveLandId == newLandId &&
-                mem.SkillMovePushFromId >= 0;
+            // Consume entries 0..matchIdx (retaining any newer ahead-of-visual entries after matchIdx).
+            list.RemoveRange(0, matchIdx + 1);
+            if (list.Count == 0) _pendingPlaceByMonster.Remove(monsterId);
 
-            if (!duplicateSameTileLingling)
-            {
-                ApplyDisplacementTag(board, mem, exactKind, actualPrevLandId, newLandId, pl.CasterPlayerId, playerPositions);
-            }
-            return ExactPlaceLookup.TaggedDisplacement;
+            return (mem.SkillMoveKind != SkillMoveKind.None && mem.SkillMoveLandId == newLandId)
+                ? ExactPlaceLookup.TaggedDisplacement
+                : ExactPlaceLookup.KnownOtherCause;
         }
 
         private void TryTagSkillDisplacementFromWindow(
@@ -1085,19 +1079,9 @@ namespace MonsterPathPredictor.Runtime
             }
             if (!board.Contains(origin) || !board.Contains(newLandId)) return;
 
-            var field = board.ComputeShortestPathsTo(origin);
-            int d = field.GetDistance(newLandId);
-            if (d > 0 && d < int.MaxValue)
+            if (board.TryInferForwardArrivalPredecessor(origin, newLandId, out int pred))
             {
-                var neighbors = board.GetValidNeighbors(newLandId);
-                for (int i = 0; i < neighbors.Count; i++)
-                {
-                    if (field.GetDistance(neighbors[i]) == d - 1)
-                    {
-                        pushFromId = neighbors[i];
-                        break;
-                    }
-                }
+                pushFromId = pred;
             }
 
             if (pushFromId >= 0)

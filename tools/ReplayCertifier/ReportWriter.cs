@@ -25,6 +25,19 @@ namespace MonsterPathPredictor.ReplayCertifier
         public double MaxDownloadFailRatio { get; set; } = 0.02;
     }
 
+    public sealed class CalibrationBinRow
+    {
+        public string Bin { get; set; }
+        public long N { get; set; }
+        public double Predicted { get; set; }
+        public double Observed { get; set; }
+        public double Diff { get; set; }
+        public double RawZ { get; set; }
+        public double? JsonZ => double.IsFinite(RawZ) ? RawZ : (double?)null;
+        public string ZStatus => double.IsNaN(RawZ) ? "NaN" : (double.IsPositiveInfinity(RawZ) ? "+Infinity" : (double.IsNegativeInfinity(RawZ) ? "-Infinity" : "finite"));
+        public Dictionary<string, long> Shapes { get; set; }
+    }
+
     public sealed class GateEvaluation
     {
         public GateStatus CoverageGate { get; set; }
@@ -50,8 +63,9 @@ namespace MonsterPathPredictor.ReplayCertifier
         public bool BucketCountsConsistent { get; set; }
         public int EvaluatedBins { get; set; }
         public double WorstAbsZ { get; set; }
+        public int UniqueAttempted { get; set; }
         public double DownloadFailRatio { get; set; }
-        public List<object> CalibrationRows { get; } = new();
+        public List<CalibrationBinRow> CalibrationRows { get; } = new();
     }
 
     public static class ReportWriter
@@ -75,7 +89,10 @@ namespace MonsterPathPredictor.ReplayCertifier
             double? thiefAcc = thiefB.DetTotal > 0 ? (double)thiefB.DetHits / thiefB.DetTotal : (double?)null;
 
             bool bucketCountsConsistent = s.Buckets.Values.All(b => b.Total == b.DetTotal + b.ProbTotal);
-            double dlFailRatio = s.ReplaysAttempted > 0 ? (double)s.DownloadFailed / s.ReplaysAttempted : 1.0;
+            int uniqueAttempted = Math.Max(0, s.ReplaysAttempted - s.DuplicateReplays);
+            double dlFailRatio = uniqueAttempted > 0
+                ? (double)s.DownloadFailed / uniqueAttempted
+                : (s.DownloadFailed > 0 ? 1.0 : (s.ReplaysAttempted > 0 ? 0.0 : 1.0));
 
             bool thresholdsValid =
                 double.IsFinite(t.MinDetAccuracy) && t.MinDetAccuracy >= 0.0 && t.MinDetAccuracy <= 1.0 &&
@@ -87,10 +104,10 @@ namespace MonsterPathPredictor.ReplayCertifier
                 t.MinCalibratedBins >= 0;
 
             bool hasHardIntegrityFailure =
-                s.MissingMap > 0 || s.ParseErrors > 0 || s.TruncatedOrCorrupt > 0 ||
+                s.MissingMap > 0 || s.ParseErrors > 0 || s.TruncatedOrCorrupt > 0 || s.DuplicateReplays > 0 ||
                 s.MissingPredictions > 0 || s.OutOfSupportPredictions > 0 || s.IllegalMoveEdges > 0 ||
                 !bucketCountsConsistent ||
-                (s.ReplaysAttempted > 0 && dlFailRatio > t.MaxDownloadFailRatio);
+                (uniqueAttempted > 0 && dlFailRatio > t.MaxDownloadFailRatio);
 
             GateStatus coverageGate;
             if (!thresholdsValid || hasHardIntegrityFailure)
@@ -131,6 +148,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                 ThiefProbTotal = thiefB.ProbTotal,
                 ThiefAccuracy = thiefAcc,
                 BucketCountsConsistent = bucketCountsConsistent,
+                UniqueAttempted = uniqueAttempted,
                 DownloadFailRatio = dlFailRatio
             };
 
@@ -145,10 +163,19 @@ namespace MonsterPathPredictor.ReplayCertifier
                 if (pb.Opp >= 30)
                 {
                     evaluatedBins++;
-                    if (Math.Abs(z) > worstZ) worstZ = Math.Abs(z);
+                    if (double.IsNaN(z) || Math.Abs(z) > worstZ) worstZ = Math.Abs(z);
                     if (!double.IsFinite(z) || !double.IsFinite(t.MaxAbsZ) || Math.Abs(z) > t.MaxAbsZ) calibOk = false;
                 }
-                eval.CalibrationRows.Add(new { bin = kv.Key, n = pb.Opp, predicted = pred, observed = obs, diff = obs - pred, z, shapes = pb.Shapes });
+                eval.CalibrationRows.Add(new CalibrationBinRow
+                {
+                    Bin = kv.Key,
+                    N = pb.Opp,
+                    Predicted = pred,
+                    Observed = obs,
+                    Diff = obs - pred,
+                    RawZ = z,
+                    Shapes = pb.Shapes
+                });
             }
 
             eval.EvaluatedBins = evaluatedBins;
@@ -324,13 +351,10 @@ namespace MonsterPathPredictor.ReplayCertifier
             }
 
             Console.WriteLine("\n=== PROBABILISTIC BRANCH CALIBRATION (n >= 20) ===");
-            foreach (var kv in s.ProbBins.OrderByDescending(k => k.Value.Opp))
+            foreach (var row in eval.CalibrationRows)
             {
-                var pb = kv.Value;
-                if (pb.Opp < 20) continue;
-                double p = pb.SumPred / pb.Opp, obs = (double)pb.Chosen / pb.Opp;
-                double z = Math.Sqrt(p * (1 - p) / pb.Opp) is double se && se > 0 ? (obs - p) / se : 0;
-                Console.WriteLine($"  Bin {kv.Key,-8}: n={pb.Opp,6:N0} | Pred={p * 100,6:F2}% | Obs={obs * 100,6:F2}% | Diff={(obs - p) * 100:+0.00;-0.00;0.00}% | z={z:+0.00;-0.00;0.00}");
+                string zText = double.IsFinite(row.RawZ) ? row.RawZ.ToString("+0.00;-0.00;0.00", System.Globalization.CultureInfo.InvariantCulture) : row.ZStatus;
+                Console.WriteLine($"  Bin {row.Bin,-8}: n={row.N,6:N0} | Pred={row.Predicted * 100,6:F2}% | Obs={row.Observed * 100,6:F2}% | Diff={row.Diff * 100:+0.00;-0.00;0.00}% | z={zText}");
             }
 
             var fa = s.FrontAudit;
@@ -358,7 +382,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                     generatedAtUtc = DateTime.UtcNow.ToString("O"),
                     passed,
                     elapsedSeconds = Math.Round(elapsedSec, 2),
-                    replays = new { s.ReplaysAttempted, s.ReplaysVerified, s.SkippedNonPve, s.MissingMap, s.DownloadFailed, s.TruncatedOrCorrupt, s.ParseErrors, s.MissingPredictions, s.OutOfSupportPredictions, s.IllegalMoveEdges },
+                    replays = new { s.ReplaysAttempted, uniqueAttempted = eval.UniqueAttempted, s.DuplicateReplays, s.ReplaysVerified, s.SkippedNonPve, s.MissingMap, s.DownloadFailed, s.TruncatedOrCorrupt, s.ParseErrors, s.MissingPredictions, s.OutOfSupportPredictions, s.IllegalMoveEdges },
                     gates = new
                     {
                         coverageGate = FormatGate(eval.CoverageGate),
@@ -368,7 +392,8 @@ namespace MonsterPathPredictor.ReplayCertifier
                         minDetAcc = t.MinDetAccuracy,
                         minThiefAcc = t.MinThiefAccuracy,
                         maxAbsZ = t.MaxAbsZ,
-                        worstAbsZ = worstZ,
+                        worstAbsZ = double.IsFinite(worstZ) ? worstZ : (double?)null,
+                        worstAbsZStatus = double.IsNaN(worstZ) ? "NaN" : (double.IsPositiveInfinity(worstZ) ? "+Infinity" : "finite"),
                         evaluatedBins = eval.EvaluatedBins
                     },
                     aggressiveDeterministic = new { hits = aggroDetHits, total = aggroDetTotal, accuracy = aggroAcc, wilson95Low = wLow, wilson95High = wHigh },
@@ -387,7 +412,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                         samples = b.Mismatches.Take(15)
                     }),
                     byMap = s.ByMap.OrderBy(k => k.Key).Select(k => new { mapId = k.Key, mapName = catalog.GetMapName(k.Key), k.Value.Replays, k.Value.DetHits, k.Value.DetTotal, k.Value.ProbTotal, k.Value.ThiefDetHits, k.Value.ThiefDetTotal, k.Value.ThiefProbTotal }),
-                    calibration = eval.CalibrationRows,
+                    calibration = eval.CalibrationRows.Select(r => new { bin = r.Bin, n = r.N, predicted = r.Predicted, observed = r.Observed, diff = r.Diff, z = r.JsonZ, zStatus = r.ZStatus, shapes = r.Shapes }),
                     frontAudit = fa
                 };
                 WriteTextAtomic(jsonOut, JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true }));

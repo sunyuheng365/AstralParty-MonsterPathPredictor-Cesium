@@ -349,6 +349,13 @@ namespace MonsterPathPredictor.ReplayCertifier
             replayIds = replayIds.Distinct(StringComparer.Ordinal).ToList();
             if (limit > 0 && replayIds.Count > limit) replayIds = replayIds.Take(limit).ToList();
 
+            if (!string.IsNullOrWhiteSpace(cacheDir) &&
+                HasCacheInputPathConflict(replayIds, cacheDir, corpusFile, mapFiles, out string cacheConflictErr))
+            {
+                Console.Error.WriteLine(cacheConflictErr);
+                return 1;
+            }
+
             if (saveCache && !string.IsNullOrWhiteSpace(cacheDir)) Directory.CreateDirectory(cacheDir);
 
             Console.WriteLine($"Loaded {catalog.MapCount} official PVE maps. Certifying {replayIds.Count:N0} replays (concurrency={concurrency}, stream-only={!saveCache})...");
@@ -360,28 +367,52 @@ namespace MonsterPathPredictor.ReplayCertifier
             var perReplay = new ConcurrentBag<CertificationSummary>();
             var cacheSeenSha = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
             var cacheSeenVerifiedId = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
+            var recoveryQueue = new ConcurrentBag<(string Id, string SavePath, CertificationSummary CorruptLocal)>();
             int processed = 0, cacheHits = 0, streamed = 0;
 
-            Task<(byte[] Bytes, bool ReceivedCorruptPayload)> DownloadReplayAsync(string id, CancellationToken ct)
+            Task<(byte[] Bytes, CertificationSummary Eval, bool ReceivedCorruptPayload)> DownloadAndEvalAsync(string id, CancellationToken ct)
             {
                 string[] urls = cdnBase.Contains("sereplaycn", StringComparison.OrdinalIgnoreCase)
                     ? new[] { cdnBase + id, "https://sereplayjp.feimogames.com/prod/" + id }
                     : new[] { cdnBase + id };
-                return DownloadReplayFromUrlsAsync(
+                return DownloadAndEvaluateFromUrlsAsync(
                     client,
                     urls,
-                    fetched => ReplayEvaluator.HasValidFrameStream(fetched, decoder, id),
+                    fetched => SafeEvaluateReplay(id, fetched, decoder, catalog),
                     () => Interlocked.Increment(ref streamed),
                     ct);
             }
 
-            async ValueTask ProcessOneAsync(string id, CancellationToken ct)
+            void ReportProgress()
             {
-                byte[] bytes = null;
-                bool loadedFromCache = false;
-                bool hadCorruptLocalFile = false;
-                bool receivedCorruptRemote = false;
+                int done = Interlocked.Increment(ref processed);
+                if (done % 250 == 0 || done == replayIds.Count)
+                    Console.WriteLine($"  progress: {done:N0}/{replayIds.Count:N0} ({sw.Elapsed.TotalSeconds:F1}s | cached={cacheHits:N0}, streamed={streamed:N0})");
+            }
+
+            void TryPublishCacheIfUnique(string savePath, byte[] bytes, CertificationSummary local)
+            {
+                if (!IsCacheableAndClean(local)) return;
+                bool unique = true;
+                if (!string.IsNullOrEmpty(local.ContentSha256) && !cacheSeenSha.TryAdd(local.ContentSha256, 0))
+                    unique = false;
+                if (unique && !string.IsNullOrEmpty(local.VerifiedReplayId) && !cacheSeenVerifiedId.TryAdd(local.VerifiedReplayId, 0))
+                    unique = false;
+                if (saveCache && savePath != null && unique)
+                {
+                    TryWriteCacheAtomic(savePath, bytes);
+                }
+            }
+
+            // Phase 1: Read and register ALL existing local cached files first (no recovery writes yet),
+            // so healthy local caches always register their SHA-256 / VerifiedReplayId BEFORE any corrupt
+            // cache recovery or new download can publish a duplicate file to disk.
+            async ValueTask ReadLocalCachePhaseAsync(string id, CancellationToken ct)
+            {
                 string cachedPath = ResolveCachedReplayPath(cacheDir, id);
+                string savePath = ResolveSaveCachePath(cacheDir, id, cachedPath);
+                byte[] bytes = null;
+                bool hadCorruptLocalFile = false;
                 if (cachedPath != null)
                 {
                     try
@@ -394,87 +425,84 @@ namespace MonsterPathPredictor.ReplayCertifier
                         }
                         else
                         {
-                            loadedFromCache = true;
                             Interlocked.Increment(ref cacheHits);
                         }
                     }
                     catch (Exception ex)
                     {
                         Console.Error.WriteLine($"WARN: Failed to read cache file {cachedPath}: {ex.Message}");
+                        hadCorruptLocalFile = true;
                     }
                 }
-                string savePath = ResolveSaveCachePath(cacheDir, id, cachedPath);
 
                 if (bytes == null)
                 {
-                    (bytes, receivedCorruptRemote) = await DownloadReplayAsync(id, ct);
-                }
-
-                CertificationSummary local;
-                if (bytes == null)
-                {
-                    local = (hadCorruptLocalFile || receivedCorruptRemote)
+                    var corruptLocal = hadCorruptLocalFile
                         ? new CertificationSummary { ReplaysAttempted = 1, RequestedReplayId = id, TruncatedOrCorrupt = 1 }
-                        : new CertificationSummary { ReplaysAttempted = 1, RequestedReplayId = id, DownloadFailed = 1 };
+                        : null;
+                    recoveryQueue.Add((id, savePath, corruptLocal));
+                    return;
                 }
-                else
+
+                var local = SafeEvaluateReplay(id, bytes, decoder, catalog);
+                if (NeedsCacheRecovery(local))
                 {
-                    local = SafeEvaluateReplay(id, bytes, decoder, catalog);
+                    recoveryQueue.Add((id, savePath, local));
+                    return;
+                }
 
-                    // If an existing cached file has a stream integrity error (corrupt/parse-error/illegal move edges),
-                    // allow ONE automatic CDN recovery attempt. Adopt clean diagnostic results (including valid MissingMap)
-                    // separately from deciding whether to publish/overwrite the cache file.
-                    if (loadedFromCache && NeedsCacheRecovery(local))
-                    {
-                        var (refreshed, _) = await DownloadReplayAsync(id, ct);
-                        if (refreshed != null)
-                        {
-                            var refreshedResult = SafeEvaluateReplay(id, refreshed, decoder, catalog);
-                            if (ShouldAdoptRecoveryResult(refreshedResult))
-                            {
-                                bytes = refreshed;
-                                local = refreshedResult;
-                                loadedFromCache = false; // Eligible for cache publish below ONLY if IsCacheableAndClean
-                            }
-                        }
-                    }
-
-                    // Register verified/non-PVE stream identity for cache dedup, and atomically publish ONLY
-                    // clean non-duplicate streams (never persist TruncatedOrCorrupt, ParseErrors, MissingMap,
-                    // IllegalMoveEdges > 0, or duplicate replay copies).
-                    if (IsCacheableAndClean(local))
-                    {
-                        bool uniqueForCache = true;
-                        if (!string.IsNullOrEmpty(local.ContentSha256) && !cacheSeenSha.TryAdd(local.ContentSha256, 0))
-                            uniqueForCache = false;
-                        if (uniqueForCache && !string.IsNullOrEmpty(local.VerifiedReplayId) && !cacheSeenVerifiedId.TryAdd(local.VerifiedReplayId, 0))
-                            uniqueForCache = false;
-                        if (!loadedFromCache && saveCache && savePath != null && uniqueForCache)
-                        {
-                            TryWriteCacheAtomic(savePath, bytes);
-                        }
-                    }
+                if (IsCacheableAndClean(local))
+                {
+                    if (!string.IsNullOrEmpty(local.ContentSha256)) cacheSeenSha.TryAdd(local.ContentSha256, 0);
+                    if (!string.IsNullOrEmpty(local.VerifiedReplayId)) cacheSeenVerifiedId.TryAdd(local.VerifiedReplayId, 0);
                 }
 
                 perReplay.Add(local);
-                int done = Interlocked.Increment(ref processed);
-                if (done % 250 == 0 || done == replayIds.Count)
-                    Console.WriteLine($"  progress: {done:N0}/{replayIds.Count:N0} ({sw.Elapsed.TotalSeconds:F1}s | cached={cacheHits:N0}, streamed={streamed:N0})");
+                ReportProgress();
             }
 
-            // When --save-cache is active, evaluate already-cached IDs first so their SHA-256 and canonical
-            // VerifiedReplayId are registered BEFORE any newly downloaded duplicate ID can be written to disk.
-            if (saveCache && !string.IsNullOrWhiteSpace(cacheDir))
+            // Phase 2: Download uncached IDs and attempt ONE automatic CDN recovery for corrupt cached files,
+            // with full semantic evaluation inside the CDN fallback loop and post-registration cache dedup.
+            async ValueTask DownloadOrRecoverPhaseAsync((string Id, string SavePath, CertificationSummary CorruptLocal) item, CancellationToken ct)
             {
-                var (cachedIds, uncachedIds) = PartitionByCachePresence(replayIds, cacheDir);
-                if (cachedIds.Count > 0)
-                    await Parallel.ForEachAsync(cachedIds, new ParallelOptions { MaxDegreeOfParallelism = concurrency }, ProcessOneAsync);
-                if (uncachedIds.Count > 0)
-                    await Parallel.ForEachAsync(uncachedIds, new ParallelOptions { MaxDegreeOfParallelism = concurrency }, ProcessOneAsync);
+                var (bytes, eval, receivedCorruptRemote) = await DownloadAndEvalAsync(item.Id, ct);
+                CertificationSummary finalLocal;
+                if (bytes != null && eval != null && ShouldAdoptRecoveryResult(eval))
+                {
+                    finalLocal = eval;
+                    TryPublishCacheIfUnique(item.SavePath, bytes, finalLocal);
+                }
+                else if (item.CorruptLocal != null)
+                {
+                    finalLocal = item.CorruptLocal;
+                }
+                else if (eval != null)
+                {
+                    finalLocal = eval;
+                }
+                else
+                {
+                    finalLocal = receivedCorruptRemote
+                        ? new CertificationSummary { ReplaysAttempted = 1, RequestedReplayId = item.Id, TruncatedOrCorrupt = 1 }
+                        : new CertificationSummary { ReplaysAttempted = 1, RequestedReplayId = item.Id, DownloadFailed = 1 };
+                }
+
+                perReplay.Add(finalLocal);
+                ReportProgress();
             }
-            else
+
+            var (cachedIds, uncachedIds) = PartitionByCachePresence(replayIds, cacheDir);
+            if (cachedIds.Count > 0)
             {
-                await Parallel.ForEachAsync(replayIds, new ParallelOptions { MaxDegreeOfParallelism = concurrency }, ProcessOneAsync);
+                await Parallel.ForEachAsync(cachedIds, new ParallelOptions { MaxDegreeOfParallelism = concurrency }, ReadLocalCachePhaseAsync);
+            }
+            foreach (string id in uncachedIds)
+            {
+                recoveryQueue.Add((id, ResolveSaveCachePath(cacheDir, id, null), null));
+            }
+            if (!recoveryQueue.IsEmpty)
+            {
+                await Parallel.ForEachAsync(recoveryQueue, new ParallelOptions { MaxDegreeOfParallelism = concurrency }, DownloadOrRecoverPhaseAsync);
             }
 
             sw.Stop();
@@ -482,6 +510,53 @@ namespace MonsterPathPredictor.ReplayCertifier
 
             bool passed = ReportWriter.PrintAndExport(total, catalog, sw.Elapsed.TotalSeconds, thresholds, jsonOut, mdOut);
             return passed ? 0 : 2;
+        }
+
+        public static bool HasCacheInputPathConflict(
+            IEnumerable<string> replayIds,
+            string cacheDir,
+            string corpusFile,
+            IReadOnlyList<string> mapFiles,
+            out string error)
+        {
+            error = null;
+            if (string.IsNullOrWhiteSpace(cacheDir) || replayIds == null) return false;
+
+            var inputPaths = new List<string>();
+            if (!string.IsNullOrWhiteSpace(corpusFile)) inputPaths.Add(corpusFile);
+            if (mapFiles != null)
+            {
+                for (int i = 0; i < mapFiles.Count; i++)
+                {
+                    if (!string.IsNullOrWhiteSpace(mapFiles[i])) inputPaths.Add(mapFiles[i]);
+                }
+            }
+            if (inputPaths.Count == 0) return false;
+
+            var cmp = (OperatingSystem.IsWindows() || OperatingSystem.IsMacOS())
+                ? StringComparer.OrdinalIgnoreCase
+                : StringComparer.Ordinal;
+            var inputCanon = new HashSet<string>(cmp);
+            for (int i = 0; i < inputPaths.Count; i++)
+            {
+                string canon = ReportWriter.ResolveCanonicalPath(inputPaths[i]);
+                if (!string.IsNullOrEmpty(canon)) inputCanon.Add(canon);
+            }
+
+            foreach (string id in replayIds)
+            {
+                string existing = ResolveCachedReplayPath(cacheDir, id);
+                string savePath = ResolveSaveCachePath(cacheDir, id, existing);
+                string canonExisting = ReportWriter.ResolveCanonicalPath(existing);
+                string canonSave = ReportWriter.ResolveCanonicalPath(savePath);
+                if ((!string.IsNullOrEmpty(canonExisting) && inputCanon.Contains(canonExisting)) ||
+                    (!string.IsNullOrEmpty(canonSave) && inputCanon.Contains(canonSave)))
+                {
+                    error = $"ERROR: Replay cache path for ID \"{id}\" conflicts with an input file (--corpus / --maps).";
+                    return true;
+                }
+            }
+            return false;
         }
 
         public static bool NeedsCacheRecovery(CertificationSummary s)
@@ -511,6 +586,53 @@ namespace MonsterPathPredictor.ReplayCertifier
                 else uncached.Add(replayIds[i]);
             }
             return (cached, uncached);
+        }
+
+        public static async Task<(byte[] Bytes, CertificationSummary Eval, bool ReceivedCorruptPayload)> DownloadAndEvaluateFromUrlsAsync(
+            HttpClient client,
+            IReadOnlyList<string> urls,
+            Func<byte[], CertificationSummary> evaluatePayload,
+            Action onStreamedSuccess,
+            CancellationToken ct)
+        {
+            bool receivedCorrupt = false;
+            CertificationSummary lastCorruptEval = null;
+
+            for (int u = 0; u < urls.Count; u++)
+            {
+                string url = urls[u];
+                for (int attempt = 0; attempt < 2; attempt++)
+                {
+                    try
+                    {
+                        using var resp = await client.GetAsync(url, ct);
+                        if (resp.StatusCode == System.Net.HttpStatusCode.NotFound)
+                        {
+                            break;
+                        }
+                        resp.EnsureSuccessStatusCode();
+                        byte[] fetched = await resp.Content.ReadAsByteArrayAsync(ct);
+                        var eval = evaluatePayload(fetched);
+                        if (ShouldAdoptRecoveryResult(eval))
+                        {
+                            onStreamedSuccess?.Invoke();
+                            return (fetched, eval, false);
+                        }
+                        receivedCorrupt = true;
+                        lastCorruptEval = eval;
+                        if (attempt < 1) await Task.Delay(150 * (attempt + 1), ct);
+                    }
+                    catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+                    {
+                        break;
+                    }
+                    catch
+                    {
+                        if (attempt < 1) await Task.Delay(250 * (attempt + 1), ct);
+                    }
+                }
+            }
+            return (null, lastCorruptEval, receivedCorrupt);
         }
 
         public static async Task<(byte[] Bytes, bool ReceivedCorruptPayload)> DownloadReplayFromUrlsAsync(
@@ -583,7 +705,8 @@ namespace MonsterPathPredictor.ReplayCertifier
                         total.MergeFrom(new CertificationSummary
                         {
                             ReplaysAttempted = item.ReplaysAttempted > 0 ? item.ReplaysAttempted : 1,
-                            TruncatedOrCorrupt = 1
+                            TruncatedOrCorrupt = 1,
+                            DuplicateReplays = 1
                         });
                         continue;
                     }

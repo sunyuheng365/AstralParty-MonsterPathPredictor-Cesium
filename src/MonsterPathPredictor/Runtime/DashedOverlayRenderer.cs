@@ -183,9 +183,13 @@ namespace MonsterPathPredictor.Runtime
 
             // 2. Animated forward-marching dashed lines for all predicted edges:
             //    first clip 3D segment against camera near plane (so edges partially behind the camera stay visible),
-            //    then project unclipped to screen space, clip 2D against viewport, and preserve exact original dash phase.
+            //    then project unclipped to screen space (using an inclusive depth floor strictly below nearClipDist
+            //    so near-plane-clipped endpoints are NEVER rejected), clip 2D against viewport, and preserve exact
+            //    static dash phase in double precision.
+            const float MinProjectDepth = 0.01f;
             float nearClipDist = 0.15f;
-            try { nearClipDist = Math.Max(0.1f, camera.nearClipPlane + 0.01f); } catch { }
+            try { nearClipDist = Math.Max(0.12f, camera.nearClipPlane + 0.02f); } catch { }
+            double dashPeriod = (double)settings.DashLength + Math.Max(0.0, settings.GapLength);
 
             for (int i = 0; i < plan.Edges.Count; i++)
             {
@@ -212,7 +216,7 @@ namespace MonsterPathPredictor.Runtime
                 }
                 else
                 {
-                    if (!TryProjectWorldUnclipped(layer, camera, camPos, camForward, new Vector3(cax, cay, caz), out pFrom)) continue;
+                    if (!TryProjectWorldUnclipped(layer, camera, camPos, camForward, new Vector3(cax, cay, caz), out pFrom, MinProjectDepth)) continue;
                 }
 
                 if (!clippedNearEnd)
@@ -221,11 +225,11 @@ namespace MonsterPathPredictor.Runtime
                 }
                 else
                 {
-                    if (!TryProjectWorldUnclipped(layer, camera, camPos, camForward, new Vector3(cbx, cby, cbz), out pTo)) continue;
+                    if (!TryProjectWorldUnclipped(layer, camera, camPos, camForward, new Vector3(cbx, cby, cbz), out pTo, MinProjectDepth)) continue;
                 }
 
                 if (!DashGeometry.TryClipSegmentToRect(pFrom, pTo, -40f, -40f, layer.width + 40f, layer.height + 40f,
-                        out var clipFrom, out var clipTo, out float clippedFromStartPx))
+                        out var clipFrom, out var clipTo, out double clippedFromStartPx))
                     continue;
 
                 Color color = PickEdgeColor(edge.Probability, edge.IsAfterCombat);
@@ -234,13 +238,16 @@ namespace MonsterPathPredictor.Runtime
                     ? baseWidth
                     : Math.Max(2.0f, baseWidth * (0.65f + 0.35f * (float)edge.Probability));
 
-                float origTrimStart = clippedNearStart ? 0f : (edge.EarliestStep == 0 ? 10f : 3f);
-                float origTrimEnd = clippedNearEnd ? 0f : 3f;
-                float trimStart = Math.Max(0f, origTrimStart - clippedFromStartPx);
-                float fullEdgeLen = pFrom.DistanceTo(pTo);
-                float clippedEndPx = Math.Max(0f, fullEdgeLen - clippedFromStartPx - clipFrom.DistanceTo(clipTo));
-                float trimEnd = Math.Max(0f, origTrimEnd - clippedEndPx);
-                float clippedPhase = DashGeometry.ComputeClippedDashPhase(phaseOffset, origTrimStart, clippedFromStartPx, trimStart);
+                double origTrimStart = clippedNearStart ? 0.0 : (edge.EarliestStep == 0 ? 10.0 : 3.0);
+                double origTrimEnd = clippedNearEnd ? 0.0 : 3.0;
+                double trimStart = Math.Max(0.0, origTrimStart - clippedFromStartPx);
+                double fullEdgeLen = Math.Sqrt(((double)pTo.X - pFrom.X) * ((double)pTo.X - pFrom.X) +
+                                               ((double)pTo.Y - pFrom.Y) * ((double)pTo.Y - pFrom.Y));
+                double clipLen = Math.Sqrt(((double)clipTo.X - clipFrom.X) * ((double)clipTo.X - clipFrom.X) +
+                                           ((double)clipTo.Y - clipFrom.Y) * ((double)clipTo.Y - clipFrom.Y));
+                double clippedEndPx = Math.Max(0.0, fullEdgeLen - clippedFromStartPx - clipLen);
+                double trimEnd = Math.Max(0.0, origTrimEnd - clippedEndPx);
+                float clippedPhase = DashGeometry.ComputeClippedDashPhase(phaseOffset, origTrimStart, clippedFromStartPx, trimStart, dashPeriod);
 
                 DashGeometry.BuildDashedSegmentsInto(
                     _dashQuadBuf,
@@ -248,8 +255,8 @@ namespace MonsterPathPredictor.Runtime
                     settings.DashLength,
                     settings.GapLength,
                     width,
-                    trimStart: trimStart,
-                    trimEnd: trimEnd,
+                    trimStart: (float)trimStart,
+                    trimEnd: (float)trimEnd,
                     phaseOffset: clippedPhase);
 
                 for (int q = 0; q < _dashQuadBuf.Count; q++)
@@ -478,10 +485,11 @@ namespace MonsterPathPredictor.Runtime
             Vector3 camPos,
             Vector3 camForward,
             Vector3 world,
-            out Point2 pt)
+            out Point2 pt,
+            float minDepth = 0.01f)
         {
             pt = default;
-            if (Vector3.Dot(world - camPos, camForward) <= 0.1f) return false;
+            if (Vector3.Dot(world - camPos, camForward) < minDepth) return false;
             Vector2 local = layer.WorldToLocal(world, camera);
             if (float.IsNaN(local.x) || float.IsInfinity(local.x) || float.IsNaN(local.y) || float.IsInfinity(local.y))
                 return false;

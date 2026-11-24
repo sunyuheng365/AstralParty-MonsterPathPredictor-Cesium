@@ -8,7 +8,7 @@ $modProj = Join-Path $root "src\MonsterPathPredictor\MonsterPathPredictor.csproj
 $testProj = Join-Path $root "tests\MonsterPathPredictor.Tests\MonsterPathPredictor.Tests.csproj"
 $manifestPath = Join-Path $root "src\MonsterPathPredictor\MonsterPathPredictor.json"
 
-$manifest = Get-Content $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $modId = $manifest.id
 $version = $manifest.version
 
@@ -22,7 +22,7 @@ if ($LASTEXITCODE -ne 0) { throw "Mod build failed." }
 
 $binDir = Join-Path $root "src\MonsterPathPredictor\bin\$Configuration\netstandard2.0"
 $distDir = Join-Path $root "dist"
-New-Item -ItemType Directory -Force -Path $distDir | Out-Null
+[System.IO.Directory]::CreateDirectory($distDir) | Out-Null
 
 $stageRoot = Join-Path $distDir ("stage-" + [Guid]::NewGuid().ToString("N").Substring(0, 12))
 $stageModDir = Join-Path $stageRoot $modId
@@ -34,18 +34,18 @@ Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 try {
-    New-Item -ItemType Directory -Force -Path $stageModDir | Out-Null
+    [System.IO.Directory]::CreateDirectory($stageModDir) | Out-Null
 
     $requiredFiles = @("$modId.dll", "$modId.json", "config.json")
     foreach ($rf in $requiredFiles) {
         $src = Join-Path $binDir $rf
-        if (-not (Test-Path $src)) { throw "Required package file missing: $src" }
-        Copy-Item $src $stageModDir -Force
+        if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { throw "Required package file missing: $src" }
+        Copy-Item -LiteralPath $src -Destination (Join-Path $stageModDir $rf) -Force
     }
 
     $archive = [System.IO.Compression.ZipFile]::Open($tmpZipPath, [System.IO.Compression.ZipArchiveMode]::Create)
     try {
-        foreach ($file in Get-ChildItem -File $stageModDir) {
+        foreach ($file in Get-ChildItem -LiteralPath $stageModDir -File) {
             $entryName = "$modId/$($file.Name)"
             [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $file.FullName, $entryName, [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
         }
@@ -80,11 +80,11 @@ try {
         }
     }
 } finally {
-    if (Test-Path $tmpZipPath) { Remove-Item $tmpZipPath -Force -ErrorAction SilentlyContinue }
-    if (Test-Path $bakZipPath) { Remove-Item $bakZipPath -Force -ErrorAction SilentlyContinue }
-    if (Test-Path $stageRoot) { Remove-Item $stageRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    if (Test-Path -LiteralPath $tmpZipPath) { Remove-Item -LiteralPath $tmpZipPath -Force -ErrorAction SilentlyContinue }
+    if (Test-Path -LiteralPath $bakZipPath) { Remove-Item -LiteralPath $bakZipPath -Force -ErrorAction SilentlyContinue }
+    if (Test-Path -LiteralPath $stageRoot) { Remove-Item -LiteralPath $stageRoot -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
 Write-Host "=== Package created ==="
 Write-Host $zipPath
-Get-Item $zipPath | Select-Object Name, Length
+Get-Item -LiteralPath $zipPath | Select-Object Name, Length

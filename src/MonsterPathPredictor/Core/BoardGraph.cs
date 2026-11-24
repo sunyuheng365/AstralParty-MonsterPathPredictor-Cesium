@@ -175,14 +175,68 @@ namespace MonsterPathPredictor.Core
         public bool IsFork(int landId) => GetValidNeighbors(landId).Count >= 3;
 
         /// <summary>
-        /// Context-aware fork predicate shared by planning and replay certification:
-        /// true on standard junctions (&gt;= 3 neighbors) AND on directed mid-turn splits where
-        /// arriving from <paramref name="fromLandId"/> leaves at least 2 forward exits.
+        /// Context-aware fork predicate shared by planning, runtime combat tracking, and replay certification:
+        /// true on standard junctions (&gt;= 3 neighbors) AND on directed arrival splits where the monster
+        /// arrived from a valid incoming predecessor (<paramref name="fromLandId"/> -&gt; <paramref name="landId"/>)
+        /// leaving at least 2 forward exits (never misclassifying bidirectional straight roads with unknown From=-1).
         /// </summary>
-        public bool IsForkForContext(int landId, int fromLandId, bool isCurrentlyMovingMidTurn)
+        public bool IsForkForContext(int landId, int fromLandId, bool arrivedFromIncomingEdge)
         {
             if (IsFork(landId)) return true;
-            return isCurrentlyMovingMidTurn && GetForwardNeighbors(landId, fromLandId).Count >= 2;
+            if (!arrivedFromIncomingEdge || fromLandId < 0) return false;
+            return IsValidNeighbor(fromLandId, landId) && GetForwardNeighbors(landId, fromLandId).Count >= 2;
+        }
+
+        /// <summary>
+        /// Infers the actual last predecessor along a forward push/displacement trajectory from
+        /// <paramref name="originLandId"/> to <paramref name="destLandId"/> (exact 1-hop predecessor on
+        /// direct edges, or forward BFS predecessor on multi-hop pushes — handles directed graphs accurately).
+        /// </summary>
+        public bool TryInferForwardArrivalPredecessor(int originLandId, int destLandId, out int lastPredecessor)
+        {
+            lastPredecessor = -1;
+            if (!Contains(originLandId) || !Contains(destLandId) || originLandId == destLandId)
+                return false;
+
+            if (IsValidNeighbor(originLandId, destLandId))
+            {
+                lastPredecessor = originLandId;
+                return true;
+            }
+
+            var dist = new Dictionary<int, int> { [originLandId] = 0 };
+            var queue = new Queue<int>();
+            queue.Enqueue(originLandId);
+            int destDist = int.MaxValue;
+
+            while (queue.Count > 0)
+            {
+                int cur = queue.Dequeue();
+                int d = dist[cur];
+                if (d >= destDist) break;
+
+                var nbs = GetValidNeighbors(cur);
+                for (int i = 0; i < nbs.Count; i++)
+                {
+                    int nxt = nbs[i];
+                    if (nxt == destLandId)
+                    {
+                        if (d + 1 < destDist)
+                        {
+                            destDist = d + 1;
+                            lastPredecessor = cur;
+                        }
+                        continue;
+                    }
+                    if (!dist.ContainsKey(nxt))
+                    {
+                        dist[nxt] = d + 1;
+                        queue.Enqueue(nxt);
+                    }
+                }
+            }
+
+            return lastPredecessor >= 0;
         }
 
         /// <summary>

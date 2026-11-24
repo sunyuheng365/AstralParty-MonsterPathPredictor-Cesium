@@ -62,6 +62,9 @@ namespace MonsterPathPredictor.ReplayCertifier
         public sealed class StubBuffSource { public int Id { get; set; } }
         public sealed class StubBuffInfo { public int BuffId { get; set; } public int Progress { get; set; } public StubBuffSource Source { get; set; } }
         public sealed class StubSnap { public long PlayerId { get; set; } public StubRoom Room { get; set; } }
+        public sealed class StubBattleUnit { public long PlayerId { get; set; } }
+        public sealed class StubBattleInner { public StubBattleUnit Attacker { get; set; } public StubBattleUnit Defender { get; set; } }
+        public sealed class StubBattle { public StubBattleInner Battle { get; set; } }
         public sealed class StubAttr { public long PlayerId { get; set; } public StubCause Cause { get; set; } public List<StubEffect> EffectDatas { get; set; } = new(); }
         public sealed class StubMoveEffectBucket { public List<StubAttr> Effects { get; set; } = new(); }
         public sealed class StubSkillMoveEffect { public long PlayerId { get; set; } public Dictionary<int, StubMoveEffectBucket> EffectData { get; set; } = new(); }
@@ -883,17 +886,25 @@ namespace MonsterPathPredictor.ReplayCertifier
                 return 1;
             }
 
-            // Test 31 (Round 6 #1): 1096.Place moving the mover itself (1-2, 3-4, Place 2->3):
-            //          split [1,2]+[2,3,4] and merged [1,2,3,4] MUST both produce IllegalMoveEdges=0 for BOTH player and monster!
+            // Test 31 (Round 6 #1 & Round 7 #23): 1096.Place moving the mover itself (1-2, 3-4, 4->{5,6}, Place 2->3):
+            //          split [1,2]+[2,3,4,5] and merged [1,2,3,4,5] MUST verify cleanly (ReplaysVerified=1, Corrupt=0, Err=0,
+            //          Illegal=0) AND prove post-teleport steps executed (monster fork at 4 scored DetHits=1/1).
             var cat31 = BuildTestCatalog(82016,
-                "{\"id\":1,\"neighbors\":[2]},{\"id\":2,\"neighbors\":[1]},{\"id\":3,\"neighbors\":[4]},{\"id\":4,\"neighbors\":[3]}");
-            int RunSelfTeleport31(bool isMonster, bool merged)
+                "{\"id\":1,\"neighbors\":[2]},{\"id\":2,\"neighbors\":[1]},{\"id\":3,\"neighbors\":[4]},{\"id\":4,\"neighbors\":[5,6,3]},{\"id\":5,\"neighbors\":[4]},{\"id\":6,\"neighbors\":[4]}");
+            CertificationSummary RunSelfTeleport31(bool isMonster, bool merged)
             {
                 var d = new StubDecoder();
                 long actor = isMonster ? 600 : 1;
                 var room = new StubRoom { MapId = 82016 };
-                if (isMonster) room.Monsters.Add(new StubUnit { Id = 600, Hero = new StubHero { HeroId = 1002, MonsterType = 11, NodeId = 1 } });
-                else room.Players.Add(new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 101, NodeId = 1 } });
+                if (isMonster)
+                {
+                    room.Players.Add(new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 101, NodeId = 5 } });
+                    room.Monsters.Add(new StubUnit { Id = 600, Hero = new StubHero { HeroId = 1002, MonsterType = 11, NodeId = 1 } });
+                }
+                else
+                {
+                    room.Players.Add(new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 101, NodeId = 1 } });
+                }
                 int r = d.Register(new StubRunning { Room = room });
                 int roll = d.Register(new StubThrowDice { PlayerId = actor });
                 int sm = d.Register(new StubSkillMoveEffect
@@ -907,19 +918,23 @@ namespace MonsterPathPredictor.ReplayCertifier
                 int fin = d.Register(new StubFinish());
                 if (merged)
                 {
-                    int mv = d.Register(new StubMove { PlayerId = actor, NodeIds = new[] { 1, 2, 3, 4 } });
-                    var res = ReplayEvaluator.EvaluateBytes("m31", ConcatFrames(MakeFrame(1003, r), MakeFrame(5022, roll), MakeFrame(1096, sm), MakeFrame(5028, mv), MakeFrame(1016, fin)), d, cat31);
-                    return (int)res.IllegalMoveEdges;
+                    int mv = d.Register(new StubMove { PlayerId = actor, NodeIds = new[] { 1, 2, 3, 4, 5 } });
+                    return ReplayEvaluator.EvaluateBytes("m31", ConcatFrames(MakeFrame(1003, r), MakeFrame(5022, roll), MakeFrame(1096, sm), MakeFrame(5028, mv), MakeFrame(1016, fin)), d, cat31);
                 }
                 int mv1 = d.Register(new StubMove { PlayerId = actor, NodeIds = new[] { 1, 2 } });
-                int mv2 = d.Register(new StubMove { PlayerId = actor, NodeIds = new[] { 2, 3, 4 } });
-                var resS = ReplayEvaluator.EvaluateBytes("s31", ConcatFrames(MakeFrame(1003, r), MakeFrame(5022, roll), MakeFrame(1096, sm), MakeFrame(5028, mv1), MakeFrame(5028, mv2), MakeFrame(1016, fin)), d, cat31);
-                return (int)resS.IllegalMoveEdges;
+                int mv2 = d.Register(new StubMove { PlayerId = actor, NodeIds = new[] { 2, 3, 4, 5 } });
+                return ReplayEvaluator.EvaluateBytes("s31", ConcatFrames(MakeFrame(1003, r), MakeFrame(5022, roll), MakeFrame(1096, sm), MakeFrame(5028, mv1), MakeFrame(5028, mv2), MakeFrame(1016, fin)), d, cat31);
             }
-            if (RunSelfTeleport31(false, false) != 0 || RunSelfTeleport31(false, true) != 0 ||
-                RunSelfTeleport31(true, false) != 0 || RunSelfTeleport31(true, true) != 0)
+            var r31PS = RunSelfTeleport31(false, false);
+            var r31PM = RunSelfTeleport31(false, true);
+            var r31MS = RunSelfTeleport31(true, false);
+            var r31MM = RunSelfTeleport31(true, true);
+            if (r31PS.ReplaysVerified != 1 || r31PS.TruncatedOrCorrupt != 0 || r31PS.ParseErrors != 0 || r31PS.IllegalMoveEdges != 0 ||
+                r31PM.ReplaysVerified != 1 || r31PM.TruncatedOrCorrupt != 0 || r31PM.ParseErrors != 0 || r31PM.IllegalMoveEdges != 0 ||
+                r31MS.ReplaysVerified != 1 || r31MS.TruncatedOrCorrupt != 0 || r31MS.ParseErrors != 0 || r31MS.IllegalMoveEdges != 0 || r31MS.Buckets["MidWalkFork"].DetHits != 1 ||
+                r31MM.ReplaysVerified != 1 || r31MM.TruncatedOrCorrupt != 0 || r31MM.ParseErrors != 0 || r31MM.IllegalMoveEdges != 0 || r31MM.Buckets["MidWalkFork"].DetHits != 1)
             {
-                Console.Error.WriteLine("SELF-TEST FAILED (Test 31): Merged vs split self-teleport 1096.Place diverged.");
+                Console.Error.WriteLine("SELF-TEST FAILED (Test 31): Merged vs split self-teleport 1096.Place diverged or failed verification.");
                 return 1;
             }
 
@@ -1092,7 +1107,231 @@ namespace MonsterPathPredictor.ReplayCertifier
                 return 1;
             }
 
-            Console.WriteLine("ReplayCertifier self-tests PASSED (38/38).");
+            // Test 39 (Round 7 #1 & #16): Cache publish path colliding with --corpus file MUST be rejected;
+            //          empty-node map JSON MUST be rejected by BoardCatalog.LoadJsonFile.
+            string tmpDir39 = Path.Combine(Path.GetTempPath(), "certifier-r7-" + Guid.NewGuid().ToString("N"));
+            try
+            {
+                Directory.CreateDirectory(tmpDir39);
+                string corpusInCache = Path.Combine(tmpDir39, "1000000000");
+                File.WriteAllText(corpusInCache, "1000000000\n");
+                if (!Program.HasCacheInputPathConflict(new[] { "1000000000" }, tmpDir39, corpusInCache, Array.Empty<string>(), out _))
+                {
+                    Console.Error.WriteLine("SELF-TEST FAILED (Test 39a): Cache path colliding with --corpus file was not rejected.");
+                    return 1;
+                }
+                string emptyMapPath = Path.Combine(tmpDir39, "empty-map.json");
+                File.WriteAllText(emptyMapPath, "{\"id\":82016,\"name\":\"Empty\",\"nodes\":[]}");
+                bool rejectedEmpty = false;
+                try { new BoardCatalog().LoadJsonFile(emptyMapPath); }
+                catch (InvalidDataException) { rejectedEmpty = true; }
+                if (!rejectedEmpty)
+                {
+                    Console.Error.WriteLine("SELF-TEST FAILED (Test 39b): Empty-node map was accepted by BoardCatalog.");
+                    return 1;
+                }
+            }
+            finally { try { if (Directory.Exists(tmpDir39)) Directory.Delete(tmpDir39, true); } catch { } }
+
+            // Test 40 (Round 7 #2 & #6):
+            //   40a: Chained self-teleport 1096 (2->3, 3->4) with echo-omitted 5028 [1,2,5] MUST yield IllegalMoveEdges=0!
+            //   40b: Multi-hop 1040.Place (1->2, 2->3) followed by 5028 [1,2,3] MUST strip both hops (IllegalMoveEdges=0)!
+            var cat40 = BuildTestCatalog(82016,
+                "{\"id\":1,\"neighbors\":[2]},{\"id\":2,\"neighbors\":[1]},{\"id\":3,\"neighbors\":[]},{\"id\":4,\"neighbors\":[5]},{\"id\":5,\"neighbors\":[4]}");
+            var dec40 = new StubDecoder();
+            int tokRun40 = dec40.Register(new StubRunning { Room = new StubRoom { MapId = 82016, Players = new List<StubUnit> { new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 101, NodeId = 1 } } } } });
+            int tokRoll40 = dec40.Register(new StubThrowDice { PlayerId = 1 });
+            int tokChain40 = dec40.Register(new StubSkillMoveEffect
+            {
+                PlayerId = 1,
+                EffectData = new Dictionary<int, StubMoveEffectBucket>
+                {
+                    [2] = new StubMoveEffectBucket { Effects = new List<StubAttr> { new StubAttr { PlayerId = 1, EffectDatas = new List<StubEffect> { new StubEffect { PlayerId = 1, Place = new StubPlace { Place = new StubPlaceInner { NodeId = 3, BackNodeId = -1 } } } } } } },
+                    [3] = new StubMoveEffectBucket { Effects = new List<StubAttr> { new StubAttr { PlayerId = 1, EffectDatas = new List<StubEffect> { new StubEffect { PlayerId = 1, Place = new StubPlace { Place = new StubPlaceInner { NodeId = 4, BackNodeId = -1 } } } } } } }
+                }
+            });
+            int tokNoEcho40 = dec40.Register(new StubMove { PlayerId = 1, NodeIds = new[] { 1, 2, 5 } });
+            int tokFin40 = dec40.Register(new StubFinish());
+            var res40a = ReplayEvaluator.EvaluateBytes("chain-noecho",
+                ConcatFrames(MakeFrame(1003, tokRun40), MakeFrame(5022, tokRoll40), MakeFrame(1096, tokChain40), MakeFrame(5028, tokNoEcho40), MakeFrame(1016, tokFin40)),
+                dec40, cat40);
+            if (res40a.ReplaysVerified != 1 || res40a.IllegalMoveEdges != 0)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 40a): Chained echo-omitted self-teleport failed (verified={res40a.ReplaysVerified}, illegal={res40a.IllegalMoveEdges}).");
+                return 1;
+            }
+            var cat40b = BuildTestCatalog(82016, "{\"id\":1,\"neighbors\":[]},{\"id\":2,\"neighbors\":[]},{\"id\":3,\"neighbors\":[]}");
+            var dec40b = new StubDecoder();
+            int tokRun40b = dec40b.Register(new StubRunning { Room = new StubRoom { MapId = 82016, Players = new List<StubUnit> { new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 101, NodeId = 1 } } } } });
+            int tokPl1 = dec40b.Register(new StubAttr { PlayerId = 1, EffectDatas = new List<StubEffect> { new StubEffect { PlayerId = 1, Place = new StubPlace { Place = new StubPlaceInner { NodeId = 2 } } } } });
+            int tokPl2 = dec40b.Register(new StubAttr { PlayerId = 1, EffectDatas = new List<StubEffect> { new StubEffect { PlayerId = 1, Place = new StubPlace { Place = new StubPlaceInner { NodeId = 3 } } } } });
+            int tokEcho40b = dec40b.Register(new StubMove { PlayerId = 1, NodeIds = new[] { 1, 2, 3 } });
+            int tokFin40b = dec40b.Register(new StubFinish());
+            var res40b = ReplayEvaluator.EvaluateBytes("multi-place",
+                ConcatFrames(MakeFrame(1003, tokRun40b), MakeFrame(1040, tokPl1), MakeFrame(1040, tokPl2), MakeFrame(5028, tokEcho40b), MakeFrame(1016, tokFin40b)),
+                dec40b, cat40b);
+            if (res40b.ReplaysVerified != 1 || res40b.IllegalMoveEdges != 0)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 40b): Multi-hop 1040.Place echo failed (illegal={res40b.IllegalMoveEdges}).");
+                return 1;
+            }
+
+            // Test 41 (Round 7 #3 & #4):
+            //   41a: Mid-turn same-round same-actor 1113 snapshot preserves stepped=true (MidWalkFork chasing P1 at 4, NOT ForkStart Red(3)).
+            //   41b: Directed 0->1, 1->[2,3] after combat on 1 (1007) MUST still score PostCombatFork (DetTotal=1, DetHits=1 for Red(2)).
+            var dec41a = new StubDecoder();
+            int tokRun41a = dec41a.Register(new StubRunning { Room = new StubRoom { MapId = 82016, Round = 1, Players = new List<StubUnit> { new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 101, NodeId = 4 } } }, Monsters = new List<StubUnit> { new StubUnit { Id = 700, Hero = new StubHero { HeroId = 1002, MonsterType = 11, NodeId = 1, BackNodeId = -1, FrontNodeIds = new[] { 2 } } } } } });
+            int tokRoll41a = dec41a.Register(new StubThrowDice { PlayerId = 700 });
+            int tokStep1 = dec41a.Register(new StubMove { PlayerId = 700, NodeIds = new[] { 1, 2 } });
+            int tokSnap41a = dec41a.Register(new StubSnap { PlayerId = 700, Room = new StubRoom { MapId = 82016, Round = 1, Players = new List<StubUnit> { new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 101, NodeId = 4 } } }, Monsters = new List<StubUnit> { new StubUnit { Id = 700, Hero = new StubHero { HeroId = 1002, MonsterType = 11, NodeId = 2, BackNodeId = 1, FrontNodeIds = new[] { 3, 4 } } } } } });
+            int tokStep2 = dec41a.Register(new StubMove { PlayerId = 700, NodeIds = new[] { 2, 4 } });
+            int tokFin41a = dec41a.Register(new StubFinish());
+            var res41a = ReplayEvaluator.EvaluateBytes("mid-snap",
+                ConcatFrames(MakeFrame(1003, tokRun41a), MakeFrame(5022, tokRoll41a), MakeFrame(5028, tokStep1), MakeFrame(1113, tokSnap41a), MakeFrame(5028, tokStep2), MakeFrame(1016, tokFin41a)),
+                dec41a, forkCatalog);
+            if (res41a.Buckets["MidWalkFork"].DetHits != 1 || res41a.Buckets["MidWalkFork"].DetTotal != 1 || res41a.Buckets["ForkStart"].Total != 0)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 41a): Mid-turn 1113 snapshot clobbered stepped state (mid={res41a.Buckets["MidWalkFork"].DetHits}/{res41a.Buckets["MidWalkFork"].DetTotal}, start={res41a.Buckets["ForkStart"].Total}).");
+                return 1;
+            }
+            var dec41b = new StubDecoder();
+            int tokRun41b = dec41b.Register(new StubRunning { Room = new StubRoom { MapId = 82016, Players = new List<StubUnit> { new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 101, NodeId = 1 } }, new StubUnit { Id = 2, Slot = 1, Hero = new StubHero { HeroId = 102, NodeId = 3 } } }, Monsters = new List<StubUnit> { new StubUnit { Id = 701, Hero = new StubHero { HeroId = 1002, MonsterType = 11, NodeId = 0, FrontNodeIds = new[] { 1 } } } } } });
+            int tokRoll41b = dec41b.Register(new StubThrowDice { PlayerId = 701 });
+            int tokMv41b1 = dec41b.Register(new StubMove { PlayerId = 701, NodeIds = new[] { 0, 1 } });
+            int tokBat41b = dec41b.Register(new StubBattle { Battle = new StubBattleInner { Attacker = new StubBattleUnit { PlayerId = 701 }, Defender = new StubBattleUnit { PlayerId = 1 } } });
+            int tokMv41b2 = dec41b.Register(new StubMove { PlayerId = 701, NodeIds = new[] { 1, 2 } });
+            int tokFin41b = dec41b.Register(new StubFinish());
+            var res41b = ReplayEvaluator.EvaluateBytes("dir-postcombat",
+                ConcatFrames(MakeFrame(1003, tokRun41b), MakeFrame(5022, tokRoll41b), MakeFrame(5028, tokMv41b1), MakeFrame(1007, tokBat41b), MakeFrame(5028, tokMv41b2), MakeFrame(1016, tokFin41b)),
+                dec41b, cat32);
+            if (res41b.Buckets["PostCombatFork"].DetHits != 1 || res41b.Buckets["PostCombatFork"].DetTotal != 1)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 41b): Directed post-combat fork was not scored (hits={res41b.Buckets["PostCombatFork"].DetHits}/{res41b.Buckets["PostCombatFork"].DetTotal}).");
+                return 1;
+            }
+
+            // Test 42 (Round 7 #5 & #14):
+            //   42a: 30x exact [0.5,0.5] (all Red) + 30x near [0.5000000004, 0.4999999996] (all Blue) MUST NOT cancel in "50%" -> FAIL GATE 3!
+            //   42b: Swapping exits 1 and 3 in [.2, .2000000002, .2000000004, .3999999994] keeps exit 2 in the SAME bin ("20.00000002%", n=30)!
+            var nearMask42 = new CertificationSummary { ReplaysAttempted = 10, ReplaysVerified = 10 };
+            PopulatePassingBaseline(nearMask42);
+            var nearExits42 = new List<ForkExitPrediction>
+            {
+                new() { NextLandId = 22, ConditionalProbability = 0.5000000004 },
+                new() { NextLandId = 55, ConditionalProbability = 0.4999999996 }
+            };
+            for (int i = 0; i < 30; i++)
+            {
+                ReplayEvaluator.RecordMultiBranchCalibration(board, 23, exits, actualNext: 22, nearMask42.ProbBins);
+                ReplayEvaluator.RecordMultiBranchCalibration(board, 23, nearExits42, actualNext: 55, nearMask42.ProbBins);
+            }
+            var e42a = ReportWriter.EvaluateGates(nearMask42, t);
+            if (nearMask42.ProbBins["50%"].Opp != 30 || nearMask42.ProbBins["50%"].Chosen != 30 || e42a.CalibrationGate != GateStatus.Fail)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 42a): Near-50/50 masked exact 50/50 bias (opp={nearMask42.ProbBins["50%"].Opp}, gate={e42a.CalibrationGate}).");
+                return 1;
+            }
+            var permBins42 = new Dictionary<string, ProbBin>();
+            var orderA42 = new List<ForkExitPrediction>
+            {
+                new() { NextLandId = 2, ConditionalProbability = 0.2 },
+                new() { NextLandId = 3, ConditionalProbability = 0.2000000002 },
+                new() { NextLandId = 4, ConditionalProbability = 0.2000000004 },
+                new() { NextLandId = 5, ConditionalProbability = 0.3999999994 }
+            };
+            var orderB42 = new List<ForkExitPrediction>
+            {
+                new() { NextLandId = 2, ConditionalProbability = 0.2000000004 },
+                new() { NextLandId = 3, ConditionalProbability = 0.2000000002 },
+                new() { NextLandId = 4, ConditionalProbability = 0.2 },
+                new() { NextLandId = 5, ConditionalProbability = 0.3999999994 }
+            };
+            for (int i = 0; i < 15; i++)
+            {
+                ReplayEvaluator.RecordMultiBranchCalibration(board4, 1, orderA42, actualNext: 3, permBins42);
+                ReplayEvaluator.RecordMultiBranchCalibration(board4, 1, orderB42, actualNext: 3, permBins42);
+            }
+            if (!permBins42.TryGetValue("20.00000002%", out var midBin42) || midBin42.Opp != 30)
+            {
+                Console.Error.WriteLine("SELF-TEST FAILED (Test 42b): Exit 2 was split across bins on sibling permutation: " + string.Join(",", permBins42.Keys));
+                return 1;
+            }
+
+            // Test 43 (Round 7 #11 & #12):
+            //   43a: Primary CDN returning semantically corrupt replay (unknown mover empty 5028) falls back to healthy backup CDN!
+            //   43b: Illegal edge on known layout followed by 1113 switching to unloaded MapIndex MUST preserve IllegalMoveEdges=1 on MissingMap!
+            byte[] semCorrupt43 = ConcatFrames(MakeFrame(1003, tokRun37), MakeFrame(5028, tokEmptyUnk37), MakeFrame(1016, tokFin37));
+            byte[] valid37 = ConcatFrames(MakeFrame(1003, tokRun37), MakeFrame(1016, tokFin37));
+            using (var c43b = new HttpClient(new StubHttpHandler(url => url.Contains("cdn1")
+                ? new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(semCorrupt43) }
+                : new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(valid37) })))
+            {
+                var (b43b, ev43b, corrupt43b) = Program.DownloadAndEvaluateFromUrlsAsync(
+                    c43b,
+                    new[] { "http://cdn1/1", "http://cdn2/1" },
+                    b => Program.SafeEvaluateReplay("1", b, dec37, forkCatalog),
+                    null,
+                    CancellationToken.None).GetAwaiter().GetResult();
+                if (b43b == null || ev43b == null || ev43b.ReplaysVerified != 1 || corrupt43b)
+                {
+                    Console.Error.WriteLine("SELF-TEST FAILED (Test 43a): Semantically corrupt primary CDN blocked healthy backup CDN.");
+                    return 1;
+                }
+            }
+            var dec43c = new StubDecoder();
+            int tokRun43c = dec43c.Register(new StubRunning { Room = new StubRoom { MapId = 82016, MapIndex = 0, Players = new List<StubUnit> { new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 101, NodeId = 1 } } } } });
+            int tokIll43c = dec43c.Register(new StubMove { PlayerId = 1, NodeIds = new[] { 1, 5 } });
+            int tokSnapMiss43c = dec43c.Register(new StubSnap { PlayerId = 1, Room = new StubRoom { MapId = 82016, MapIndex = 99 } });
+            int tokFin43c = dec43c.Register(new StubFinish());
+            var res43c = ReplayEvaluator.EvaluateBytes("ill-then-miss",
+                ConcatFrames(MakeFrame(1003, tokRun43c), MakeFrame(5028, tokIll43c), MakeFrame(1113, tokSnapMiss43c), MakeFrame(1016, tokFin43c)),
+                dec43c, forkCatalog);
+            if (res43c.MissingMap != 1 || res43c.IllegalMoveEdges != 1 || !Program.NeedsCacheRecovery(res43c))
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 43b): Subsequent MissingMap erased prefix IllegalMoveEdges (miss={res43c.MissingMap}, illegal={res43c.IllegalMoveEdges}).");
+                return 1;
+            }
+
+            // Test 44 (Round 7 #15 & #20):
+            //   44a: ProbBin with SumPred=0, Chosen=1 (z=+Infinity) MUST fail GATE 3 AND serialize JSON + MD without throwing!
+            //   44b: 1 DownloadFailed + 2 duplicate non-PVE requests MUST report DownloadFailRatio == 0.5 (1/2, NOT diluted to 1/3)!
+            var infSum44 = new CertificationSummary { ReplaysAttempted = 10, ReplaysVerified = 10 };
+            PopulatePassingBaseline(infSum44);
+            infSum44.ProbBins["exp(-745.826)"] = new ProbBin { Opp = 30, SumPred = 0.0, Chosen = 1 };
+            string tmpJson44 = Path.Combine(Path.GetTempPath(), "certifier-inf-" + Guid.NewGuid().ToString("N") + ".json");
+            string tmpMd44 = Path.Combine(Path.GetTempPath(), "certifier-inf-" + Guid.NewGuid().ToString("N") + ".md");
+            try
+            {
+                bool passed44 = ReportWriter.PrintAndExport(infSum44, forkCatalog, 0.1, t, tmpJson44, tmpMd44);
+                if (passed44 || !File.Exists(tmpJson44) || !File.Exists(tmpMd44))
+                {
+                    Console.Error.WriteLine("SELF-TEST FAILED (Test 44a): Infinite-z calibration failed to export JSON/MD cleanly.");
+                    return 1;
+                }
+                using var doc44 = System.Text.Json.JsonDocument.Parse(File.ReadAllText(tmpJson44));
+                var row44 = doc44.RootElement.GetProperty("calibration").EnumerateArray().First();
+                if (row44.GetProperty("z").ValueKind != System.Text.Json.JsonValueKind.Null ||
+                    row44.GetProperty("zStatus").GetString() != "+Infinity")
+                {
+                    Console.Error.WriteLine("SELF-TEST FAILED (Test 44a): Infinite-z JSON representation incorrect.");
+                    return 1;
+                }
+            }
+            finally
+            {
+                try { if (File.Exists(tmpJson44)) File.Delete(tmpJson44); } catch { }
+                try { if (File.Exists(tmpMd44)) File.Delete(tmpMd44); } catch { }
+            }
+            var dlFail44 = new CertificationSummary { ReplaysAttempted = 1, RequestedReplayId = "1788434495879999", DownloadFailed = 1 };
+            var merged44b = Program.DeduplicateAndMerge(new[] { dlFail44, npveA, npveB });
+            var eval44b = ReportWriter.EvaluateGates(merged44b, t);
+            if (eval44b.UniqueAttempted != 2 || Math.Abs(eval44b.DownloadFailRatio - 0.5) > 1e-9)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 44b): Duplicate non-PVE diluted DownloadFailRatio (unique={eval44b.UniqueAttempted}, ratio={eval44b.DownloadFailRatio}).");
+                return 1;
+            }
+
+            Console.WriteLine("ReplayCertifier self-tests PASSED (44/44).");
             return 0;
         }
     }

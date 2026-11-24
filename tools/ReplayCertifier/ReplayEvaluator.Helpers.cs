@@ -221,19 +221,9 @@ namespace MonsterPathPredictor.ReplayCertifier
             int origin = board.Contains(oldLandId) ? oldLandId : casterLandId;
             if (!board.Contains(origin) || !board.Contains(newLandId)) return;
 
-            var field = board.ComputeShortestPathsTo(origin);
-            int d = field.GetDistance(newLandId);
-            if (d > 0 && d < int.MaxValue)
+            if (board.TryInferForwardArrivalPredecessor(origin, newLandId, out int pred))
             {
-                var neighbors = board.GetValidNeighbors(newLandId);
-                for (int i = 0; i < neighbors.Count; i++)
-                {
-                    if (field.GetDistance(neighbors[i]) == d - 1)
-                    {
-                        pushFromId = neighbors[i];
-                        break;
-                    }
-                }
+                pushFromId = pred;
             }
             if (pushFromId >= 0)
             {
@@ -349,8 +339,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                     // tile via an ordinary Place can NEVER reactivate an expired skill tag.
                     if (tileChanged)
                     {
-                        target.SkillDisplacedFromNode = oldNode;
-                        target.SkillDisplacedToNode = newNode;
+                        target.PendingDisplacementHops.Add((oldNode, newNode));
                         target.PendingSkillMoveKind = SkillMoveKind.None;
                         target.PendingSkillMoveLandId = -1;
                         target.PendingSkillMovePushDirId = -1;

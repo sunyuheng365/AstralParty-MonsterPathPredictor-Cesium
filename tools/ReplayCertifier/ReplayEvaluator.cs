@@ -32,8 +32,7 @@ namespace MonsterPathPredictor.ReplayCertifier
             public int CrimeNum;
             public int CrimeBuffProgress;
             public bool NotSelect;
-            public int SkillDisplacedFromNode = -1;
-            public int SkillDisplacedToNode = -1;
+            public List<(int From, int To)> PendingDisplacementHops = new();
             public SkillMoveKind PendingSkillMoveKind = SkillMoveKind.None;
             public int PendingSkillMoveLandId = -1;
             public int PendingSkillMovePushDirId = -1;
@@ -77,7 +76,7 @@ namespace MonsterPathPredictor.ReplayCertifier
             bool decodeFailed = false;
             var lifecycle = StreamLifecycleState.Unstarted;
 
-            void SyncRoom(dynamic room)
+            void SyncRoom(dynamic room, bool preservePendingEffects = false)
             {
                 int newIdx = (int)room.MapIndex;
                 if (board == null || newIdx != mapIndex)
@@ -85,18 +84,18 @@ namespace MonsterPathPredictor.ReplayCertifier
                     if (catalog.TryGetGraph(mapId, newIdx, out var nb)) { mapIndex = newIdx; board = nb; }
                     else { unknownLayout = true; return; }
                 }
-                pendingMoveEffects.Clear();
-                var prevPlayerDisp = new Dictionary<long, (int From, int To)>();
+                if (!preservePendingEffects) pendingMoveEffects.Clear();
+                var prevPlayerDisp = new Dictionary<long, List<(int From, int To)>>();
                 foreach (var kv in players)
                 {
-                    if (kv.Value.SkillDisplacedToNode >= 0)
-                        prevPlayerDisp[kv.Key] = (kv.Value.SkillDisplacedFromNode, kv.Value.SkillDisplacedToNode);
+                    if (kv.Value.PendingDisplacementHops.Count > 0)
+                        prevPlayerDisp[kv.Key] = new List<(int, int)>(kv.Value.PendingDisplacementHops);
                 }
-                var prevMonsterState = new Dictionary<long, (int From, int To, SkillMoveKind Kind, int Land, int PushDir, int PushFrom)>();
+                var prevMonsterState = new Dictionary<long, (List<(int From, int To)> Hops, SkillMoveKind Kind, int Land, int PushDir, int PushFrom)>();
                 foreach (var kv in monsters)
                 {
-                    if (kv.Value.SkillDisplacedToNode >= 0 || kv.Value.PendingSkillMoveKind != SkillMoveKind.None)
-                        prevMonsterState[kv.Key] = (kv.Value.SkillDisplacedFromNode, kv.Value.SkillDisplacedToNode,
+                    if (kv.Value.PendingDisplacementHops.Count > 0 || kv.Value.PendingSkillMoveKind != SkillMoveKind.None)
+                        prevMonsterState[kv.Key] = (new List<(int, int)>(kv.Value.PendingDisplacementHops),
                             kv.Value.PendingSkillMoveKind, kv.Value.PendingSkillMoveLandId,
                             kv.Value.PendingSkillMovePushDirId, kv.Value.PendingSkillMovePushFromId);
                 }
@@ -107,10 +106,9 @@ namespace MonsterPathPredictor.ReplayCertifier
                         if (p?.Hero != null)
                         {
                             UnitSim u = BuildUnit(p, false);
-                            if (prevPlayerDisp.TryGetValue(u.Id, out var pd) && u.NodeId == pd.To)
+                            if (prevPlayerDisp.TryGetValue(u.Id, out var hops) && hops.Count > 0 && u.NodeId == hops[^1].To)
                             {
-                                u.SkillDisplacedFromNode = pd.From;
-                                u.SkillDisplacedToNode = pd.To;
+                                u.PendingDisplacementHops.AddRange(hops);
                             }
                             players[u.Id] = u;
                         }
@@ -121,10 +119,9 @@ namespace MonsterPathPredictor.ReplayCertifier
                             UnitSim u = BuildUnit(m, true);
                             if (prevMonsterState.TryGetValue(u.Id, out var ms))
                             {
-                                if (ms.To >= 0 && u.NodeId == ms.To)
+                                if (ms.Hops.Count > 0 && u.NodeId == ms.Hops[^1].To)
                                 {
-                                    u.SkillDisplacedFromNode = ms.From;
-                                    u.SkillDisplacedToNode = ms.To;
+                                    u.PendingDisplacementHops.AddRange(ms.Hops);
                                 }
                                 if (ms.Kind != SkillMoveKind.None && u.NodeId == ms.Land)
                                 {
@@ -235,13 +232,19 @@ namespace MonsterPathPredictor.ReplayCertifier
                 {
                     dynamic snap = decoder.TryDecode("party.protocol.ReplaySnapshotS2C", payload);
                     if (snap?.Room == null) { decodeFailed = true; break; }
-                    SyncRoom(snap.Room);
+                    int snapRound = (int)snap.Room.Round;
+                    long snapActor = (long)snap.PlayerId;
+                    bool sameOngoingTurn = (curTurnActor != 0 && snapActor == curTurnActor && snapRound == curRound);
+                    SyncRoom(snap.Room, preservePendingEffects: sameOngoingTurn);
                     if (unknownLayout) break;
-                    curRound = (int)snap.Room.Round;
-                    curTurnActor = (long)snap.PlayerId;
-                    stepped = foughtOnTile = foughtTurn = thiefStoleOnTile = false;
-                    turnStartLandId = monsters.TryGetValue(curTurnActor, out var am) ? am.NodeId : -1;
-                    startedOnFork = am != null && board.IsFork(am.NodeId);
+                    curRound = snapRound;
+                    curTurnActor = snapActor;
+                    if (!sameOngoingTurn)
+                    {
+                        stepped = foughtOnTile = foughtTurn = thiefStoleOnTile = false;
+                        turnStartLandId = monsters.TryGetValue(curTurnActor, out var am) ? am.NodeId : -1;
+                        startedOnFork = am != null && board.IsFork(am.NodeId);
+                    }
                 }
                 else if (cmd == 1018)
                 {
@@ -401,7 +404,10 @@ namespace MonsterPathPredictor.ReplayCertifier
                     ReplaysAttempted = 1,
                     RequestedReplayId = replayId,
                     ContentSha256 = summary.ContentSha256,
-                    MissingMap = 1
+                    MissingMap = 1,
+                    MissingPredictions = summary.MissingPredictions,
+                    OutOfSupportPredictions = summary.OutOfSupportPredictions,
+                    IllegalMoveEdges = summary.IllegalMoveEdges
                 };
             }
             if (parseError)

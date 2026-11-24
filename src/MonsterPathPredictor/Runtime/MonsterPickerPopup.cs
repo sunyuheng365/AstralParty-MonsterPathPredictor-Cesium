@@ -134,7 +134,11 @@ namespace MonsterPathPredictor.Runtime
                 }
             }
 
-            int totalPages = Math.Max(1, (visible.Count + MaxVisibleRows - 1) / MaxVisibleRows);
+            // Dynamically fit rows per page to current GRoot viewport height so pager and footer controls
+            // remain completely reachable even on short windows (e.g. height = 480).
+            float stageHeight = GRoot.inst != null && GRoot.inst.height > 0f ? GRoot.inst.height : 720f;
+            int rowsPerPage = ComputeRowsPerPage(stageHeight);
+            int totalPages = Math.Max(1, (visible.Count + rowsPerPage - 1) / rowsPerPage);
             if (_pageIndex >= totalPages) _pageIndex = totalPages - 1;
             if (_pageIndex < 0) _pageIndex = 0;
 
@@ -142,7 +146,7 @@ namespace MonsterPathPredictor.Runtime
             // game window immediately brings the popup back inside the visible viewport.
             if (_positioned) ClampToStage();
 
-            string sig = BuildSignature(visible, selectedMonsterId, settings, _pageIndex, totalPages);
+            string sig = BuildSignature(visible, selectedMonsterId, settings, _pageIndex, totalPages, rowsPerPage);
             if (sig == _lastSignature) return;
             _lastSignature = sig;
 
@@ -161,8 +165,8 @@ namespace MonsterPathPredictor.Runtime
             else
             {
                 _emptyText.visible = false;
-                int start = _pageIndex * MaxVisibleRows;
-                int count = Math.Min(MaxVisibleRows, visible.Count - start);
+                int start = _pageIndex * rowsPerPage;
+                int count = Math.Min(rowsPerPage, visible.Count - start);
                 listHeight = count * (RowHeight + 4f) + 4f;
                 for (int i = 0; i < count; i++)
                 {
@@ -421,12 +425,24 @@ namespace MonsterPathPredictor.Runtime
             _root.SetXY(x, y);
         }
 
+        private static int ComputeRowsPerPage(float stageHeight)
+        {
+            const float PagerReserve = 28f;
+            const float MarginReserve = 24f;
+            float chrome = HeaderHeight + Padding + PagerReserve + Padding + FooterHeight + MarginReserve;
+            float availList = stageHeight - chrome;
+            if (availList <= RowHeight + 4f) return 1;
+            int rows = (int)((availList - 4f) / (RowHeight + 4f));
+            return Math.Max(1, Math.Min(MaxVisibleRows, rows));
+        }
+
         private static string BuildSignature(
             IReadOnlyList<LiveMonsterInfo> visibleMonsters,
             long selectedId,
             PredictorSettings settings,
             int pageIndex,
-            int totalPages)
+            int totalPages,
+            int rowsPerPage)
         {
             var sb = new System.Text.StringBuilder(160);
             sb.Append(selectedId).Append('|')
@@ -434,7 +450,7 @@ namespace MonsterPathPredictor.Runtime
               .Append(settings.PickerHotkey).Append('|')
               .Append(settings.AllowNonAggressiveMonsters ? '1' : '0')
               .Append(settings.ClosePickerOnSelect ? '1' : '0').Append('|')
-              .Append(pageIndex).Append('/').Append(totalPages).Append('|');
+              .Append(pageIndex).Append('/').Append(totalPages).Append(':').Append(rowsPerPage).Append('|');
             if (visibleMonsters != null)
             {
                 for (int i = 0; i < visibleMonsters.Count; i++)

@@ -323,9 +323,10 @@ namespace MonsterPathPredictor.Core
         }
 
         /// <summary>
-        /// Liang-Barsky 2D segment clipping against an axis-aligned viewport rectangle in double precision
-        /// (prevents float cancellation on extreme off-screen projections like (-2^36, 50) -> (2^36, 50))
-        /// and snaps clipped endpoints onto the hit boundary edge.
+        /// Liang-Barsky 2D segment clipping against an axis-aligned viewport rectangle.
+        /// Uses midpoint-centered <c>decimal</c> arithmetic (28+ digits, exact up to 1e27 including H = 2^64)
+        /// with a midpoint-centered <c>double</c> fallback for even larger values, avoiding parameter-tie
+        /// distortion on extreme off-screen projections like (-2^64, -2^64) -> (2^64, 2^64).
         /// </summary>
         public static bool TryClipSegmentToRect(
             Point2 a,
@@ -338,52 +339,129 @@ namespace MonsterPathPredictor.Core
             out Point2 clippedB,
             out float startTrimPx)
         {
+            bool ok = TryClipSegmentToRect(a, b, minX, minY, maxX, maxY, out clippedA, out clippedB, out double startTrimD);
+            startTrimPx = (float)startTrimD;
+            return ok;
+        }
+
+        public static bool TryClipSegmentToRect(
+            Point2 a,
+            Point2 b,
+            float minX,
+            float minY,
+            float maxX,
+            float maxY,
+            out Point2 clippedA,
+            out Point2 clippedB,
+            out double startTrimPx)
+        {
             clippedA = a;
             clippedB = b;
-            startTrimPx = 0f;
+            startTrimPx = 0.0;
 
             double ax = a.X, ay = a.Y;
             double bx = b.X, by = b.Y;
+            double dMinX = minX, dMinY = minY, dMaxX = maxX, dMaxY = maxY;
+            if (double.IsNaN(ax) || double.IsInfinity(ax) || double.IsNaN(ay) || double.IsInfinity(ay) ||
+                double.IsNaN(bx) || double.IsInfinity(bx) || double.IsNaN(by) || double.IsInfinity(by))
+                return false;
+
+            double maxAbs = Math.Max(
+                Math.Max(Math.Max(Math.Abs(ax), Math.Abs(ay)), Math.Max(Math.Abs(bx), Math.Abs(by))),
+                Math.Max(Math.Max(Math.Abs(dMinX), Math.Abs(dMaxX)), Math.Max(Math.Abs(dMinY), Math.Abs(dMaxY))));
+
             double dx = bx - ax;
             double dy = by - ay;
-            double dMinX = minX, dMinY = minY, dMaxX = maxX, dMaxY = maxY;
-            double t0 = 0.0;
-            double t1 = 1.0;
-            int hitStartEdge = 0; // 1=minX, 2=maxX, 3=minY, 4=maxY
-            int hitEndEdge = 0;
+            double fullLen = Math.Sqrt(dx * dx + dy * dy);
 
-            bool ClipEdge(double p, double q, int edgeId)
+            if (maxAbs <= 1e26)
             {
-                if (Math.Abs(p) < 1e-12) return q >= 0.0;
+                decimal dax = (decimal)ax, day = (decimal)ay;
+                decimal dbx = (decimal)bx, dby = (decimal)by;
+                decimal dmX = (decimal)dMinX, dmY = (decimal)dMinY, dMX = (decimal)dMaxX, dMY = (decimal)dMaxY;
+                decimal mx = (dax + dbx) * 0.5m;
+                decimal my = (day + dby) * 0.5m;
+                decimal hx = (dbx - dax) * 0.5m;
+                decimal hy = (dby - day) * 0.5m;
+
+                decimal s0 = -1m;
+                decimal s1 = 1m;
+                int hitStartEdge = 0; // 1=minX, 2=maxX, 3=minY, 4=maxY
+                int hitEndEdge = 0;
+
+                bool ClipDec(decimal p, decimal q, int edgeId)
+                {
+                    if (p == 0m) return q >= 0m;
+                    decimal r = q / p;
+                    if (p < 0m)
+                    {
+                        if (r > s1) return false;
+                        if (r > s0) { s0 = r; hitStartEdge = edgeId; }
+                    }
+                    else
+                    {
+                        if (r < s0) return false;
+                        if (r < s1) { s1 = r; hitEndEdge = edgeId; }
+                    }
+                    return true;
+                }
+
+                if (!ClipDec(-hx, mx - dmX, 1)) return false;
+                if (!ClipDec(hx, dMX - mx, 2)) return false;
+                if (!ClipDec(-hy, my - dmY, 3)) return false;
+                if (!ClipDec(hy, dMY - my, 4)) return false;
+
+                double t0 = (double)((s0 + 1m) * 0.5m);
+                startTrimPx = t0 * fullLen;
+
+                decimal x0 = hitStartEdge == 1 ? dmX : (hitStartEdge == 2 ? dMX : (mx + s0 * hx));
+                decimal y0 = hitStartEdge == 3 ? dmY : (hitStartEdge == 4 ? dMY : (my + s0 * hy));
+                decimal x1 = hitEndEdge == 1 ? dmX : (hitEndEdge == 2 ? dMX : (mx + s1 * hx));
+                decimal y1 = hitEndEdge == 3 ? dmY : (hitEndEdge == 4 ? dMY : (my + s1 * hy));
+
+                clippedA = new Point2((float)x0, (float)y0);
+                clippedB = new Point2((float)x1, (float)y1);
+                return true;
+            }
+
+            // Fallback for extreme coordinates > 1e26 using midpoint parameterization in double.
+            double mxD = (ax + bx) * 0.5;
+            double myD = (ay + by) * 0.5;
+            double hxD = (bx - ax) * 0.5;
+            double hyD = (by - ay) * 0.5;
+            double ds0 = -1.0, ds1 = 1.0;
+            int dHitStart = 0, dHitEnd = 0;
+
+            bool ClipDbl(double p, double q, int edgeId)
+            {
+                if (Math.Abs(p) < 1e-18) return q >= 0.0;
                 double r = q / p;
                 if (p < 0.0)
                 {
-                    if (r > t1) return false;
-                    if (r > t0) { t0 = r; hitStartEdge = edgeId; }
+                    if (r > ds1) return false;
+                    if (r > ds0) { ds0 = r; dHitStart = edgeId; }
                 }
                 else
                 {
-                    if (r < t0) return false;
-                    if (r < t1) { t1 = r; hitEndEdge = edgeId; }
+                    if (r < ds0) return false;
+                    if (r < ds1) { ds1 = r; dHitEnd = edgeId; }
                 }
                 return true;
             }
 
-            if (!ClipEdge(-dx, ax - dMinX, 1)) return false;
-            if (!ClipEdge(dx, dMaxX - ax, 2)) return false;
-            if (!ClipEdge(-dy, ay - dMinY, 3)) return false;
-            if (!ClipEdge(dy, dMaxY - ay, 4)) return false;
+            if (!ClipDbl(-hxD, mxD - dMinX, 1)) return false;
+            if (!ClipDbl(hxD, dMaxX - mxD, 2)) return false;
+            if (!ClipDbl(-hyD, myD - dMinY, 3)) return false;
+            if (!ClipDbl(hyD, dMaxY - myD, 4)) return false;
 
-            double fullLen = Math.Sqrt(dx * dx + dy * dy);
-            startTrimPx = (float)(t0 * fullLen);
+            startTrimPx = ((ds0 + 1.0) * 0.5) * fullLen;
+            double dx0 = dHitStart == 1 ? dMinX : (dHitStart == 2 ? dMaxX : (mxD + ds0 * hxD));
+            double dy0 = dHitStart == 3 ? dMinY : (dHitStart == 4 ? dMaxY : (myD + ds0 * hyD));
+            double dx1 = dHitEnd == 1 ? dMinX : (dHitEnd == 2 ? dMaxX : (mxD + ds1 * hxD));
+            double dy1 = dHitEnd == 3 ? dMinY : (dHitEnd == 4 ? dMaxY : (myD + ds1 * hyD));
 
-            double x0 = hitStartEdge == 1 ? dMinX : (hitStartEdge == 2 ? dMaxX : (ax + t0 * dx));
-            double y0 = hitStartEdge == 3 ? dMinY : (hitStartEdge == 4 ? dMaxY : (ay + t0 * dy));
-            double x1 = hitEndEdge == 1 ? dMinX : (hitEndEdge == 2 ? dMaxX : (ax + t1 * dx));
-            double y1 = hitEndEdge == 3 ? dMinY : (hitEndEdge == 4 ? dMaxY : (ay + t1 * dy));
-
-            clippedA = new Point2((float)x0, (float)y0);
-            clippedB = new Point2((float)x1, (float)y1);
+            clippedA = new Point2((float)dx0, (float)dy0);
+            clippedB = new Point2((float)dx1, (float)dy1);
             return true;
         }
 
@@ -438,12 +516,26 @@ namespace MonsterPathPredictor.Core
         }
 
         /// <summary>
-        /// Computes the dash phase offset for a viewport-clipped sub-segment so the static dash pattern
-        /// aligns pixel-for-pixel with the unclipped edge (independent of camera panning).
+        /// Computes the dash phase offset for a viewport-clipped sub-segment in double precision,
+        /// reducing modulo <paramref name="period"/> before converting to float so huge clip distances
+        /// (e.g. 67,108,864 px) never suffer float-rounding phase drift.
         /// </summary>
-        public static float ComputeClippedDashPhase(float phaseOffset, float origTrimStart, float clippedFromStartPx, float newTrimStart)
+        public static float ComputeClippedDashPhase(
+            double phaseOffset,
+            double origTrimStart,
+            double clippedFromStartPx,
+            double newTrimStart,
+            double period = 0.0)
         {
-            return phaseOffset + origTrimStart - clippedFromStartPx - newTrimStart;
+            double raw = phaseOffset + origTrimStart - clippedFromStartPx - newTrimStart;
+            if (double.IsNaN(raw) || double.IsInfinity(raw)) return 0f;
+            if (period > 0.0 && !double.IsNaN(period) && !double.IsInfinity(period))
+            {
+                double rem = raw % period;
+                if (rem < 0.0) rem += period;
+                return (float)rem;
+            }
+            return (float)raw;
         }
 
         private static DashQuad MakePositiveWinding(Point2 a, Point2 b, Point2 c, Point2 d)

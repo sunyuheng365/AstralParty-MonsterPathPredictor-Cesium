@@ -85,25 +85,38 @@ namespace MonsterPathPredictor.ReplayCertifier
 
                 if (bytes == null)
                 {
-                    for (int attempt = 0; attempt < 3; attempt++)
+                    string[] cdns = cdnBase.Contains("sereplaycn", StringComparison.OrdinalIgnoreCase)
+                        ? new[] { cdnBase, "https://sereplayjp.feimogames.com/prod/" }
+                        : new[] { cdnBase };
+
+                    foreach (string baseUrl in cdns)
                     {
-                        try
+                        for (int attempt = 0; attempt < 2; attempt++)
                         {
-                            bytes = await client.GetByteArrayAsync(cdnBase + id, ct);
-                            if (bytes.Length > 1000)
+                            try
                             {
-                                Interlocked.Increment(ref streamed);
-                                if (saveCache && cachedPath != null)
-                                    await File.WriteAllBytesAsync(cachedPath, bytes, ct);
+                                bytes = await client.GetByteArrayAsync(baseUrl + id, ct);
+                                if (bytes.Length > 1000)
+                                {
+                                    Interlocked.Increment(ref streamed);
+                                    if (saveCache && cachedPath != null)
+                                        await File.WriteAllBytesAsync(cachedPath, bytes, ct);
+                                    break;
+                                }
+                                bytes = null;
+                            }
+                            catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+                            {
+                                bytes = null;
                                 break;
                             }
-                            bytes = null;
+                            catch
+                            {
+                                bytes = null;
+                                if (attempt < 1) await Task.Delay(250 * (attempt + 1), ct);
+                            }
                         }
-                        catch
-                        {
-                            bytes = null;
-                            if (attempt < 2) await Task.Delay(250 * (attempt + 1), ct);
-                        }
+                        if (bytes != null) break;
                     }
                 }
 

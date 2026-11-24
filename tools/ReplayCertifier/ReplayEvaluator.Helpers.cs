@@ -52,6 +52,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                 FrontNodeIds = ToIntArray((IEnumerable)h.FrontNodeIds),
                 Hp = (int)h.Hp,
                 Gold = (int)h.Gold,
+                CrimeNum = (int)h.CrimeNum,
                 NotSelect = (bool)h.NotSelect
             };
             if (h.Buffs != null)
@@ -62,6 +63,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                         int bid = (int)kv.Value.BuffId;
                         u.BuffIds.Add(bid);
                         if (bid == 10011 && kv.Value.Source != null) u.TauntSkillId = (int)kv.Value.Source.Id;
+                        if (bid == 10671303 || (bid == 10671301 && (int)kv.Value.Progress > 0)) u.WardenRevealed = true;
                     }
             }
             return u;
@@ -96,6 +98,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                     target.Gold = (int)eff.Gold.CurrGold;
                     if (actorIsThief && !target.IsMonster && chg < 0) thiefStole = true;
                 }
+                if (eff.CrimeNum != null) target.CrimeNum = Math.Max(0, (int)eff.CrimeNum.CurrNum);
                 if (eff.NotSelect != null) target.NotSelect = (bool)eff.NotSelect.NotSelect;
                 if (eff.Disappear != null && target.IsMonster) target.Hp = 0;
 
@@ -110,6 +113,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                         {
                             target.BuffIds.Add(bid);
                             if (bid == 10011 && eff.Buff.Buff.Source != null) target.TauntSkillId = (int)eff.Buff.Buff.Source.Id;
+                            if (bid == 10671303 || (bid == 10671301 && (int)eff.Buff.Buff.Progress > 0)) target.WardenRevealed = true;
                         }
                     }
                     else if (eff.Buff.Buffs != null)
@@ -123,6 +127,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                             {
                                 target.BuffIds.Add(bid);
                                 if (bid == 10011 && kv.Value.Source != null) target.TauntSkillId = (int)kv.Value.Source.Id;
+                                if (bid == 10671303 || (bid == 10671301 && (int)kv.Value.Progress > 0)) target.WardenRevealed = true;
                             }
                         }
                     }

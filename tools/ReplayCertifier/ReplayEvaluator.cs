@@ -21,9 +21,11 @@ namespace MonsterPathPredictor.ReplayCertifier
             public int[] FrontNodeIds = Array.Empty<int>();
             public int Hp;
             public int Gold;
+            public int CrimeNum;
             public bool NotSelect;
             public bool DisplacedBySkill;
             public int TauntSkillId;
+            public bool WardenRevealed;
             public HashSet<int> BuffIds = new();
         }
 
@@ -39,7 +41,7 @@ namespace MonsterPathPredictor.ReplayCertifier
 
             int mapId = (int)running.Room.MapId;
             int mapIndex = (int)running.Room.MapIndex;
-            if (mapId < 82000 || mapId >= 83000) { summary.SkippedNonPve = 1; return summary; }
+            if (mapId < 82000 || mapId >= 84000) { summary.SkippedNonPve = 1; return summary; }
             if (!catalog.TryGetGraph(mapId, mapIndex, out var board)) { summary.MissingMap = 1; return summary; }
 
             summary.ReplaysVerified = 1;
@@ -76,6 +78,7 @@ namespace MonsterPathPredictor.ReplayCertifier
 
             int curRound = (int)running.Room.Round;
             long curTurnActor = 0;
+            int turnStartLandId = -1;
             bool startedOnFork = false, stepped = false, foughtOnTile = false, foughtTurn = false, thiefStoleOnTile = false;
 
             for (int fi = 0; fi < frames.Count; fi++)
@@ -91,7 +94,8 @@ namespace MonsterPathPredictor.ReplayCertifier
                     curRound = (int)snap.Room.Round;
                     curTurnActor = (long)snap.PlayerId;
                     stepped = foughtOnTile = foughtTurn = thiefStoleOnTile = false;
-                    startedOnFork = monsters.TryGetValue(curTurnActor, out var am) && board.IsFork(am.NodeId);
+                    turnStartLandId = monsters.TryGetValue(curTurnActor, out var am) ? am.NodeId : -1;
+                    startedOnFork = am != null && board.IsFork(am.NodeId);
                 }
                 else if (cmd == 1018)
                 {
@@ -114,6 +118,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                         {
                             curTurnActor = ma.Id;
                             stepped = foughtOnTile = foughtTurn = thiefStoleOnTile = false;
+                            turnStartLandId = ma.NodeId;
                             startedOnFork = board.IsFork(ma.NodeId);
                         }
                     }
@@ -174,7 +179,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                     dynamic mv = decoder.TryDecode("party.protocol.MoveS2C", payload);
                     if (mv != null)
                         HandleMove(mv, replayId, mapId, curRound, fi, board, players, monsters, spawnedAtTile,
-                            startedOnFork, ref stepped, ref foughtOnTile, foughtTurn, ref thiefStoleOnTile, mapStat, summary);
+                            startedOnFork, turnStartLandId, ref stepped, ref foughtOnTile, foughtTurn, ref thiefStoleOnTile, mapStat, summary);
                 }
             }
 

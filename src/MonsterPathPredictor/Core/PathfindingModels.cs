@@ -47,6 +47,7 @@ namespace MonsterPathPredictor.Core
         SpawnDirection,
         CurrentFacing,
         TauntChase,
+        MarkedTargetChase,
         SkillTrashcanRed,
         SkillShirleyRandom,
         SkillLinglingRedBlue,
@@ -77,12 +78,32 @@ namespace MonsterPathPredictor.Core
         public int CanStep { get; set; }
 
         public bool IsCurrentlyMovingMidTurn { get; set; }
+        /// <summary>Tile where the monster started its current turn (-1 if unknown / turn has not started yet).</summary>
+        public int TurnStartLandId { get; set; } = -1;
         public bool JustFoughtOnCurrentFork { get; set; }
         public bool HasLaunchedFightThisTurn { get; set; }
         public bool JustSpawnedOnFork { get; set; }
 
         public bool IsTaunted { get; set; }
         public long TauntTargetPlayerId { get; set; }
+
+        /// <summary>
+        /// Library (82016) Warden (1067, before true culprit reveal) and Guard (1068, before 5 dmg / buff 10681202):
+        /// only pursues and attacks players with CrimeNum &gt; 0, and does not cascade past a behind nearest culprit.
+        /// </summary>
+        public bool RequiresCrimeTarget { get; set; }
+
+        /// <summary>
+        /// Magic Academy (82012) / Stadium (83001) Academy Security Officer (1018):
+        /// prioritizes players marked with 【问题学生】 (buff 2101001) and may reverse at turn start to chase them.
+        /// </summary>
+        public bool ChasesProblemStudent { get; set; }
+
+        /// <summary>
+        /// Garden Courtyard (82015) Bronze Mandarin Duck (1047):
+        /// prioritizes players marked with buff 10470101 and may reverse at turn start to chase them.
+        /// </summary>
+        public bool ChasesMandarinDuckMark { get; set; }
 
         public SkillMoveKind SkillMoveKind { get; set; } = SkillMoveKind.None;
         public int SkillMovePushDirectionLandId { get; set; } = -1;
@@ -100,6 +121,12 @@ namespace MonsterPathPredictor.Core
         public bool IsTargetable { get; set; } = true;
         /// <summary>Player's current stars/gold (-1 = unknown/assume positive for thief steal checks).</summary>
         public int Gold { get; set; } = -1;
+        /// <summary>Library (82016) 【罪证】 stack count (buff 10013 / Hero.CrimeNum).</summary>
+        public int CrimeNum { get; set; }
+        /// <summary>Magic Academy (82012) / Stadium (83001) 【问题学生】 mark (buff 2101001).</summary>
+        public bool HasProblemStudentMark { get; set; }
+        /// <summary>Garden Courtyard (82015) Bronze Mandarin Duck mark (buff 10470101).</summary>
+        public bool HasMandarinDuckMark { get; set; }
 
         public string SeatTag => "P" + (Slot + 1);
     }

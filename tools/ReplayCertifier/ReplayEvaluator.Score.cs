@@ -11,7 +11,7 @@ namespace MonsterPathPredictor.ReplayCertifier
         private static void HandleMove(
             dynamic mv, string replayId, int mapId, int curRound, int fi, BoardGraph board,
             Dictionary<long, UnitSim> players, Dictionary<long, UnitSim> monsters, Dictionary<long, int> spawnedAtTile,
-            bool startedOnFork, ref bool stepped, ref bool foughtOnTile, bool foughtTurn, ref bool thiefStoleOnTile,
+            bool startedOnFork, int turnStartLandId, ref bool stepped, ref bool foughtOnTile, bool foughtTurn, ref bool thiefStoleOnTile,
             MapStats mapStat, CertificationSummary summary)
         {
             long moverId = (long)mv.PlayerId;
@@ -47,7 +47,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                 {
                     ScoreForkDecision(m, isNormalAggro, isThief, curTile, fromTile, nextTile,
                         replayId, mapId, curRound, fi, board, players, spawnedAtTile,
-                        startedOnFork, stepped, foughtOnTile, foughtTurn, thiefStoleOnTile, mapStat, summary);
+                        startedOnFork, turnStartLandId, stepped, foughtOnTile, foughtTurn, thiefStoleOnTile, mapStat, summary);
                 }
 
                 m.BackNodeId = curTile;
@@ -65,7 +65,7 @@ namespace MonsterPathPredictor.ReplayCertifier
             UnitSim m, bool isNormalAggro, bool isThief, int curTile, int fromTile, int nextTile,
             string replayId, int mapId, int curRound, int fi, BoardGraph board,
             Dictionary<long, UnitSim> players, Dictionary<long, int> spawnedAtTile,
-            bool startedOnFork, bool stepped, bool foughtOnTile, bool foughtTurn, bool thiefStoleOnTile,
+            bool startedOnFork, int turnStartLandId, bool stepped, bool foughtOnTile, bool foughtTurn, bool thiefStoleOnTile,
             MapStats mapStat, CertificationSummary summary)
         {
             bool isTurnStart = !stepped && startedOnFork;
@@ -95,6 +95,11 @@ namespace MonsterPathPredictor.ReplayCertifier
                 if (caster != null) tauntTargetId = caster.Id;
             }
 
+            bool anyPlayerHasTrueCulprit = players.Values.Any(p => p.BuffIds.Contains(10671302));
+            bool requiresCrimeTarget =
+                (m.HeroId == 1067 && !m.WardenRevealed && !anyPlayerHasTrueCulprit) ||
+                (m.HeroId == 1068 && !m.BuffIds.Contains(10681202));
+
             // Thief stealing on a fork interrupts movement and leaves that fork via Red > Blue
             bool thiefStoleHere = isThief && stepped && !isPostCombat && thiefStoleOnTile;
 
@@ -108,17 +113,28 @@ namespace MonsterPathPredictor.ReplayCertifier
                 FromLandId = fromTile,
                 FrontNodeIds = m.FrontNodeIds,
                 IsCurrentlyMovingMidTurn = stepped && !thiefStoleHere,
+                TurnStartLandId = turnStartLandId,
                 JustFoughtOnCurrentFork = isPostCombat || thiefStoleHere,
                 HasLaunchedFightThisTurn = foughtTurn,
                 JustSpawnedOnFork = isFreshSpawn,
                 IsTaunted = isTaunted,
-                TauntTargetPlayerId = tauntTargetId
+                TauntTargetPlayerId = tauntTargetId,
+                RequiresCrimeTarget = requiresCrimeTarget,
+                ChasesProblemStudent = (m.HeroId == 1018),
+                ChasesMandarinDuckMark = (m.HeroId == 1047)
             };
 
             var trackedPlayers = players.Values.Select(p => new TrackedPlayer
             {
-                PlayerId = p.Id, Slot = p.Slot, LandId = p.NodeId,
-                IsAlive = p.Hp > 0, IsTargetable = !p.NotSelect, Gold = p.Gold
+                PlayerId = p.Id,
+                Slot = p.Slot,
+                LandId = p.NodeId,
+                IsAlive = p.Hp > 0,
+                IsTargetable = !p.NotSelect,
+                Gold = p.Gold,
+                CrimeNum = p.CrimeNum,
+                HasProblemStudentMark = p.BuffIds.Contains(2101001),
+                HasMandarinDuckMark = p.BuffIds.Contains(10470101)
             }).ToList();
 
             var plan = MonsterPathEngine.Plan(board, mState, trackedPlayers, new PlanOptions

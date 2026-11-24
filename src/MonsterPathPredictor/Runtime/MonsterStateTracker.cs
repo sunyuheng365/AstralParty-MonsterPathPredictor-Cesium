@@ -195,6 +195,7 @@ namespace MonsterPathPredictor.Runtime
             var playerPositions = new Dictionary<long, int>();
             var heroIdToPlayerId = new Dictionary<int, long>();
             var aliveMonsterIds = new HashSet<long>();
+            bool anyPlayerHasTrueCulprit = false;
 
             for (int i = 0; i < allUnits.Count; i++)
             {
@@ -206,7 +207,8 @@ namespace MonsterPathPredictor.Runtime
 
                 if (cType == CharacterType.Hero)
                 {
-                    var tp = BuildTrackedPlayer(pd, settings);
+                    var tp = BuildTrackedPlayer(pd, settings, out bool isTrueCulprit);
+                    if (isTrueCulprit) anyPlayerHasTrueCulprit = true;
                     if (tp != null)
                     {
                         players.Add(tp);
@@ -292,6 +294,7 @@ namespace MonsterPathPredictor.Runtime
                 bool isNormalAggressive = IsNormalAggressiveMonster(pd);
                 bool isThief = IsThiefMonster(pd);
                 bool isTaunted = TryReadTauntTarget(pd, heroIdToPlayerId, out long tauntTargetId);
+                bool requiresCrimeTarget = IsCrimeRestrictedMonster(pd, heroId, anyPlayerHasTrueCulprit);
                 int actionWeight = SafeActionWeight(pd);
                 SafeHp(pd, out int hp, out int maxHp);
 
@@ -311,11 +314,15 @@ namespace MonsterPathPredictor.Runtime
                     FrontNodeIds = frontIds,
                     CanStep = canStep,
                     IsCurrentlyMovingMidTurn = isMovingMidTurn,
+                    TurnStartLandId = (curActorId == mid) ? _activeActorStartLandId : landId,
                     JustFoughtOnCurrentFork = justFought,
                     HasLaunchedFightThisTurn = launchedFightThisTurn,
                     JustSpawnedOnFork = mem.JustSpawnedOnFork && board.IsFork(landId),
                     IsTaunted = isTaunted,
                     TauntTargetPlayerId = tauntTargetId,
+                    RequiresCrimeTarget = requiresCrimeTarget,
+                    ChasesProblemStudent = (heroId == 1018),
+                    ChasesMandarinDuckMark = (heroId == 1047),
                     SkillMoveKind = mem.SkillMoveLandId == landId ? mem.SkillMoveKind : SkillMoveKind.None,
                     SkillMovePushDirectionLandId = mem.SkillMoveLandId == landId ? mem.SkillMovePushDirId : -1,
                     SkillMovePushFromLandId = mem.SkillMoveLandId == landId ? mem.SkillMovePushFromId : -1
@@ -517,8 +524,9 @@ namespace MonsterPathPredictor.Runtime
             }
         }
 
-        private static TrackedPlayer BuildTrackedPlayer(BattlePlayerData pd, PredictorSettings settings)
+        private static TrackedPlayer BuildTrackedPlayer(BattlePlayerData pd, PredictorSettings settings, out bool isTrueCulprit)
         {
+            isTrueCulprit = false;
             try
             {
                 var p = pd.player;
@@ -536,18 +544,55 @@ namespace MonsterPathPredictor.Runtime
                     try { if (p.Hero != null) notSelect = p.Hero.NotSelect; } catch { }
                 }
 
-                if (!notSelect && settings != null && settings.ExcludedPlayerBuffIds != null && settings.ExcludedPlayerBuffIds.Count > 0)
+                bool hasProblemStudent = false;
+                bool hasMandarinDuck = false;
+                int crimeFromBuff = 0;
+
+                try
                 {
                     var buffs = Players.BuffsOf(p.Id);
-                    for (int i = 0; i < buffs.Count; i++)
+                    if (buffs != null)
                     {
-                        if (settings.ExcludedPlayerBuffIds.Contains(buffs[i].BuffId))
+                        for (int i = 0; i < buffs.Count; i++)
                         {
-                            notSelect = true;
-                            break;
+                            int bid = buffs[i].BuffId;
+                            if (bid == 2101001) hasProblemStudent = true;
+                            else if (bid == 10470101) hasMandarinDuck = true;
+                            else if (bid == 10671302) isTrueCulprit = true;
+
+                            if (!notSelect && settings != null && settings.ExcludedPlayerBuffIds != null &&
+                                settings.ExcludedPlayerBuffIds.Contains(bid))
+                            {
+                                notSelect = true;
+                            }
                         }
                     }
                 }
+                catch { }
+
+                try
+                {
+                    if (p.Hero != null && p.Hero.Buffs != null)
+                    {
+                        foreach (var kv in p.Hero.Buffs)
+                        {
+                            var b = kv.Value;
+                            if (b == null) continue;
+                            int bid = b.BuffId;
+                            if (bid == 2101001) hasProblemStudent = true;
+                            else if (bid == 10470101) hasMandarinDuck = true;
+                            else if (bid == 10671302) isTrueCulprit = true;
+                            else if (bid == 10013 && b.Progress > crimeFromBuff) crimeFromBuff = b.Progress;
+
+                            if (!notSelect && settings != null && settings.ExcludedPlayerBuffIds != null &&
+                                settings.ExcludedPlayerBuffIds.Contains(bid))
+                            {
+                                notSelect = true;
+                            }
+                        }
+                    }
+                }
+                catch { }
 
                 int slot = 0;
                 try
@@ -562,6 +607,7 @@ namespace MonsterPathPredictor.Runtime
                 int landId = SafeLandId(pd);
                 string nick = Players.SafeNick(pd) ?? ("P" + (slot + 1));
                 int gold = SafeGold(pd);
+                int crimeNum = Math.Max(SafeCrimeNum(pd), crimeFromBuff);
 
                 return new TrackedPlayer
                 {
@@ -571,7 +617,10 @@ namespace MonsterPathPredictor.Runtime
                     LandId = landId,
                     IsAlive = !dead,
                     IsTargetable = !notSelect,
-                    Gold = gold
+                    Gold = gold,
+                    CrimeNum = crimeNum,
+                    HasProblemStudentMark = hasProblemStudent,
+                    HasMandarinDuckMark = hasMandarinDuck
                 };
             }
             catch
@@ -648,6 +697,128 @@ namespace MonsterPathPredictor.Runtime
             }
             catch { }
             return -1;
+        }
+
+        private static bool _crimePropResolved;
+        private static MemberInfo _crimePropMember;
+
+        private static int SafeCrimeNum(BattlePlayerData pd)
+        {
+            try
+            {
+                var prop = pd.Property;
+                if (prop != null)
+                {
+                    if (!_crimePropResolved)
+                    {
+                        _crimePropResolved = true;
+                        var t = prop.GetType();
+                        _crimePropMember = (MemberInfo)t.GetProperty("CrimeNum", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                            ?? (MemberInfo)t.GetProperty("crimeNum", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                            ?? (MemberInfo)t.GetField("CrimeNum", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                            ?? t.GetField("crimeNum", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                    }
+                    if (_crimePropMember != null)
+                    {
+                        object raw = _crimePropMember is PropertyInfo pi ? pi.GetValue(prop) : ((FieldInfo)_crimePropMember).GetValue(prop);
+                        if (raw is int iv) return Math.Max(0, iv);
+                        if (raw != null)
+                        {
+                            var valProp = raw.GetType().GetProperty("Value");
+                            if (valProp != null && valProp.GetValue(raw) is int rv) return Math.Max(0, rv);
+                        }
+                    }
+                }
+            }
+            catch { }
+            try
+            {
+                if (pd.player != null && pd.player.Hero != null) return Math.Max(0, pd.player.Hero.CrimeNum);
+            }
+            catch { }
+            return 0;
+        }
+
+        private static bool IsCrimeRestrictedMonster(BattlePlayerData pd, int heroId, bool anyPlayerHasTrueCulprit)
+        {
+            if (heroId == 1067) // 典狱长: restricted to CrimeNum > 0 until 真凶揭露
+            {
+                if (anyPlayerHasTrueCulprit) return false;
+                return !IsWardenTrueCulpritRevealed(pd);
+            }
+            if (heroId == 1068) // 看守: restricted to CrimeNum > 0 until 5 cumulative damage (buff 10681202)
+            {
+                return !HasMonsterBuff(pd, 10681202);
+            }
+            return false;
+        }
+
+        private static bool IsWardenTrueCulpritRevealed(BattlePlayerData pd)
+        {
+            try
+            {
+                long pid = pd.player != null ? pd.player.Id : 0;
+                if (pid != 0)
+                {
+                    var buffs = Players.BuffsOf(pid);
+                    if (buffs != null)
+                    {
+                        for (int i = 0; i < buffs.Count; i++)
+                        {
+                            if (buffs[i].BuffId == 10671303) return true;
+                        }
+                    }
+                }
+            }
+            catch { }
+            try
+            {
+                var hero = pd.player != null ? pd.player.Hero : null;
+                if (hero != null && hero.Buffs != null)
+                {
+                    foreach (var kv in hero.Buffs)
+                    {
+                        var b = kv.Value;
+                        if (b == null) continue;
+                        if (b.BuffId == 10671303 || (b.BuffId == 10671301 && b.Progress > 0)) return true;
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        private static bool HasMonsterBuff(BattlePlayerData pd, int buffId)
+        {
+            try
+            {
+                long pid = pd.player != null ? pd.player.Id : 0;
+                if (pid != 0)
+                {
+                    var buffs = Players.BuffsOf(pid);
+                    if (buffs != null)
+                    {
+                        for (int i = 0; i < buffs.Count; i++)
+                        {
+                            if (buffs[i].BuffId == buffId) return true;
+                        }
+                    }
+                }
+            }
+            catch { }
+            try
+            {
+                var hero = pd.player != null ? pd.player.Hero : null;
+                if (hero != null && hero.Buffs != null)
+                {
+                    foreach (var kv in hero.Buffs)
+                    {
+                        if (kv.Value != null && kv.Value.BuffId == buffId) return true;
+                    }
+                }
+            }
+            catch { }
+            return false;
         }
 
         private static bool TryReadTauntTarget(BattlePlayerData pd, Dictionary<int, long> heroIdToPlayerId, out long targetPlayerId)

@@ -439,7 +439,9 @@ namespace MonsterPathPredictor.Runtime
                     sb.Append(st.MonsterId).Append(':')
                       .Append(st.DisplayName).Append(':')
                       .Append(st.CurrentLandId).Append(':')
-                      .Append(st.Hp).Append('/').Append(st.MaxHp).Append(';');
+                      .Append(st.Hp).Append('/').Append(st.MaxHp).Append(':')
+                      .Append(st.ActionWeight).Append(':')
+                      .Append(st.IsNormalAggressive ? 'A' : 'N').Append(';');
                 }
             }
             return sb.ToString();

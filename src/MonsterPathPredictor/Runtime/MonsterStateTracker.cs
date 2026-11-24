@@ -40,17 +40,21 @@ namespace MonsterPathPredictor.Runtime
             public int SkillMovePushFromId = -1;
         }
 
-        private struct SkillCastRecord
+        private sealed class SkillCastRecord
         {
             public long CasterPlayerId;
             public int SkillId;
             public DateTime TimestampUtc;
+            public HashSet<long> AppliedMonsterIds = new HashSet<long>();
         }
 
         private struct CombatRecord
         {
             public long AttackerId;
             public long DefenderId;
+            public int AttackerLandId;
+            public int DefenderLandId;
+            public long ActiveActorAtEvent;
         }
 
         private const int MaxQueuedEvents = 256;
@@ -59,6 +63,7 @@ namespace MonsterPathPredictor.Runtime
         private readonly ConcurrentQueue<CombatRecord> _combatQueue = new ConcurrentQueue<CombatRecord>();
 
         private readonly Dictionary<long, MonsterMemory> _memories = new Dictionary<long, MonsterMemory>();
+        private readonly HashSet<long> _rosterAliveMonsterIds = new HashSet<long>();
         private readonly Dictionary<long, int> _lastPlayerGold = new Dictionary<long, int>();
         private readonly List<SkillCastRecord> _recentSkills = new List<SkillCastRecord>();
 
@@ -107,6 +112,7 @@ namespace MonsterPathPredictor.Runtime
         public void Reset()
         {
             _memories.Clear();
+            _rosterAliveMonsterIds.Clear();
             _lastPlayerGold.Clear();
             _recentSkills.Clear();
             while (_skillQueue.TryDequeue(out _)) { }
@@ -119,6 +125,40 @@ namespace MonsterPathPredictor.Runtime
             _matchStartTime = 0;
         }
 
+        public bool IsMonsterInAliveRoster(long monsterId)
+        {
+            return monsterId != 0 && _rosterAliveMonsterIds.Contains(monsterId);
+        }
+
+        private static int TryReadLiveUnitLandId(long unitId)
+        {
+            if (unitId == 0) return -1;
+            try
+            {
+                var all = Players.All();
+                if (all == null) return -1;
+                for (int i = 0; i < all.Count; i++)
+                {
+                    var pd = all[i];
+                    if (pd != null && pd.player != null && pd.player.Id == unitId)
+                        return SafeLandId(pd);
+                }
+            }
+            catch { }
+            return -1;
+        }
+
+        private static long TryReadCurrentActorId()
+        {
+            try
+            {
+                if (!Tools.SimpleSingletonProvider<GameLogicManager>.hasInstance) return 0;
+                var cur = SafeGetCurrentPlayer(Tools.SimpleSingletonProvider<GameLogicManager>.inst.battle);
+                return (cur != null && cur.player != null) ? cur.player.Id : 0;
+            }
+            catch { return 0; }
+        }
+
         private void OnFightResolved(FightSnapshot snap)
         {
             if (!_acceptEvents) return;
@@ -127,7 +167,10 @@ namespace MonsterPathPredictor.Runtime
             _combatQueue.Enqueue(new CombatRecord
             {
                 AttackerId = snap.AttackerPlayerId,
-                DefenderId = snap.DefenderPlayerId
+                DefenderId = snap.DefenderPlayerId,
+                AttackerLandId = TryReadLiveUnitLandId(snap.AttackerPlayerId),
+                DefenderLandId = TryReadLiveUnitLandId(snap.DefenderPlayerId),
+                ActiveActorAtEvent = TryReadCurrentActorId()
             });
         }
 
@@ -139,7 +182,14 @@ namespace MonsterPathPredictor.Runtime
             if (atk != 0 || def != 0)
             {
                 if (_combatQueue.Count >= MaxQueuedEvents) _combatQueue.TryDequeue(out _);
-                _combatQueue.Enqueue(new CombatRecord { AttackerId = atk, DefenderId = def });
+                _combatQueue.Enqueue(new CombatRecord
+                {
+                    AttackerId = atk,
+                    DefenderId = def,
+                    AttackerLandId = TryReadLiveUnitLandId(atk),
+                    DefenderLandId = TryReadLiveUnitLandId(def),
+                    ActiveActorAtEvent = TryReadCurrentActorId()
+                });
             }
         }
 
@@ -194,12 +244,15 @@ namespace MonsterPathPredictor.Runtime
             players = new List<TrackedPlayer>();
 
             matchChanged = EnsureSameMatch();
-            var pendingCombatUnits = DrainEventQueues();
 
             if (board == null || battle == null) return;
 
             var allUnits = Players.All();
             if (allUnits == null || allUnits.Count == 0) return;
+
+            // Only drain queued combat/skill events AFTER confirming we have a populated live unit snapshot
+            // so events are never lost on an empty-roster frame.
+            var pendingCombatTiles = DrainEventQueues();
 
             var currentActor = SafeGetCurrentPlayer(battle);
             long curActorId = (currentActor != null && currentActor.player != null) ? currentActor.player.Id : 0;
@@ -222,7 +275,7 @@ namespace MonsterPathPredictor.Runtime
 
             var playerPositions = new Dictionary<long, int>();
             var heroIdToPlayerId = new Dictionary<int, long>();
-            var aliveMonsterIds = new HashSet<long>();
+            var rosterAliveIds = new HashSet<long>();
             var thiefStoleLandIds = new HashSet<int>();
             bool anyPlayerHasTrueCulprit = false;
 
@@ -270,16 +323,16 @@ namespace MonsterPathPredictor.Runtime
                 try { cType = pd.characterType; } catch { }
                 if (cType != CharacterType.Monster) continue;
 
-                if (!IsMonsterAliveAndActive(pd)) continue;
+                if (!IsRosterMonsterAlive(pd)) continue;
+
+                long mid = pd.player.Id;
+                rosterAliveIds.Add(mid);
 
                 var ch = pd.CharacterInst;
                 if (!UnityObject.IsAlive(ch)) continue;
 
                 int landId = SafeLandId(pd);
                 if (!board.Contains(landId)) continue;
-
-                long mid = pd.player.Id;
-                aliveMonsterIds.Add(mid);
 
                 int fromLandId = SafeFromLandId(pd);
                 int[] frontIds = SafeFrontNodeIds(pd);
@@ -299,8 +352,9 @@ namespace MonsterPathPredictor.Runtime
                 }
                 else
                 {
-                    // Clear prior-turn post-combat flag when a brand new turn starts for this monster
-                    if (curActorId == mid && mem.JustFoughtOnFork && mem.CombatTurnSequence != _turnSequence)
+                    // Invalidate any prior-turn post-combat marker as soon as turn sequence advances,
+                    // even when another actor is currently taking their turn (prevents stale preview pollution).
+                    if (mem.JustFoughtOnFork && mem.CombatTurnSequence != _turnSequence)
                     {
                         mem.JustFoughtOnFork = false;
                         mem.CombatForkLandId = -1;
@@ -313,7 +367,7 @@ namespace MonsterPathPredictor.Runtime
 
                         if (!isMonsterOwnTurn || movedNonAdjacently)
                         {
-                            TryTagSkillDisplacement(board, mem, mem.LastLandId, landId, playerPositions, allUnits);
+                            TryTagSkillDisplacement(board, mid, mem, mem.LastLandId, landId, playerPositions, allUnits);
                         }
                         else
                         {
@@ -337,17 +391,32 @@ namespace MonsterPathPredictor.Runtime
                     }
                 }
 
-                // Stamp queued combat events or Thief fork steals onto the monster's LIVE current tile
-                // (prevents stamping stale LastLandId when monster stepped onto a fork and fought between snapshots).
-                if (pendingCombatUnits.Contains(mid) ||
-                    (isThief && curActorId == mid && board.IsFork(landId) && thiefStoleLandIds.Contains(landId)))
+                // Stamp queued combat events ONLY onto the actual tile where combat occurred (and only if it is a fork
+                // and belongs to the monster's active turn), or Thief fork steal on current fork tile.
+                if (pendingCombatTiles.TryGetValue(mid, out var combatEvt) &&
+                    (combatEvt.ActiveActor == 0 || combatEvt.ActiveActor == mid) &&
+                    curActorId == mid)
+                {
+                    int actualCombatTile = combatEvt.LandId >= 0 ? combatEvt.LandId : landId;
+                    if (board.IsFork(actualCombatTile))
+                    {
+                        mem.JustFoughtOnFork = true;
+                        mem.CombatForkLandId = actualCombatTile;
+                        mem.CombatTurnSequence = _turnSequence;
+                    }
+                }
+                else if (isThief && curActorId == mid && board.IsFork(landId) && thiefStoleLandIds.Contains(landId))
                 {
                     mem.JustFoughtOnFork = true;
                     mem.CombatForkLandId = landId;
                     mem.CombatTurnSequence = _turnSequence;
                 }
 
-                bool justFought = mem.JustFoughtOnFork && mem.CombatForkLandId == landId && board.IsFork(landId);
+                bool justFought = (curActorId == mid) &&
+                                  mem.JustFoughtOnFork &&
+                                  mem.CombatTurnSequence == _turnSequence &&
+                                  mem.CombatForkLandId == landId &&
+                                  board.IsFork(landId);
                 bool isMovingMidTurn = (curActorId == mid) && _activeActorSteppedThisTurn && !justFought;
                 bool launchedFightThisTurn = (curActorId == mid) && SafeIsLaunchFight(pd);
 
@@ -435,12 +504,16 @@ namespace MonsterPathPredictor.Runtime
                 }
             }
 
-            if (_memories.Count > aliveMonsterIds.Count)
+            _rosterAliveMonsterIds.Clear();
+            foreach (long id in rosterAliveIds) _rosterAliveMonsterIds.Add(id);
+
+            // Only prune memories for monsters truly removed/dead from the roster (NOT temporarily unrendered models).
+            if (_memories.Count > rosterAliveIds.Count)
             {
                 var stale = new List<long>();
                 foreach (var k in _memories.Keys)
                 {
-                    if (!aliveMonsterIds.Contains(k)) stale.Add(k);
+                    if (!rosterAliveIds.Contains(k)) stale.Add(k);
                 }
                 for (int i = 0; i < stale.Count; i++) _memories.Remove(stale[i]);
             }
@@ -462,7 +535,13 @@ namespace MonsterPathPredictor.Runtime
             return false;
         }
 
-        private HashSet<long> DrainEventQueues()
+        private struct PendingUnitCombat
+        {
+            public int LandId;
+            public long ActiveActor;
+        }
+
+        private Dictionary<long, PendingUnitCombat> DrainEventQueues()
         {
             var now = DateTime.UtcNow;
             while (_skillQueue.TryDequeue(out var sk))
@@ -477,17 +556,20 @@ namespace MonsterPathPredictor.Runtime
                 }
             }
 
-            var combatUnits = new HashSet<long>();
+            var combatByUnit = new Dictionary<long, PendingUnitCombat>();
             while (_combatQueue.TryDequeue(out var c))
             {
-                if (c.AttackerId != 0) combatUnits.Add(c.AttackerId);
-                if (c.DefenderId != 0) combatUnits.Add(c.DefenderId);
+                if (c.AttackerId != 0)
+                    combatByUnit[c.AttackerId] = new PendingUnitCombat { LandId = c.AttackerLandId, ActiveActor = c.ActiveActorAtEvent };
+                if (c.DefenderId != 0)
+                    combatByUnit[c.DefenderId] = new PendingUnitCombat { LandId = c.DefenderLandId, ActiveActor = c.ActiveActorAtEvent };
             }
-            return combatUnits;
+            return combatByUnit;
         }
 
         private void TryTagSkillDisplacement(
             BoardGraph board,
+            long monsterId,
             MonsterMemory mem,
             int oldLandId,
             int newLandId,
@@ -499,11 +581,14 @@ namespace MonsterPathPredictor.Runtime
             for (int i = _recentSkills.Count - 1; i >= 0; i--)
             {
                 var sk = _recentSkills[i];
+                if (sk.AppliedMonsterIds.Contains(monsterId)) continue;
+
                 SkillMoveKind kind = IdentifyDisplacementSkill(sk.SkillId, sk.CasterPlayerId, allUnits);
                 if (kind == SkillMoveKind.None) continue;
 
-                // Consume matched skill record once so unrelated subsequent moves aren't falsely tagged
-                _recentSkills.RemoveAt(i);
+                // Record consumption per (cast, target monster) so AoE throws like Sherry (30601/30602)
+                // tag ALL displaced monsters in the same cast without removing the cast for monster #2+.
+                sk.AppliedMonsterIds.Add(monsterId);
 
                 mem.SkillMoveKind = kind;
                 mem.SkillMoveLandId = newLandId;
@@ -743,7 +828,7 @@ namespace MonsterPathPredictor.Runtime
             }
         }
 
-        private static bool IsMonsterAliveAndActive(BattlePlayerData pd)
+        private static bool IsRosterMonsterAlive(BattlePlayerData pd)
         {
             try
             {
@@ -753,8 +838,8 @@ namespace MonsterPathPredictor.Runtime
                     if (prop.HealthState == HealthState.Dead) return false;
                     if (prop.maxHP > 0 && prop.HP != null && prop.HP.Value <= 0) return false;
                 }
-                var ch = pd.CharacterInst;
-                if (!UnityObject.IsAlive(ch)) return false;
+                var hero = pd.player != null ? pd.player.Hero : null;
+                if (hero != null && hero.MaxHp > 0 && hero.Hp <= 0) return false;
                 return true;
             }
             catch

@@ -28,6 +28,7 @@ $stageRoot = Join-Path $distDir ("stage-" + [Guid]::NewGuid().ToString("N").Subs
 $stageModDir = Join-Path $stageRoot $modId
 $zipPath = Join-Path $distDir "$modId-$version.zip"
 $tmpZipPath = Join-Path $distDir ("$modId-$version.zip." + [Guid]::NewGuid().ToString("N").Substring(0, 8) + ".tmp")
+$bakZipPath = Join-Path $distDir ("$modId-$version.zip." + [Guid]::NewGuid().ToString("N").Substring(0, 8) + ".bak")
 
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -64,9 +65,23 @@ try {
         $verify.Dispose()
     }
 
-    Move-Item -Path $tmpZipPath -Destination $zipPath -Force
+    # Atomic same-volume publish without a destination-missing deletion window
+    if ([System.IO.File]::Exists($zipPath)) {
+        [System.IO.File]::Replace($tmpZipPath, $zipPath, $bakZipPath, $true)
+    } else {
+        try {
+            [System.IO.File]::Move($tmpZipPath, $zipPath)
+        } catch [System.IO.IOException] {
+            if ([System.IO.File]::Exists($zipPath)) {
+                [System.IO.File]::Replace($tmpZipPath, $zipPath, $bakZipPath, $true)
+            } else {
+                throw
+            }
+        }
+    }
 } finally {
     if (Test-Path $tmpZipPath) { Remove-Item $tmpZipPath -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $bakZipPath) { Remove-Item $bakZipPath -Force -ErrorAction SilentlyContinue }
     if (Test-Path $stageRoot) { Remove-Item $stageRoot -Recurse -Force -ErrorAction SilentlyContinue }
 }
 

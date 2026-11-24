@@ -56,15 +56,34 @@ namespace MonsterPathPredictor.ReplayCertifier
             }
 
             var replayIds = new List<string>();
-            if (!string.IsNullOrWhiteSpace(corpusFile) && File.Exists(corpusFile))
+            if (!string.IsNullOrWhiteSpace(corpusFile))
             {
-                replayIds.AddRange(File.ReadAllLines(corpusFile)
-                    .Select(l => l.Trim())
-                    .Where(l => l.Length >= 10 && l.All(char.IsDigit)));
+                if (!File.Exists(corpusFile))
+                {
+                    Console.Error.WriteLine("ERROR: Specified --corpus file not found: " + corpusFile);
+                    return 1;
+                }
+                string[] lines = File.ReadAllLines(corpusFile);
+                for (int li = 0; li < lines.Length; li++)
+                {
+                    string trimmed = lines[li].Trim();
+                    if (trimmed.Length == 0 || trimmed.StartsWith("#", StringComparison.Ordinal)) continue;
+                    if (!IsValidReplayId(trimmed))
+                    {
+                        Console.Error.WriteLine($"ERROR: Invalid replay ID at {corpusFile}:{li + 1}: \"{trimmed}\"");
+                        return 1;
+                    }
+                    replayIds.Add(trimmed);
+                }
             }
-            else if (!string.IsNullOrWhiteSpace(cacheDir) && Directory.Exists(cacheDir))
+            else if (!string.IsNullOrWhiteSpace(cacheDir))
             {
-                replayIds.AddRange(Directory.GetFiles(cacheDir).Select(Path.GetFileName));
+                if (!Directory.Exists(cacheDir))
+                {
+                    Console.Error.WriteLine("ERROR: Specified --cache-dir not found: " + cacheDir);
+                    return 1;
+                }
+                replayIds.AddRange(DiscoverCachedReplayIds(cacheDir));
             }
 
             replayIds = replayIds.Distinct(StringComparer.Ordinal).ToList();
@@ -84,8 +103,8 @@ namespace MonsterPathPredictor.ReplayCertifier
             await Parallel.ForEachAsync(replayIds, new ParallelOptions { MaxDegreeOfParallelism = concurrency }, async (id, ct) =>
             {
                 byte[] bytes = null;
-                string cachedPath = !string.IsNullOrWhiteSpace(cacheDir) ? Path.Combine(cacheDir, id) : null;
-                if (cachedPath != null && File.Exists(cachedPath))
+                string cachedPath = ResolveCachedReplayPath(cacheDir, id);
+                if (cachedPath != null)
                 {
                     var fi = new FileInfo(cachedPath);
                     if (fi.Length > 1000)
@@ -94,6 +113,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                         Interlocked.Increment(ref cacheHits);
                     }
                 }
+                string savePath = !string.IsNullOrWhiteSpace(cacheDir) ? Path.Combine(cacheDir, id) : null;
 
                 if (bytes == null)
                 {
@@ -111,8 +131,8 @@ namespace MonsterPathPredictor.ReplayCertifier
                                 if (bytes.Length > 1000)
                                 {
                                     Interlocked.Increment(ref streamed);
-                                    if (saveCache && cachedPath != null)
-                                        await File.WriteAllBytesAsync(cachedPath, bytes, ct);
+                                    if (saveCache && savePath != null)
+                                        await File.WriteAllBytesAsync(savePath, bytes, ct);
                                     break;
                                 }
                                 bytes = null;
@@ -256,8 +276,156 @@ namespace MonsterPathPredictor.ReplayCertifier
                 try { if (File.Exists(tmpMap)) File.Delete(tmpMap); } catch { }
             }
 
-            Console.WriteLine("ReplayCertifier self-tests PASSED (5/5).");
+            // Test 6: Out-of-support actual move (A/B predicted 50/50, 20 go A and 20 go C) MUST fail GATE 0
+            var oos = new CertificationSummary { ReplaysAttempted = 10, ReplaysVerified = 10 };
+            oos.Buckets["MidWalkFork"].DetTotal = 200;
+            oos.Buckets["MidWalkFork"].DetHits = 200;
+            oos.Buckets["ThiefFork"].DetTotal = 20;
+            oos.Buckets["ThiefFork"].DetHits = 20;
+            for (int i = 0; i < 20; i++)
+            {
+                if (!ReplayEvaluator.RecordMultiBranchCalibration(board, 23, exits, actualNext: 22, oos.ProbBins))
+                    oos.OutOfSupportPredictions++;
+                if (!ReplayEvaluator.RecordMultiBranchCalibration(board, 23, exits, actualNext: 24, oos.ProbBins))
+                    oos.OutOfSupportPredictions++;
+            }
+            var e6 = ReportWriter.EvaluateGates(oos, t);
+            if (e6.Passed || e6.CoverageGate != GateStatus.Fail || oos.OutOfSupportPredictions != 20)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 6): Out-of-support 50/50 went undetected (oos={oos.OutOfSupportPredictions}, gate={e6.CoverageGate}).");
+                return 1;
+            }
+
+            // Test 7: 3-way symmetric 30/60/0 bias MUST fail GATE 3 via independent slot #2
+            var board3 = new MonsterPathPredictor.Core.BoardGraph(new[]
+            {
+                new MonsterPathPredictor.Core.LandNodeSnapshot(1, new[] { 2, 3, 4, 5 }),
+                new MonsterPathPredictor.Core.LandNodeSnapshot(2, new[] { 1 }),
+                new MonsterPathPredictor.Core.LandNodeSnapshot(3, new[] { 1 }),
+                new MonsterPathPredictor.Core.LandNodeSnapshot(4, new[] { 1 }),
+                new MonsterPathPredictor.Core.LandNodeSnapshot(5, new[] { 1 })
+            });
+            var exits3 = new List<MonsterPathPredictor.Core.ForkExitPrediction>
+            {
+                new() { NextLandId = 2, ConditionalProbability = 1.0 / 3.0 },
+                new() { NextLandId = 3, ConditionalProbability = 1.0 / 3.0 },
+                new() { NextLandId = 4, ConditionalProbability = 1.0 / 3.0 }
+            };
+            var biased3 = new CertificationSummary { ReplaysAttempted = 10, ReplaysVerified = 10 };
+            biased3.Buckets["MidWalkFork"].DetTotal = 200;
+            biased3.Buckets["MidWalkFork"].DetHits = 200;
+            biased3.Buckets["ThiefFork"].DetTotal = 20;
+            biased3.Buckets["ThiefFork"].DetHits = 20;
+            for (int i = 0; i < 30; i++) ReplayEvaluator.RecordMultiBranchCalibration(board3, 1, exits3, actualNext: 2, biased3.ProbBins);
+            for (int i = 0; i < 60; i++) ReplayEvaluator.RecordMultiBranchCalibration(board3, 1, exits3, actualNext: 3, biased3.ProbBins);
+            var e7 = ReportWriter.EvaluateGates(biased3, t);
+            if (e7.Passed || e7.CalibrationGate != GateStatus.Fail)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 7): 3-way 30/60/0 bias went undetected (gate={e7.CalibrationGate}, maxZ={e7.WorstAbsZ:F2}).");
+                return 1;
+            }
+
+            // Test 8: Standard game/Toys nested cache layout <root>/<id>/<id> AND flat <root>/<id> both discoverable
+            string tmpCache = Path.Combine(Path.GetTempPath(), "certifier-cache-" + Guid.NewGuid().ToString("N"));
+            try
+            {
+                Directory.CreateDirectory(Path.Combine(tmpCache, "1788434495879811"));
+                File.WriteAllBytes(Path.Combine(tmpCache, "1788434495879811", "1788434495879811"), new byte[1200]);
+                File.WriteAllBytes(Path.Combine(tmpCache, "1788434495879812"), new byte[1200]);
+                var discovered = DiscoverCachedReplayIds(tmpCache);
+                if (!discovered.Contains("1788434495879811") || !discovered.Contains("1788434495879812") ||
+                    ResolveCachedReplayPath(tmpCache, "1788434495879811") == null ||
+                    ResolveCachedReplayPath(tmpCache, "1788434495879812") == null)
+                {
+                    Console.Error.WriteLine("SELF-TEST FAILED (Test 8): Nested/flat cache discovery failed.");
+                    return 1;
+                }
+            }
+            finally
+            {
+                try { if (Directory.Exists(tmpCache)) Directory.Delete(tmpCache, true); } catch { }
+            }
+
+            // Test 9: Zero-denominator accuracy MUST format as "N/A", never "100.0000%"
+            if (ReportWriter.FormatAccuracy(0, 0) != "N/A" || ReportWriter.FormatAccuracy(1, 1, 3) != "100.000%")
+            {
+                Console.Error.WriteLine("SELF-TEST FAILED (Test 9): FormatAccuracy zero-denominator mismatch.");
+                return 1;
+            }
+
+            // Test 10: IllegalMoveEdges > 0 MUST fail GATE 0
+            var illegal = new CertificationSummary { ReplaysAttempted = 10, ReplaysVerified = 10, IllegalMoveEdges = 1 };
+            illegal.Buckets["MidWalkFork"].DetTotal = 200;
+            illegal.Buckets["MidWalkFork"].DetHits = 200;
+            illegal.Buckets["ThiefFork"].DetTotal = 20;
+            illegal.Buckets["ThiefFork"].DetHits = 20;
+            illegal.ProbBins["50%"] = new ProbBin { Opp = 40, SumPred = 20.0, Chosen = 20 };
+            var e10 = ReportWriter.EvaluateGates(illegal, t);
+            if (e10.Passed || e10.CoverageGate != GateStatus.Fail)
+            {
+                Console.Error.WriteLine("SELF-TEST FAILED (Test 10): IllegalMoveEdges did not fail GATE 0.");
+                return 1;
+            }
+
+            // Test 11: Full-frame tail truncation (dropping the final 1016 GameFinishS2C frame cleanly on a frame boundary) MUST fail
+            byte[] makeFrame(short cmdId, byte[] body)
+            {
+                var buf = new byte[6 + body.Length];
+                System.Buffers.Binary.BinaryPrimitives.WriteInt16BigEndian(buf.AsSpan(0, 2), cmdId);
+                System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(buf.AsSpan(2, 4), body.Length);
+                body.CopyTo(buf, 6);
+                return buf;
+            }
+            byte[] f1003 = makeFrame(1003, new byte[] { 1, 2, 3 });
+            byte[] f1016 = makeFrame(1016, new byte[] { 4, 5, 6 });
+            byte[] fullStream = f1003.Concat(f1016).ToArray();
+            if (!ReplayEvaluator.HasCompleteFrameStreamAndFinishAnchor(fullStream) ||
+                ReplayEvaluator.HasCompleteFrameStreamAndFinishAnchor(f1003))
+            {
+                Console.Error.WriteLine("SELF-TEST FAILED (Test 11): Full-frame 1016 tail truncation was not caught.");
+                return 1;
+            }
+
+            Console.WriteLine("ReplayCertifier self-tests PASSED (11/11).");
             return 0;
+        }
+
+        private static bool IsValidReplayId(string s)
+        {
+            return !string.IsNullOrWhiteSpace(s) && s.Length >= 10 && s.All(char.IsDigit);
+        }
+
+        public static List<string> DiscoverCachedReplayIds(string cacheDir)
+        {
+            var ids = new List<string>();
+            if (string.IsNullOrWhiteSpace(cacheDir) || !Directory.Exists(cacheDir)) return ids;
+
+            foreach (string file in Directory.GetFiles(cacheDir))
+            {
+                string name = Path.GetFileName(file);
+                if (IsValidReplayId(name)) ids.Add(name);
+            }
+
+            // Also support official game & AstralParty.Toys nested layout: <root>/<id>/<id>
+            foreach (string subDir in Directory.GetDirectories(cacheDir))
+            {
+                string dirName = Path.GetFileName(subDir);
+                if (!IsValidReplayId(dirName)) continue;
+                string nested = Path.Combine(subDir, dirName);
+                if (File.Exists(nested)) ids.Add(dirName);
+            }
+
+            return ids.Distinct(StringComparer.Ordinal).ToList();
+        }
+
+        public static string ResolveCachedReplayPath(string cacheDir, string replayId)
+        {
+            if (string.IsNullOrWhiteSpace(cacheDir) || string.IsNullOrWhiteSpace(replayId)) return null;
+            string flat = Path.Combine(cacheDir, replayId);
+            if (File.Exists(flat)) return flat;
+            string nested = Path.Combine(cacheDir, replayId, replayId);
+            if (File.Exists(nested)) return nested;
+            return null;
         }
 
         private static string GetArg(string[] args, string name)

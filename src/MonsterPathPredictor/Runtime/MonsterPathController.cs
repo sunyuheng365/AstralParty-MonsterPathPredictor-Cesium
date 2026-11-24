@@ -258,7 +258,16 @@ namespace MonsterPathPredictor.Runtime
                         return;
                     }
 
-                    // Brief grace window against 1-frame teleport/re-parent hiccups while still alive
+                    // Monster is still alive in the battle roster (only its CharacterInst/model is
+                    // momentarily unrendered/rebuilding): keep lock & memory intact, just hide overlay.
+                    if (_tracker.IsMonsterInAliveRoster(_selectedMonsterId))
+                    {
+                        _selectedMissingSince = DateTime.MinValue;
+                        _renderer.HideAll();
+                        return;
+                    }
+
+                    // Roster temporarily empty/unavailable: brief grace window before clearing
                     if (_selectedMissingSince == DateTime.MinValue)
                     {
                         _selectedMissingSince = now;

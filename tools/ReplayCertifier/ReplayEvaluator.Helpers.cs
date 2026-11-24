@@ -32,6 +32,19 @@ namespace MonsterPathPredictor.ReplayCertifier
             return (list, truncated);
         }
 
+        public static bool HasCompleteFrameStreamAndFinishAnchor(byte[] bytes)
+        {
+            var (frames, isTruncated) = ReadFrames(bytes);
+            if (isTruncated || frames.Count == 0) return false;
+            bool hasStart = false, hasFinish = false;
+            foreach (var (cmd, payload) in frames)
+            {
+                if (cmd == 1003 && payload.Length > 0) hasStart = true;
+                if (cmd == 1016 && payload.Length > 0) hasFinish = true;
+            }
+            return hasStart && hasFinish;
+        }
+
         private static int[] ToIntArray(IEnumerable items)
         {
             if (items == null) return Array.Empty<int>();

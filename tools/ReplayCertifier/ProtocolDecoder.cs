@@ -17,21 +17,25 @@ namespace MonsterPathPredictor.ReplayCertifier
 
         public ProtocolDecoder(string protocolDir)
         {
-            if (string.IsNullOrWhiteSpace(protocolDir) || !Directory.Exists(protocolDir))
-                throw new DirectoryNotFoundException("Protocol directory not found: " + protocolDir);
+            if (string.IsNullOrWhiteSpace(protocolDir))
+                throw new DirectoryNotFoundException("Protocol directory not specified.");
+
+            string fullDir = Path.GetFullPath(protocolDir);
+            if (!Directory.Exists(fullDir))
+                throw new DirectoryNotFoundException("Protocol directory not found: " + fullDir);
 
             AssemblyLoadContext.Default.Resolving += (ctx, name) =>
             {
                 if (name.Name == null || name.Name == "System.Runtime" || name.Name == "netstandard" ||
                     name.Name == "mscorlib" || name.Name.StartsWith("System.", StringComparison.Ordinal))
                     return null;
-                var p = Path.Combine(protocolDir, name.Name + ".dll");
+                var p = Path.Combine(fullDir, name.Name + ".dll");
                 return File.Exists(p) ? ctx.LoadFromAssemblyPath(p) : null;
             };
 
-            string runtimeDll = Path.Combine(protocolDir, "AstralParty.Runtime.dll");
+            string runtimeDll = Path.Combine(fullDir, "AstralParty.Runtime.dll");
             if (!File.Exists(runtimeDll))
-                throw new FileNotFoundException("AstralParty.Runtime.dll not found in " + protocolDir);
+                throw new FileNotFoundException("AstralParty.Runtime.dll not found in " + fullDir);
 
             _gameAsm = AssemblyLoadContext.Default.LoadFromAssemblyPath(runtimeDll);
         }

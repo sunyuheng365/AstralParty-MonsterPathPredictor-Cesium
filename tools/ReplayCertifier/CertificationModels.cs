@@ -93,6 +93,8 @@ namespace MonsterPathPredictor.ReplayCertifier
         public int ParseErrors;
         public int TruncatedOrCorrupt;
         public long MissingPredictions;
+        public long OutOfSupportPredictions;
+        public long IllegalMoveEdges;
 
         public Dictionary<string, BucketStats> Buckets = new()
         {
@@ -117,6 +119,8 @@ namespace MonsterPathPredictor.ReplayCertifier
             ParseErrors += other.ParseErrors;
             TruncatedOrCorrupt += other.TruncatedOrCorrupt;
             MissingPredictions += other.MissingPredictions;
+            OutOfSupportPredictions += other.OutOfSupportPredictions;
+            IllegalMoveEdges += other.IllegalMoveEdges;
             FrontAudit.MergeFrom(other.FrontAudit);
 
             foreach (var kv in other.Buckets) Buckets[kv.Key].MergeFrom(kv.Value);

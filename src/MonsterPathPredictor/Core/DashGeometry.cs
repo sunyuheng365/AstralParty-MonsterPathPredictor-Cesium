@@ -124,36 +124,43 @@ namespace MonsterPathPredictor.Core
 
             if (directHits.Count > 1)
             {
-                // Order-independent selection: find global closest depth first, then pick best
-                // normalized center distance within the fixed depth tie band (ties by depth, then ID).
+                // Strictly transitive, enumeration-order-independent 3-pass selection:
+                // 1) Find global minimum CameraDepth.
+                // 2) Within [minDepth, minDepth + CoplanarDepthThreshold], find global minimum center distance.
+                // 3) Within [minCenterDist, minCenterDist + 0.001f], break ties deterministically by (CameraDepth, MonsterId).
                 float minDepth = float.MaxValue;
                 for (int i = 0; i < directHits.Count; i++)
                 {
                     if (directHits[i].CameraDepth < minDepth) minDepth = directHits[i].CameraDepth;
                 }
 
-                MonsterHitBox best = null;
-                float bestCenterDist = float.MaxValue;
+                float minCenterDist = float.MaxValue;
                 for (int i = 0; i < directHits.Count; i++)
                 {
                     var cand = directHits[i];
                     if (cand.CameraDepth > minDepth + CoplanarDepthThreshold) continue;
+                    float d = cand.Rect.NormalizedCenterDistanceSq(click);
+                    if (d < minCenterDist) minCenterDist = d;
+                }
 
-                    float candCenterDist = cand.Rect.NormalizedCenterDistanceSq(click);
+                MonsterHitBox best = null;
+                for (int i = 0; i < directHits.Count; i++)
+                {
+                    var cand = directHits[i];
+                    if (cand.CameraDepth > minDepth + CoplanarDepthThreshold) continue;
+                    if (cand.Rect.NormalizedCenterDistanceSq(click) > minCenterDist + 0.001f) continue;
+
                     if (best == null ||
-                        candCenterDist < bestCenterDist - 0.001f ||
-                        (Math.Abs(candCenterDist - bestCenterDist) <= 0.001f &&
-                         (cand.CameraDepth < best.CameraDepth - 0.0001f ||
-                          (Math.Abs(cand.CameraDepth - best.CameraDepth) <= 0.0001f && cand.MonsterId < best.MonsterId))))
+                        cand.CameraDepth < best.CameraDepth ||
+                        (cand.CameraDepth == best.CameraDepth && cand.MonsterId < best.MonsterId))
                     {
                         best = cand;
-                        bestCenterDist = candCenterDist;
                     }
                 }
                 return best != null ? best.MonsterId : 0;
             }
 
-            // Near-miss fallback: global closest distance to any sprite bounding box boundary
+            // Near-miss fallback: strictly transitive 3-pass global-minimum selection
             float maxDist = Math.Max(0f, nearMissRadius);
             if (maxDist <= 0f) return 0;
 
@@ -166,24 +173,31 @@ namespace MonsterPathPredictor.Core
                 if (edgeDist < minEdgeDist) minEdgeDist = edgeDist;
             }
 
-            MonsterHitBox nearest = null;
-            float bestCenter = float.MaxValue;
+            float minCenter = float.MaxValue;
             for (int i = 0; i < boxes.Count; i++)
             {
                 var box = boxes[i];
                 if (box == null) continue;
                 float edgeDist = box.Rect.DistanceToPoint(click);
                 if (edgeDist > maxDist || edgeDist > minEdgeDist + 1.5f) continue;
+                float d = box.Rect.Center.DistanceTo(click);
+                if (d < minCenter) minCenter = d;
+            }
 
-                float dCand = box.Rect.Center.DistanceTo(click);
+            MonsterHitBox nearest = null;
+            for (int i = 0; i < boxes.Count; i++)
+            {
+                var box = boxes[i];
+                if (box == null) continue;
+                float edgeDist = box.Rect.DistanceToPoint(click);
+                if (edgeDist > maxDist || edgeDist > minEdgeDist + 1.5f) continue;
+                if (box.Rect.Center.DistanceTo(click) > minCenter + 1f) continue;
+
                 if (nearest == null ||
-                    dCand < bestCenter - 1f ||
-                    (Math.Abs(dCand - bestCenter) <= 1f &&
-                     (box.CameraDepth < nearest.CameraDepth - 0.0001f ||
-                      (Math.Abs(box.CameraDepth - nearest.CameraDepth) <= 0.0001f && box.MonsterId < nearest.MonsterId))))
+                    box.CameraDepth < nearest.CameraDepth ||
+                    (box.CameraDepth == nearest.CameraDepth && box.MonsterId < nearest.MonsterId))
                 {
                     nearest = box;
-                    bestCenter = dCand;
                 }
             }
 

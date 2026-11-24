@@ -51,6 +51,7 @@ namespace MonsterPathPredictor.Runtime
         private readonly Dictionary<long, float> _stableHeaderHeight = new Dictionary<long, float>();
         private readonly Dictionary<int, Point2> _screenCache = new Dictionary<int, Point2>();
         private readonly Dictionary<int, int> _forkTagStack = new Dictionary<int, int>();
+        private readonly Dictionary<long, int> _forkExitLabelStack = new Dictionary<long, int>();
         private readonly HashSet<int> _combatLandSet = new HashSet<int>();
         private readonly List<DashQuad> _dashQuadBuf = new List<DashQuad>(32);
         private readonly List<Vector2> _vertBuf = new List<Vector2>(4);
@@ -209,6 +210,7 @@ namespace MonsterPathPredictor.Runtime
 
             // 3. Fork directional arrows & probability percentage badges (de-overlapped across multi-visit forks)
             _forkTagStack.Clear();
+            _forkExitLabelStack.Clear();
             float tagLineHeight = Math.Max(20f, settings.FontSize + 5f);
             for (int i = 0; i < plan.Forks.Count; i++)
             {
@@ -219,7 +221,6 @@ namespace MonsterPathPredictor.Runtime
                 DrawDot(forkPt, 5.5f, forkAccent);
 
                 _forkTagStack.TryGetValue(fork.ForkLandId, out int visitIndex);
-                float alongShift = Math.Min(0.82f, 0.56f + visitIndex * 0.14f);
 
                 for (int e = 0; e < fork.Exits.Count; e++)
                 {
@@ -236,13 +237,18 @@ namespace MonsterPathPredictor.Runtime
 
                     if (fork.HasMultipleBranches || settings.ShowDeterministicPercent)
                     {
-                        string pctText = visitIndex > 0
+                        long exitKey = ((long)fork.ForkLandId << 32) ^ (uint)exit.NextLandId;
+                        _forkExitLabelStack.TryGetValue(exitKey, out int exitVisit);
+                        _forkExitLabelStack[exitKey] = exitVisit + 1;
+
+                        string pctText = (visitIndex > 0 || exitVisit > 0)
                             ? ("第" + fork.StepIndex + "步 " + exit.FormatConditionalPercent())
                             : exit.FormatConditionalPercent();
                         float lat = fork.Exits.Count <= 2
                             ? (e == 0 ? -16f : 16f)
                             : ((e - (fork.Exits.Count - 1) * 0.5f) * 20f);
-                        var anchor = DashGeometry.ComputeEdgeLabelAnchor(forkPt, exitPt, alongRatio: alongShift, lateralOffset: lat);
+                        var baseAnchor = DashGeometry.ComputeEdgeLabelAnchor(forkPt, exitPt, alongRatio: 0.56f, lateralOffset: lat);
+                        var anchor = new Point2(baseAnchor.X, baseAnchor.Y - exitVisit * tagLineHeight);
                         DrawPillLabel(anchor, pctText, settings.FontSize, exitColor);
                     }
                 }

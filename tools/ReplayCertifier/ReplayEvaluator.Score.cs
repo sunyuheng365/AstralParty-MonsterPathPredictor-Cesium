@@ -8,9 +8,31 @@ namespace MonsterPathPredictor.ReplayCertifier
 {
     internal static partial class ReplayEvaluator
     {
+        private static void ConsumePendingMoveEffects(
+            long moverId,
+            int tileId,
+            Dictionary<long, Dictionary<int, List<dynamic>>> pendingMoveEffects,
+            Dictionary<long, UnitSim> players,
+            Dictionary<long, UnitSim> monsters,
+            long curTurnActor,
+            ref bool thiefStoleOnTile)
+        {
+            if (pendingMoveEffects == null || !pendingMoveEffects.TryGetValue(moverId, out var byTile)) return;
+            if (!byTile.TryGetValue(tileId, out var attrs)) return;
+            byTile.Remove(tileId);
+            if (byTile.Count == 0) pendingMoveEffects.Remove(moverId);
+            foreach (var attr in attrs)
+            {
+                // 1096 HeroSkillMoveEffectS2C pass-by effects (e.g., Forest thief aura 10701102)
+                // do NOT trigger the fork-interrupting steal pause (only 1040 UpdateHeroAttrS2C does).
+                ApplyAttr(attr, players, monsters, true, curTurnActor);
+            }
+        }
+
         private static void HandleMove(
             dynamic mv, string replayId, int mapId, int curRound, int fi, BoardGraph board,
             Dictionary<long, UnitSim> players, Dictionary<long, UnitSim> monsters, Dictionary<long, int> spawnedAtTile,
+            Dictionary<long, Dictionary<int, List<dynamic>>> pendingMoveEffects, long curTurnActor,
             bool startedOnFork, int turnStartLandId, ref bool stepped, ref bool foughtOnTile, bool foughtTurn, ref bool thiefStoleOnTile,
             MapStats mapStat, CertificationSummary summary)
         {
@@ -21,8 +43,11 @@ namespace MonsterPathPredictor.ReplayCertifier
             if (players.TryGetValue(moverId, out var mp))
             {
                 int prev = mp.NodeId;
-                foreach (int nid in nodeIds) if (nid != prev) { mp.BackNodeId = prev; prev = nid; }
-                mp.NodeId = prev;
+                foreach (int nid in nodeIds)
+                {
+                    if (nid != prev) { mp.BackNodeId = prev; prev = nid; mp.NodeId = prev; }
+                    ConsumePendingMoveEffects(moverId, prev, pendingMoveEffects, players, monsters, curTurnActor, ref thiefStoleOnTile);
+                }
                 return;
             }
 
@@ -41,13 +66,20 @@ namespace MonsterPathPredictor.ReplayCertifier
             for (int s = 0; s < pathSteps.Count; s++)
             {
                 int curTile = m.NodeId, nextTile = pathSteps[s], fromTile = m.BackNodeId;
+                bool validEdge = board.Contains(curTile) && board.Contains(nextTile) && board.IsValidNeighbor(curTile, nextTile);
 
-                if (!m.DisplacedBySkill && (isNormalAggro || isThief) &&
-                    board.IsFork(curTile) && board.IsValidNeighbor(curTile, nextTile))
+                if (!m.DisplacedBySkill && (isNormalAggro || isThief))
                 {
-                    ScoreForkDecision(m, isNormalAggro, isThief, curTile, fromTile, nextTile,
-                        replayId, mapId, curRound, fi, board, players, spawnedAtTile,
-                        startedOnFork, turnStartLandId, stepped, foughtOnTile, foughtTurn, thiefStoleOnTile, mapStat, summary);
+                    if (!validEdge)
+                    {
+                        summary.IllegalMoveEdges++;
+                    }
+                    else if (board.IsFork(curTile))
+                    {
+                        ScoreForkDecision(m, isNormalAggro, isThief, curTile, fromTile, nextTile,
+                            replayId, mapId, curRound, fi, board, players, spawnedAtTile,
+                            startedOnFork, turnStartLandId, stepped, foughtOnTile, foughtTurn, thiefStoleOnTile, mapStat, summary);
+                    }
                 }
 
                 m.BackNodeId = curTile;
@@ -58,6 +90,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                 foughtOnTile = false;
                 thiefStoleOnTile = false;
                 if (spawnedAtTile.TryGetValue(m.Id, out int spt) && spt != nextTile) spawnedAtTile.Remove(m.Id);
+                ConsumePendingMoveEffects(moverId, nextTile, pendingMoveEffects, players, monsters, curTurnActor, ref thiefStoleOnTile);
             }
         }
 
@@ -198,25 +231,48 @@ namespace MonsterPathPredictor.ReplayCertifier
             {
                 bStat.ProbTotal++;
                 mapStat.ProbTotal++;
-                RecordMultiBranchCalibration(board, curTile, forkPred.Exits, nextTile, summary.ProbBins);
+                if (!RecordMultiBranchCalibration(board, curTile, forkPred.Exits, nextTile, summary.ProbBins))
+                {
+                    summary.OutOfSupportPredictions++;
+                    if (bStat.Mismatches.Count < 15)
+                    {
+                        string predList = string.Join(",", forkPred.Exits.Select(e => $"{e.NextLandId}:{e.FormatConditionalPercent()}"));
+                        bStat.Mismatches.Add(
+                            $"{replayId} map={mapId} R{curRound} F{fi} m={m.Id} tile={curTile} from={fromTile} pred=[{predList}] actual={nextTile} (OUT_OF_SUPPORT)");
+                    }
+                }
             }
         }
 
         /// <summary>
         /// Records probabilistic calibration observations for a multi-branch fork.
-        /// For symmetric/equal-probability bins (e.g. 50%/50% or 33.3%x3), scores ONLY ONE
-        /// deterministically chosen reference exit selected BEFORE observing actualNext
-        /// (earliest neighbor in raw BoardGraph Red>Blue order), preventing directional
-        /// bias from self-canceling to 50.00% / z=0.00.
+        /// 1. First verifies that <paramref name="actualNext"/> is in the predicted support (positive probability);
+        ///    returns false if out-of-support so GATE 0 fails instead of hiding zero-probability outcomes.
+        /// 2. For 2-way equal-probability bins (e.g. 50%/50%), scores ONE deterministically chosen reference exit
+        ///    selected BEFORE observing actualNext (earliest in raw BoardGraph Red>Blue order).
+        /// 3. For k>=3 equal-probability exits (e.g. 33.3% x 3), scores all k-1 independent slots ordered by raw
+        ///    neighbor priority ("33.3%#1", "33.3%#2", ...) so non-uniform distributions like 30/60/0 are caught!
         /// </summary>
-        public static void RecordMultiBranchCalibration(
+        public static bool RecordMultiBranchCalibration(
             BoardGraph board,
             int forkLandId,
             IReadOnlyList<ForkExitPrediction> exits,
             int actualNext,
             Dictionary<string, ProbBin> probBins)
         {
-            if (exits == null || exits.Count < 2) return;
+            if (exits == null || exits.Count < 2) return false;
+
+            bool inSupport = false;
+            for (int i = 0; i < exits.Count; i++)
+            {
+                if (exits[i].NextLandId == actualNext && exits[i].ConditionalProbability > 0.0)
+                {
+                    inSupport = true;
+                    break;
+                }
+            }
+            if (!inSupport) return false;
+
             var rawNeighbors = board.GetValidNeighbors(forkLandId);
             var byBin = new Dictionary<string, List<ForkExitPrediction>>(StringComparer.Ordinal);
             for (int i = 0; i < exits.Count; i++)
@@ -230,26 +286,42 @@ namespace MonsterPathPredictor.ReplayCertifier
             {
                 string binKey = kv.Key;
                 var group = kv.Value;
-                ForkExitPrediction selected = group[0];
-                if (group.Count > 1)
+                if (group.Count == 1)
                 {
-                    int bestOrder = int.MaxValue;
-                    for (int i = 0; i < group.Count; i++)
+                    AddCalibrationObs(probBins, binKey, group[0], actualNext);
+                }
+                else
+                {
+                    group.Sort((a, b) =>
                     {
-                        int idx = IndexOfNeighbor(rawNeighbors, group[i].NextLandId);
-                        if (idx < bestOrder || (idx == bestOrder && group[i].NextLandId < selected.NextLandId))
+                        int ia = IndexOfNeighbor(rawNeighbors, a.NextLandId);
+                        int ib = IndexOfNeighbor(rawNeighbors, b.NextLandId);
+                        return ia != ib ? ia.CompareTo(ib) : a.NextLandId.CompareTo(b.NextLandId);
+                    });
+
+                    if (group.Count == 2)
+                    {
+                        AddCalibrationObs(probBins, binKey, group[0], actualNext);
+                    }
+                    else
+                    {
+                        for (int r = 0; r < group.Count - 1; r++)
                         {
-                            bestOrder = idx;
-                            selected = group[i];
+                            AddCalibrationObs(probBins, $"{binKey}#{r + 1}", group[r], actualNext);
                         }
                     }
                 }
-
-                if (!probBins.TryGetValue(binKey, out var pb)) probBins[binKey] = pb = new ProbBin();
-                pb.Opp++;
-                pb.SumPred += selected.ConditionalProbability;
-                if (selected.NextLandId == actualNext) pb.Chosen++;
             }
+
+            return true;
+        }
+
+        private static void AddCalibrationObs(Dictionary<string, ProbBin> probBins, string binKey, ForkExitPrediction exit, int actualNext)
+        {
+            if (!probBins.TryGetValue(binKey, out var pb)) probBins[binKey] = pb = new ProbBin();
+            pb.Opp++;
+            pb.SumPred += exit.ConditionalProbability;
+            if (exit.NextLandId == actualNext) pb.Chosen++;
         }
 
         private static int IndexOfNeighbor(IReadOnlyList<int> neighbors, int targetId)

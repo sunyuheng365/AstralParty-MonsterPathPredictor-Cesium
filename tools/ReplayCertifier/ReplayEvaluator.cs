@@ -65,8 +65,24 @@ namespace MonsterPathPredictor.ReplayCertifier
             var monsters = new Dictionary<long, UnitSim>();
             var seenMonsters = new HashSet<long>();
             var spawnedAtTile = new Dictionary<long, int>();
+            var pendingMoveEffects = new Dictionary<long, Dictionary<int, List<dynamic>>>();
+            long curTurnActor = 0;
             bool unknownLayout = false;
             bool decodeFailed = false;
+            bool hasFinishAnchor = false;
+
+            void FlushPendingEffectsForActor(long actorId)
+            {
+                if (actorId == 0 || !pendingMoveEffects.TryGetValue(actorId, out var byTile)) return;
+                foreach (var kv in byTile)
+                {
+                    foreach (var effAttr in kv.Value)
+                    {
+                        ApplyAttr(effAttr, players, monsters, true, curTurnActor);
+                    }
+                }
+                pendingMoveEffects.Remove(actorId);
+            }
 
             void SyncRoom(dynamic room)
             {
@@ -76,6 +92,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                     if (catalog.TryGetGraph(mapId, newIdx, out var nb)) { mapIndex = newIdx; board = nb; }
                     else { unknownLayout = true; return; }
                 }
+                pendingMoveEffects.Clear();
                 var prevDisp = monsters.Where(kv => kv.Value.DisplacedBySkill).Select(kv => kv.Key).ToHashSet();
                 players.Clear();
                 monsters.Clear();
@@ -96,16 +113,30 @@ namespace MonsterPathPredictor.ReplayCertifier
             SyncRoom(running.Room);
 
             int curRound = (int)running.Room.Round;
-            long curTurnActor = 0;
             int turnStartLandId = -1;
             bool startedOnFork = false, stepped = false, foughtOnTile = false, foughtTurn = false, thiefStoleOnTile = false;
 
             for (int fi = 0; fi < frames.Count && !unknownLayout; fi++)
             {
                 var (cmd, payload) = frames[fi];
-                if (payload.Length == 0) continue;
+                if (payload.Length == 0)
+                {
+                    // State-carrying protocol frames must never have empty payload
+                    if (cmd == 1003 || cmd == 1016 || cmd == 1113 || cmd == 1018 || cmd == 5022 ||
+                        cmd == 1040 || cmd == 1096 || cmd == 5214 || cmd == 1007 || cmd == 1115 || cmd == 5028)
+                    {
+                        decodeFailed = true;
+                    }
+                    continue;
+                }
 
-                if (cmd == 1113)
+                if (cmd == 1016)
+                {
+                    dynamic fin = decoder.TryDecode("party.protocol.GameFinishS2C", payload);
+                    if (fin == null) { decodeFailed = true; continue; }
+                    hasFinishAnchor = true;
+                }
+                else if (cmd == 1113)
                 {
                     dynamic snap = decoder.TryDecode("party.protocol.ReplaySnapshotS2C", payload);
                     if (snap?.Room == null) { decodeFailed = true; continue; }
@@ -134,6 +165,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                     dynamic td = decoder.TryDecode("party.protocol.ThrowDiceS2C", payload);
                     if (td == null) { decodeFailed = true; continue; }
                     long actorId = (long)td.PlayerId;
+                    FlushPendingEffectsForActor(curTurnActor);
                     if (monsters.TryGetValue(actorId, out var ma))
                     {
                         curTurnActor = ma.Id;
@@ -153,24 +185,52 @@ namespace MonsterPathPredictor.ReplayCertifier
                 {
                     dynamic sm = decoder.TryDecode("party.protocol.HeroSkillMoveEffectS2C", payload);
                     if (sm == null) { decodeFailed = true; continue; }
+                    long moverId = (long)sm.PlayerId;
+                    UnitSim moverUnit = null;
+                    if (moverId != 0 && !players.TryGetValue(moverId, out moverUnit))
+                        monsters.TryGetValue(moverId, out moverUnit);
+
                     if (sm.EffectData != null)
+                    {
                         foreach (dynamic kv in (IEnumerable)sm.EffectData)
-                            if (kv?.Value?.Effects != null)
-                                foreach (dynamic attr in (IEnumerable)kv.Value.Effects)
+                        {
+                            if (kv?.Value?.Effects == null) continue;
+                            int triggerTile = Convert.ToInt32(kv.Key);
+                            bool applyNow = moverUnit == null || triggerTile < 0 || moverUnit.NodeId == triggerTile;
+                            foreach (dynamic attr in (IEnumerable)kv.Value.Effects)
+                            {
+                                if (applyNow)
+                                {
                                     ApplyAttr(attr, players, monsters, true, curTurnActor);
+                                }
+                                else
+                                {
+                                    if (!pendingMoveEffects.TryGetValue(moverId, out var byTile))
+                                        pendingMoveEffects[moverId] = byTile = new Dictionary<int, List<dynamic>>();
+                                    if (!byTile.TryGetValue(triggerTile, out var list))
+                                        byTile[triggerTile] = list = new List<dynamic>();
+                                    list.Add(attr);
+                                }
+                            }
+                        }
+                    }
                 }
                 else if (cmd == 5214)
                 {
                     dynamic mp = decoder.TryDecode("party.protocol.MonsterPursuitS2C", payload);
                     if (mp == null) { decodeFailed = true; continue; }
+                    if ((bool)mp.Exit) continue;
+
                     long mpid = (long)mp.PlayerId;
-                    if (monsters.TryGetValue(mpid, out var pm))
+                    UnitSim targetUnit = null;
+                    if (!players.TryGetValue(mpid, out targetUnit))
+                        monsters.TryGetValue(mpid, out targetUnit);
+                    if (targetUnit != null)
                     {
                         int nid = (int)mp.NodeId;
-                        if (nid >= 0) pm.NodeId = nid;
-                        pm.BackNodeId = (int)mp.BackId;
-                        int[] fids = ToIntArray((IEnumerable)mp.FrontIds);
-                        if (fids.Length > 0) pm.FrontNodeIds = fids;
+                        if (nid >= 0) targetUnit.NodeId = nid;
+                        targetUnit.BackNodeId = (int)mp.BackId;
+                        targetUnit.FrontNodeIds = ToIntArray((IEnumerable)mp.FrontIds);
                     }
                 }
                 else if (cmd == 1007)
@@ -196,8 +256,8 @@ namespace MonsterPathPredictor.ReplayCertifier
                 {
                     dynamic mv = decoder.TryDecode("party.protocol.MoveS2C", payload);
                     if (mv == null) { decodeFailed = true; continue; }
-                    HandleMove(mv, replayId, mapId, curRound, fi, board, players, monsters, spawnedAtTile,
-                        startedOnFork, turnStartLandId, ref stepped, ref foughtOnTile, foughtTurn, ref thiefStoleOnTile, mapStat, summary);
+                    HandleMove(mv, replayId, mapId, curRound, fi, board, players, monsters, spawnedAtTile, pendingMoveEffects,
+                        curTurnActor, startedOnFork, turnStartLandId, ref stepped, ref foughtOnTile, foughtTurn, ref thiefStoleOnTile, mapStat, summary);
                 }
             }
 
@@ -205,7 +265,7 @@ namespace MonsterPathPredictor.ReplayCertifier
             {
                 summary.MissingMap = 1;
             }
-            else if (isTruncated || decodeFailed)
+            else if (isTruncated || decodeFailed || !hasFinishAnchor)
             {
                 summary.TruncatedOrCorrupt = 1;
             }

@@ -270,6 +270,178 @@ namespace MonsterPathPredictor.Tests
             {
                 Assert.Equal(expected, MonsterHitTester.PickMonster(click, p, 28f));
             }
+
+            // Round 2 counterexample (#16): equal depth 10, half-width 50, center X = 0, 1.4, 2, IDs = 3, 2, 1
+            // Non-transitive pairwise tolerance previously returned 1 in forward order and 3 in reverse order!
+            var eqA = new MonsterHitBox { MonsterId = 3, Rect = new HitRect2D(-50f, -50f, 50f, 50f), CameraDepth = 10f };
+            var eqB = new MonsterHitBox { MonsterId = 2, Rect = new HitRect2D(-48.6f, -50f, 51.4f, 50f), CameraDepth = 10f };
+            var eqC = new MonsterHitBox { MonsterId = 1, Rect = new HitRect2D(-48f, -50f, 52f, 50f), CameraDepth = 10f };
+            var eqPerms = new[]
+            {
+                new[] { eqA, eqB, eqC }, new[] { eqA, eqC, eqB },
+                new[] { eqB, eqA, eqC }, new[] { eqB, eqC, eqA },
+                new[] { eqC, eqA, eqB }, new[] { eqC, eqB, eqA }
+            };
+            long eqWinner = MonsterHitTester.PickMonster(new Point2(0f, 0f), eqPerms[0], 28f);
+            foreach (var p in eqPerms)
+            {
+                Assert.Equal(eqWinner, MonsterHitTester.PickMonster(new Point2(0f, 0f), p, 28f));
+            }
+        }
+
+        [Fact]
+        public void PostCombatTauntPrecedence_LongForecastMatchesArrivalRecomputation()
+        {
+            // Round 2 (#11): RedBlueAfterCombat + Taunted monster fights P2 on normal tile 2,
+            // then reaches Fork 3 (Red=4, Blue=5 -> Taunter P1 at 6).
+            // Long forecast from 1 AND fresh arrival recomputation at 3 must BOTH choose Red(4)!
+            var board = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(1, new[] { 2 }),
+                new LandNodeSnapshot(2, new[] { 3, 1 }),
+                new LandNodeSnapshot(3, new[] { 4, 5, 2 }),
+                new LandNodeSnapshot(4, new[] { 3 }),
+                new LandNodeSnapshot(5, new[] { 6, 3 }),
+                new LandNodeSnapshot(6, new[] { 5 })
+            });
+            var players = new List<TrackedPlayer>
+            {
+                new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = 6, IsAlive = true, IsTargetable = true },
+                new TrackedPlayer { PlayerId = 2, Slot = 1, LandId = 2, IsAlive = true, IsTargetable = true }
+            };
+            var opts = new PlanOptions { MaxSteps = 4, PostCombatMode = PostCombatMode.RedBlueAfterCombat };
+
+            var fromStart = new MonsterState
+            {
+                MonsterId = 911, CurrentLandId = 1, FromLandId = -1, FrontNodeIds = new[] { 2 },
+                IsTaunted = true, TauntTargetPlayerId = 1
+            };
+            var longPlan = MonsterPathEngine.Plan(board, fromStart, players, opts);
+            int longChoice = longPlan.Forks.Single(f => f.ForkLandId == 3).Exits[0].NextLandId;
+
+            var atForkAfterCombat = new MonsterState
+            {
+                MonsterId = 911, CurrentLandId = 3, FromLandId = 2,
+                IsCurrentlyMovingMidTurn = true, HasLaunchedFightThisTurn = true,
+                IsTaunted = true, TauntTargetPlayerId = 1
+            };
+            var arrivalPlan = MonsterPathEngine.Plan(board, atForkAfterCombat, players, opts);
+            int arrivalChoice = arrivalPlan.Forks.Single(f => f.ForkLandId == 3).Exits[0].NextLandId;
+
+            Assert.Equal(4, longChoice);
+            Assert.Equal(longChoice, arrivalChoice);
+        }
+
+        [Fact]
+        public void ExcludedTurnStartMark_DoesNotRegainPriorityInFallbackMidWalkRanking()
+        {
+            // Round 2 (#12): 1047 started turn on tile 1 where ONLY marked player P1 stands.
+            // Monster walks 1 -> 2 -> 3(Fork: Red=4->1 (dist 2 to P1), Blue=5(P2 unmarked, dist 1 to P2)).
+            // P1 on TurnStartLandId(1) must NOT regain PriorityTier=0 over closer unmarked P2(5)!
+            var board = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(1, new[] { 2, 4 }),
+                new LandNodeSnapshot(2, new[] { 3, 1 }),
+                new LandNodeSnapshot(3, new[] { 4, 5, 2 }),
+                new LandNodeSnapshot(4, new[] { 1, 3 }),
+                new LandNodeSnapshot(5, new[] { 3 })
+            });
+            var players = new List<TrackedPlayer>
+            {
+                new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = 1, IsAlive = true, IsTargetable = true, HasMandarinDuckMark = true },
+                new TrackedPlayer { PlayerId = 2, Slot = 1, LandId = 5, IsAlive = true, IsTargetable = true, HasMandarinDuckMark = false }
+            };
+            var monster = new MonsterState
+            {
+                MonsterId = 912, HeroId = 1047, ChasesMandarinDuckMark = true,
+                CurrentLandId = 3, FromLandId = 2, TurnStartLandId = 1,
+                IsCurrentlyMovingMidTurn = true
+            };
+
+            var plan = MonsterPathEngine.Plan(board, monster, players, new PlanOptions { MaxSteps = 1 });
+            Assert.Equal(5, plan.Forks.Single(f => f.ForkLandId == 3).Exits[0].NextLandId);
+        }
+
+        [Fact]
+        public void MidTurnDeadEndRecomputation_StopsCleanlyInsteadOfUTurning()
+        {
+            // Round 2 (#13): minimal board A(1)-B(2). Arriving at B(2) mid-turn with From=A(1), Front=[]
+            // must stop as a dead-end (zero edges, IsDeadEnd=true) instead of U-turning to A(1)!
+            var board = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(1, new[] { 2 }),
+                new LandNodeSnapshot(2, new[] { 1 })
+            });
+            var atB = new MonsterState
+            {
+                MonsterId = 913, CurrentLandId = 2, FromLandId = 1,
+                FrontNodeIds = Array.Empty<int>(), IsCurrentlyMovingMidTurn = true
+            };
+            var plan = MonsterPathEngine.Plan(board, atB, new List<TrackedPlayer>(), new PlanOptions { MaxSteps = 3 });
+            Assert.Empty(plan.Edges);
+            Assert.True(plan.Endpoints.Single().IsDeadEnd);
+        }
+
+        [Fact]
+        public void ThirtyBinarySplits_ExactModePreservesFullProbabilityDownToTwoToMinus30()
+        {
+            // Round 2 (#14): linear spine of 30 binary forks (0 -> 1 -> ... -> 30), each fork i has side dead-end (100+i).
+            // With MinBranchProbability=0.0, even 2^-30 (~9.31e-10 < 1e-9) must NEVER be silently dropped!
+            var nodes = new List<LandNodeSnapshot> { new LandNodeSnapshot(0, new[] { 1 }) };
+            for (int i = 1; i <= 30; i++)
+            {
+                int side = 100 + i;
+                int next = i + 1;
+                nodes.Add(new LandNodeSnapshot(i, new[] { next, side, i - 1 }));
+                nodes.Add(new LandNodeSnapshot(side, new[] { i }));
+            }
+            nodes.Add(new LandNodeSnapshot(31, new[] { 30 }));
+            var board = new BoardGraph(nodes);
+            var m = new MonsterState { MonsterId = 914, CurrentLandId = 0, FromLandId = -1, FrontNodeIds = new[] { 1 } };
+
+            var plan = MonsterPathEngine.Plan(board, m, new List<TrackedPlayer>(), new PlanOptions { MaxSteps = 31, MinBranchProbability = 0.0 });
+            Assert.Equal(0.0, plan.PrunedProbability, 12);
+            Assert.Equal(1.0, plan.Endpoints.Sum(e => e.Probability), 12);
+            Assert.Contains(plan.Endpoints, e => e.LandId == 31 && Math.Abs(e.Probability - Math.Pow(0.5, 30)) < 1e-15);
+        }
+
+        [Fact]
+        public void MergedForkWithDifferingReasons_CombinesLabelInsteadOfShowingOnlyFirstPath()
+        {
+            // Round 2 (#15): ShirleyThrow on Fork 1 sends equal mass onto upper (2 has P3) and lower (3 empty).
+            // At Fork 4, P1 (Slot 0, tile 5) beats P3 (Slot 2, tile 2), so BOTH paths advance 4 -> 5 at step 3:
+            //   - Upper path already fought P3 at tile 2 -> at Fork 5 chases P2(8) onto Blue(7).
+            //   - Lower path fights P1 for the first time at Fork 5 -> leaves Fork 5 via PostCombat Red(6).
+            // Both merge at Fork 5 (AfterCombat=true, step=3) -> 50% Red / 50% Blue with combined "混合(...)" label!
+            var board = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(0, new[] { 1 }),
+                new LandNodeSnapshot(1, new[] { 2, 3, 0 }),
+                new LandNodeSnapshot(2, new[] { 4, 1 }),
+                new LandNodeSnapshot(3, new[] { 4, 1 }),
+                new LandNodeSnapshot(4, new[] { 5, 2, 3 }),
+                new LandNodeSnapshot(5, new[] { 6, 7, 4 }),
+                new LandNodeSnapshot(6, new[] { 5 }),
+                new LandNodeSnapshot(7, new[] { 8, 5 }),
+                new LandNodeSnapshot(8, new[] { 7 })
+            });
+            var players = new List<TrackedPlayer>
+            {
+                new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = 5, IsAlive = true, IsTargetable = true },
+                new TrackedPlayer { PlayerId = 2, Slot = 1, LandId = 8, IsAlive = true, IsTargetable = true },
+                new TrackedPlayer { PlayerId = 3, Slot = 2, LandId = 2, IsAlive = true, IsTargetable = true }
+            };
+            var m = new MonsterState
+            {
+                MonsterId = 915, CurrentLandId = 1, FromLandId = -1,
+                SkillMoveKind = SkillMoveKind.ShirleyThrow
+            };
+
+            var plan = MonsterPathEngine.Plan(board, m, players, new PlanOptions { MaxSteps = 4, SimulateCombatOnFork = true });
+            var fork5 = plan.Forks.Single(f => f.ForkLandId == 5 && f.StepIndex == 3);
+            Assert.Equal(2, fork5.Exits.Count);
+            Assert.Equal(ForkReasonKind.MidForkMultiShortestPath, fork5.ReasonKind);
+            Assert.StartsWith("混合(", fork5.SummaryLabel);
         }
     }
 }

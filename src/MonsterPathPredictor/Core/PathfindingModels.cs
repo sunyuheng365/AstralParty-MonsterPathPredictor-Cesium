@@ -45,6 +45,8 @@ namespace MonsterPathPredictor.Core
         PostCombatRed,
         PostCombatBlue,
         SpawnDirection,
+        CurrentFacing,
+        TauntChase,
         SkillTrashcanRed,
         SkillShirleyRandom,
         SkillLinglingRedBlue,
@@ -66,6 +68,7 @@ namespace MonsterPathPredictor.Core
         public int Hp { get; set; }
         public int MaxHp { get; set; }
         public bool IsNormalAggressive { get; set; } = true;
+        public bool IsThief { get; set; }
         public int ActionWeight { get; set; }
 
         public int CurrentLandId { get; set; } = -1;
@@ -77,6 +80,9 @@ namespace MonsterPathPredictor.Core
         public bool JustFoughtOnCurrentFork { get; set; }
         public bool HasLaunchedFightThisTurn { get; set; }
         public bool JustSpawnedOnFork { get; set; }
+
+        public bool IsTaunted { get; set; }
+        public long TauntTargetPlayerId { get; set; }
 
         public SkillMoveKind SkillMoveKind { get; set; } = SkillMoveKind.None;
         public int SkillMovePushDirectionLandId { get; set; } = -1;
@@ -92,6 +98,8 @@ namespace MonsterPathPredictor.Core
         public int LandId { get; set; } = -1;
         public bool IsAlive { get; set; } = true;
         public bool IsTargetable { get; set; } = true;
+        /// <summary>Player's current stars/gold (-1 = unknown/assume positive for thief steal checks).</summary>
+        public int Gold { get; set; } = -1;
 
         public string SeatTag => "P" + (Slot + 1);
     }
@@ -144,6 +152,7 @@ namespace MonsterPathPredictor.Core
         public int StepIndex { get; set; }
         public double Probability { get; set; }
         public string TargetLabel { get; set; } = string.Empty;
+        public bool IsSteal { get; set; }
     }
 
     public sealed class PredictedEndpoint

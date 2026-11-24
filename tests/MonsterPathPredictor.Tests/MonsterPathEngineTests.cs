@@ -520,5 +520,125 @@ namespace MonsterPathPredictor.Tests
             Assert.Equal(ForkReasonKind.PostCombatRed, fork2Red.ReasonKind);
             Assert.Equal(7, fork2Red.Exits[0].NextLandId);
         }
+
+        [Fact]
+        public void StoppedOnForkWithSingleFacingReadsCurrentFacingInsteadOfRedBlue()
+        {
+            // Monster stopped on fork 23 (raw Red=22, Blue=55, None=24) with explicit single current facing [24]
+            // Even with JustSpawnedOnFork=false and FromLandId set, must follow its current facing arrow [24], not Red(22)!
+            var board = BuildTJunctionBoard();
+            var monster = new MonsterState
+            {
+                MonsterId = 302,
+                CurrentLandId = 23,
+                FromLandId = 55,
+                FrontNodeIds = new[] { 24 },
+                JustSpawnedOnFork = false,
+                IsCurrentlyMovingMidTurn = false
+            };
+
+            var plan = MonsterPathEngine.Plan(board, monster, new List<TrackedPlayer>(), new PlanOptions { MaxSteps = 2 });
+            Assert.Single(plan.Forks);
+            Assert.Equal(ForkReasonKind.CurrentFacing, plan.Forks[0].ReasonKind);
+            Assert.Equal("当前朝向", plan.Forks[0].SummaryLabel);
+            Assert.Single(plan.Forks[0].Exits);
+            Assert.Equal(24, plan.Forks[0].Exits[0].NextLandId);
+        }
+
+        [Fact]
+        public void ForkStartWithRestrictedFrontNodeIdsRestrictsRedBluePriorityToFrontSet()
+        {
+            // Reproduces real replay case from Map 82014 (幽魂暗巷) tile 22:
+            // Raw neighbors = [41 (Red), 23 (Blue), 21 (None)], but monster FrontNodeIds = [23, 21] (41 not allowed).
+            // Must pick 23 (highest priority within FrontNodeIds), NOT 41!
+            var board = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(22, new[] { 41, 23, 21 }),
+                new LandNodeSnapshot(41, new[] { 22 }),
+                new LandNodeSnapshot(23, new[] { 22, 24 }),
+                new LandNodeSnapshot(24, new[] { 23 }),
+                new LandNodeSnapshot(21, new[] { 22 })
+            });
+
+            var monster = new MonsterState
+            {
+                MonsterId = 303,
+                CurrentLandId = 22,
+                FromLandId = -1,
+                FrontNodeIds = new[] { 23, 21 },
+                JustSpawnedOnFork = true
+            };
+
+            var plan = MonsterPathEngine.Plan(board, monster, new List<TrackedPlayer>(), new PlanOptions { MaxSteps = 2 });
+            var fork = plan.Forks.Single(f => f.ForkLandId == 22);
+            Assert.Single(fork.Exits);
+            Assert.Equal(23, fork.Exits[0].NextLandId);
+            Assert.Equal(ForkReasonKind.ForkStartBlue, fork.ReasonKind);
+        }
+
+        [Fact]
+        public void TauntOverridesForkFacingAndAllowsUTurnTowardTaunter()
+        {
+            // Reproduces real replay 1792049438378425 R1 F289 (buff 10011):
+            // Monster on fork 23 has FrontNodeIds=[22] (Red), but P1 at 25 taunted it -> must turn to 24!
+            var board = BuildTJunctionBoard();
+            var players = new List<TrackedPlayer>
+            {
+                new TrackedPlayer { PlayerId = 9001, Slot = 0, LandId = 25, IsAlive = true, IsTargetable = true },
+                new TrackedPlayer { PlayerId = 9002, Slot = 1, LandId = 22, IsAlive = true, IsTargetable = true }
+            };
+
+            var monster = new MonsterState
+            {
+                MonsterId = 304,
+                CurrentLandId = 23,
+                FromLandId = 24,
+                FrontNodeIds = new[] { 22 },
+                IsTaunted = true,
+                TauntTargetPlayerId = 9001
+            };
+
+            var plan = MonsterPathEngine.Plan(board, monster, players, new PlanOptions { MaxSteps = 2 });
+            var fork = plan.Forks.Single(f => f.ForkLandId == 23);
+            Assert.Equal(ForkReasonKind.TauntChase, fork.ReasonKind);
+            Assert.Single(fork.Exits);
+            Assert.Equal(24, fork.Exits[0].NextLandId);
+        }
+
+        [Fact]
+        public void ThiefStealingOnForkSwitchesExitToRedBlueWhileZeroGoldPlayerDoesNot()
+        {
+            // Verified across 746 real replays (597/598 = 99.83%):
+            // Thief arrives at fork 23 from 24 (Red=22, Blue=55). P2 sits on Blue branch (55).
+            // - When P1 on fork 23 has Gold=10 -> Thief steals on fork 23 and leaves via Red(22)!
+            // - When P1 on fork 23 has Gold=0  -> Thief cannot steal, continues chasing P2 via Blue(55)!
+            var board = BuildTJunctionBoard();
+            var thief = new MonsterState
+            {
+                MonsterId = 305,
+                CurrentLandId = 24,
+                FromLandId = 25,
+                IsNormalAggressive = false,
+                IsThief = true
+            };
+
+            var withGold = new List<TrackedPlayer>
+            {
+                new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = 23, IsAlive = true, IsTargetable = true, Gold = 10 },
+                new TrackedPlayer { PlayerId = 2, Slot = 1, LandId = 55, IsAlive = true, IsTargetable = true, Gold = 15 }
+            };
+            var planSteal = MonsterPathEngine.Plan(board, thief, withGold, new PlanOptions { MaxSteps = 3, SimulateCombatOnFork = true });
+            Assert.Single(planSteal.Combats);
+            Assert.True(planSteal.Combats[0].IsSteal);
+            Assert.Equal(22, planSteal.Forks.Single(f => f.ForkLandId == 23).Exits[0].NextLandId);
+
+            var zeroGold = new List<TrackedPlayer>
+            {
+                new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = 23, IsAlive = true, IsTargetable = true, Gold = 0 },
+                new TrackedPlayer { PlayerId = 2, Slot = 1, LandId = 55, IsAlive = true, IsTargetable = true, Gold = 15 }
+            };
+            var planNoSteal = MonsterPathEngine.Plan(board, thief, zeroGold, new PlanOptions { MaxSteps = 3, SimulateCombatOnFork = true });
+            Assert.Equal(55, planNoSteal.Forks.Single(f => f.ForkLandId == 23).Exits[0].NextLandId);
+        }
     }
 }

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Reflection;
 using CesiumLoader.SDK.Engine;
 using CesiumLoader.SDK.Gameplay;
 using Core.Unit;
@@ -192,6 +193,7 @@ namespace MonsterPathPredictor.Runtime
             }
 
             var playerPositions = new Dictionary<long, int>();
+            var heroIdToPlayerId = new Dictionary<int, long>();
             var aliveMonsterIds = new HashSet<long>();
 
             for (int i = 0; i < allUnits.Count; i++)
@@ -209,6 +211,9 @@ namespace MonsterPathPredictor.Runtime
                     {
                         players.Add(tp);
                         if (tp.LandId >= 0) playerPositions[tp.PlayerId] = tp.LandId;
+                        int pHeroId = SafeHeroId(pd);
+                        if (pHeroId > 0 && tp.IsAlive && !heroIdToPlayerId.ContainsKey(pHeroId))
+                            heroIdToPlayerId[pHeroId] = tp.PlayerId;
                     }
                 }
             }
@@ -285,6 +290,8 @@ namespace MonsterPathPredictor.Runtime
                 int heroId = SafeHeroId(pd);
                 string monsterName = ResolveMonsterName(pd, heroId);
                 bool isNormalAggressive = IsNormalAggressiveMonster(pd);
+                bool isThief = IsThiefMonster(pd);
+                bool isTaunted = TryReadTauntTarget(pd, heroIdToPlayerId, out long tauntTargetId);
                 int actionWeight = SafeActionWeight(pd);
                 SafeHp(pd, out int hp, out int maxHp);
 
@@ -297,6 +304,7 @@ namespace MonsterPathPredictor.Runtime
                     Hp = hp,
                     MaxHp = maxHp,
                     IsNormalAggressive = isNormalAggressive,
+                    IsThief = isThief,
                     ActionWeight = actionWeight,
                     CurrentLandId = landId,
                     FromLandId = fromLandId,
@@ -306,6 +314,8 @@ namespace MonsterPathPredictor.Runtime
                     JustFoughtOnCurrentFork = justFought,
                     HasLaunchedFightThisTurn = launchedFightThisTurn,
                     JustSpawnedOnFork = mem.JustSpawnedOnFork && board.IsFork(landId),
+                    IsTaunted = isTaunted,
+                    TauntTargetPlayerId = tauntTargetId,
                     SkillMoveKind = mem.SkillMoveLandId == landId ? mem.SkillMoveKind : SkillMoveKind.None,
                     SkillMovePushDirectionLandId = mem.SkillMoveLandId == landId ? mem.SkillMovePushDirId : -1,
                     SkillMovePushFromLandId = mem.SkillMoveLandId == landId ? mem.SkillMovePushFromId : -1
@@ -551,6 +561,7 @@ namespace MonsterPathPredictor.Runtime
 
                 int landId = SafeLandId(pd);
                 string nick = Players.SafeNick(pd) ?? ("P" + (slot + 1));
+                int gold = SafeGold(pd);
 
                 return new TrackedPlayer
                 {
@@ -559,7 +570,8 @@ namespace MonsterPathPredictor.Runtime
                     Name = nick,
                     LandId = landId,
                     IsAlive = !dead,
-                    IsTargetable = !notSelect
+                    IsTargetable = !notSelect,
+                    Gold = gold
                 };
             }
             catch
@@ -611,6 +623,59 @@ namespace MonsterPathPredictor.Runtime
             {
                 return false;
             }
+        }
+
+        private static bool IsThiefMonster(BattlePlayerData pd)
+        {
+            try
+            {
+                var hero = pd.player != null ? pd.player.Hero : null;
+                return hero != null && hero.MonsterType == Hero.Types.MonsterType.Thief;
+            }
+            catch { return false; }
+        }
+
+        private static int SafeGold(BattlePlayerData pd)
+        {
+            try
+            {
+                if (pd.Property != null && pd.Property.gold != null) return pd.Property.gold.Value;
+            }
+            catch { }
+            try
+            {
+                if (pd.player != null && pd.player.Hero != null) return pd.player.Hero.Gold;
+            }
+            catch { }
+            return -1;
+        }
+
+        private static bool TryReadTauntTarget(BattlePlayerData pd, Dictionary<int, long> heroIdToPlayerId, out long targetPlayerId)
+        {
+            targetPlayerId = 0;
+            try
+            {
+                var hero = pd.player != null ? pd.player.Hero : null;
+                if (hero == null || hero.Buffs == null) return false;
+                foreach (var kv in hero.Buffs)
+                {
+                    var buff = kv.Value;
+                    if (buff == null || buff.BuffId != 10011) continue;
+                    int skillId = buff.Source != null ? buff.Source.Id : 0;
+                    if (skillId >= 10000)
+                    {
+                        int casterHeroId = skillId / 100;
+                        if (heroIdToPlayerId.TryGetValue(casterHeroId, out long pid))
+                        {
+                            targetPlayerId = pid;
+                            return true;
+                        }
+                    }
+                    return true;
+                }
+            }
+            catch { }
+            return false;
         }
 
         private static bool IsNormalAggressiveMonster(BattlePlayerData pd)
@@ -681,8 +746,29 @@ namespace MonsterPathPredictor.Runtime
             return -1;
         }
 
+        private static readonly MethodInfo CharacterGetFrontNodeIds = typeof(Character).GetMethod(
+            "GetFrontNodeIds",
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
         private static int[] SafeFrontNodeIds(BattlePlayerData pd)
         {
+            // 1. Live visual facing arrows from Character.GetFrontNodeIds() (authoritative on forks!)
+            try
+            {
+                var ch = pd.CharacterInst;
+                if (CharacterGetFrontNodeIds != null && UnityObject.IsAlive(ch))
+                {
+                    if (CharacterGetFrontNodeIds.Invoke(ch, null) is List<int> live && live.Count > 0)
+                    {
+                        var arr = new int[live.Count];
+                        for (int i = 0; i < live.Count; i++) arr[i] = live[i];
+                        return arr;
+                    }
+                }
+            }
+            catch { }
+
+            // 2. RoomPlayer.FrontIds
             try
             {
                 if (pd.player != null && pd.player.FrontIds != null && pd.player.FrontIds.Count > 0)
@@ -695,6 +781,7 @@ namespace MonsterPathPredictor.Runtime
             }
             catch { }
 
+            // 3. Protobuf Hero.FrontNodeIds
             try
             {
                 if (pd.player != null && pd.player.Hero != null && pd.player.Hero.FrontNodeIds != null && pd.player.Hero.FrontNodeIds.Count > 0)

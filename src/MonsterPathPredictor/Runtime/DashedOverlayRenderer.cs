@@ -24,23 +24,55 @@ namespace MonsterPathPredictor.Runtime
         private static readonly Color CombatBadgeColor = new Color(1.00f, 0.40f, 0.34f, 0.98f);        // Encounter marker
         private static readonly Color RingColor = new Color(1.00f, 0.88f, 0.25f, 0.95f);               // Selection ring
         private static readonly Color BadgeBg = new Color(0.06f, 0.09f, 0.14f, 0.86f);                 // Dark pill
+        private static readonly float[] PillCornerRadii = { 6f, 6f, 6f, 6f };
+
+        private sealed class PooledPill
+        {
+            public GComponent Root;
+            public GGraph Bg;
+            public GTextField Text;
+            public string LastText;
+            public int LastFontSize;
+            public Color LastColor;
+            public float Width;
+            public float Height;
+            public float LastX;
+            public float LastY;
+            public bool HasContent;
+            public bool HasPos;
+        }
 
         private GComponent _layer;
-        private readonly List<GGraph> _graphPool = new List<GGraph>();
-        private readonly List<GTextField> _textPool = new List<GTextField>();
-        private int _usedGraphs;
-        private int _usedTexts;
+        private GComponent _lineLayer;
+        private GComponent _pillLayer;
+        private readonly List<GGraph> _lineGraphPool = new List<GGraph>();
+        private readonly List<PooledPill> _pillPool = new List<PooledPill>();
+        private readonly Dictionary<long, float> _stableHeaderHeight = new Dictionary<long, float>();
+        private int _usedLineGraphs;
+        private int _usedPills;
 
         public GComponent EnsureLayer()
         {
-            if (_layer != null && !_layer.isDisposed && _layer.parent == GRoot.inst)
+            if (_layer != null && !_layer.isDisposed && _layer.parent == GRoot.inst &&
+                _lineLayer != null && !_lineLayer.isDisposed &&
+                _pillLayer != null && !_pillLayer.isDisposed)
             {
-                _layer.SetSize(GRoot.inst.width, GRoot.inst.height);
+                float w = GRoot.inst.width;
+                float h = GRoot.inst.height;
+                if (Math.Abs(_layer.width - w) > 0.5f || Math.Abs(_layer.height - h) > 0.5f)
+                {
+                    _layer.SetSize(w, h);
+                    _lineLayer.SetSize(w, h);
+                    _pillLayer.SetSize(w, h);
+                }
                 return _layer;
             }
 
             Dispose();
             if (GRoot.inst == null) return null;
+
+            float rootW = GRoot.inst.width;
+            float rootH = GRoot.inst.height;
 
             _layer = new GComponent
             {
@@ -48,17 +80,31 @@ namespace MonsterPathPredictor.Runtime
                 touchable = false,
                 sortingOrder = 55
             };
+            _lineLayer = new GComponent { name = "Lines", touchable = false };
+            _pillLayer = new GComponent { name = "Pills", touchable = false };
+
+            _layer.AddChild(_lineLayer);
+            _layer.AddChild(_pillLayer);
             GRoot.inst.AddChild(_layer);
-            _layer.SetSize(GRoot.inst.width, GRoot.inst.height);
+
+            _layer.SetSize(rootW, rootH);
+            _lineLayer.SetSize(rootW, rootH);
+            _pillLayer.SetSize(rootW, rootH);
             return _layer;
         }
 
         public void HideAll()
         {
-            for (int i = 0; i < _graphPool.Count; i++) _graphPool[i].visible = false;
-            for (int i = 0; i < _textPool.Count; i++) _textPool[i].visible = false;
-            _usedGraphs = 0;
-            _usedTexts = 0;
+            for (int i = 0; i < _lineGraphPool.Count; i++)
+            {
+                if (_lineGraphPool[i].visible) _lineGraphPool[i].visible = false;
+            }
+            for (int i = 0; i < _pillPool.Count; i++)
+            {
+                if (_pillPool[i].Root.visible) _pillPool[i].Root.visible = false;
+            }
+            _usedLineGraphs = 0;
+            _usedPills = 0;
         }
 
         public void Render(
@@ -75,8 +121,8 @@ namespace MonsterPathPredictor.Runtime
                 return;
             }
 
-            _usedGraphs = 0;
-            _usedTexts = 0;
+            _usedLineGraphs = 0;
+            _usedPills = 0;
 
             var camTr = UnityObject.GetTransform(camera);
             var camPos = TransformService.GetPosition(camTr);
@@ -87,6 +133,16 @@ namespace MonsterPathPredictor.Runtime
             float phaseOffset = settings.DashSpeed > 0.01f
                 ? UnityTime.RealtimeSinceStartup * settings.DashSpeed
                 : 0f;
+
+            // 0. Selected monster header badge FIRST (always Pill #0 so its cached FairyGUI mesh never swaps)
+            Vector3 headerWorld = GetStableHeaderAnchorWorld(selectedMonster);
+            if (TryProjectWorld(layer, camera, camPos, camForward, headerWorld, out var headerPt))
+            {
+                string headerText = plan.MonsterName + " · " + plan.StepsRequested + "格";
+                if (!string.IsNullOrEmpty(plan.HeadlineNote))
+                    headerText += " (" + plan.HeadlineNote + ")";
+                DrawPillLabel(new Point2(headerPt.X, headerPt.Y - 12f), headerText, Math.Max(13, settings.FontSize - 2), RingColor);
+            }
 
             var screenCache = new Dictionary<int, Point2>();
             bool TryProjectTile(int landId, out Point2 pt)
@@ -179,15 +235,17 @@ namespace MonsterPathPredictor.Runtime
                 }
             }
 
-            // 4. Encounter / combat markers on tiles occupied by living players
+            // 4. Encounter / combat / steal markers on tiles occupied by living players
             for (int i = 0; i < plan.Combats.Count; i++)
             {
                 var combat = plan.Combats[i];
                 if (!TryProjectTile(combat.LandId, out var cPt)) continue;
 
-                DrawDot(cPt, 7.5f, CombatBadgeColor);
-                string cLabel = "⚔遇" + combat.TargetLabel + "(" + combat.StepIndex + "格)";
-                DrawPillLabel(new Point2(cPt.X, cPt.Y + 18f), cLabel, Math.Max(12, settings.FontSize - 3), CombatBadgeColor);
+                Color badgeColor = combat.IsSteal ? MajorBranchColor : CombatBadgeColor;
+                DrawDot(cPt, 7.5f, badgeColor);
+                string prefix = combat.IsSteal ? "偷" : "⚔遇";
+                string cLabel = prefix + combat.TargetLabel + "(" + combat.StepIndex + "格)";
+                DrawPillLabel(new Point2(cPt.X, cPt.Y + 18f), cLabel, Math.Max(12, settings.FontSize - 3), badgeColor);
             }
 
             // 5. Endpoint markers at the end of X steps (skip if a combat marker already sits on that exact tile)
@@ -208,21 +266,51 @@ namespace MonsterPathPredictor.Runtime
                 DrawPillLabel(new Point2(epPt.X, epPt.Y + yOff), epLabel, Math.Max(12, settings.FontSize - 4), epColor);
             }
 
-            // 6. Selected monster header badge cleanly above the actual sprite top
-            var bounds = selectedMonster.CharacterRef != null
-                ? SpriteBoundsReader.Capture(selectedMonster.CharacterRef, selectedMonster.FeetWorldPos, camera)
-                : selectedMonster.VisualBounds;
-            Vector3 headerWorld = new Vector3(bounds.TopWorld.x, bounds.TopWorld.y + 0.18f, bounds.TopWorld.z);
-            if (TryProjectWorld(layer, camera, camPos, camForward, headerWorld, out var headerPt))
+            for (int i = _usedLineGraphs; i < _lineGraphPool.Count; i++)
             {
-                string headerText = plan.MonsterName + " · " + plan.StepsRequested + "格";
-                if (!string.IsNullOrEmpty(plan.HeadlineNote))
-                    headerText += " (" + plan.HeadlineNote + ")";
-                DrawPillLabel(new Point2(headerPt.X, headerPt.Y - 12f), headerText, Math.Max(13, settings.FontSize - 2), RingColor);
+                if (_lineGraphPool[i].visible) _lineGraphPool[i].visible = false;
+            }
+            for (int i = _usedPills; i < _pillPool.Count; i++)
+            {
+                if (_pillPool[i].Root.visible) _pillPool[i].Root.visible = false;
+            }
+        }
+
+        private Vector3 GetStableHeaderAnchorWorld(LiveMonsterInfo selectedMonster)
+        {
+            Vector3 basePos = selectedMonster.FeetWorldPos;
+            var vb = selectedMonster.VisualBounds;
+
+            // Keep horizontal anchor synced to sprite center (handles stacked lateral offsets on the same tile),
+            // while locking vertical height against idle animation bobbing so the header pill stays rock-steady.
+            float x = vb.FromSprite ? vb.TopWorld.x : basePos.x;
+            float z = vb.FromSprite ? vb.TopWorld.z : basePos.z;
+            float measuredHeight = vb.FromSprite ? Math.Max(1.0f, vb.TopWorld.y - basePos.y) : 1.95f;
+
+            long mid = selectedMonster.State != null ? selectedMonster.State.MonsterId : 0;
+            if (mid != 0)
+            {
+                if (_stableHeaderHeight.TryGetValue(mid, out float cached))
+                {
+                    if (measuredHeight > cached + 0.08f)
+                    {
+                        cached = measuredHeight;
+                        _stableHeaderHeight[mid] = cached;
+                    }
+                    else if (cached - measuredHeight > 0.60f)
+                    {
+                        cached = measuredHeight;
+                        _stableHeaderHeight[mid] = cached;
+                    }
+                    measuredHeight = cached;
+                }
+                else
+                {
+                    _stableHeaderHeight[mid] = measuredHeight;
+                }
             }
 
-            for (int i = _usedGraphs; i < _graphPool.Count; i++) _graphPool[i].visible = false;
-            for (int i = _usedTexts; i < _textPool.Count; i++) _textPool[i].visible = false;
+            return new Vector3(x, basePos.y + measuredHeight + 0.18f, z);
         }
 
         private static Color PickEdgeColor(double probability, bool isAfterCombat)
@@ -308,99 +396,148 @@ namespace MonsterPathPredictor.Runtime
                 verts.Add(new Vector2(points[i].X - minX, points[i].Y - minY));
             }
 
-            var g = AcquireGraph();
+            var g = AcquireLineGraph();
             g.SetXY(minX, minY);
             g.SetSize(w, h);
             g.DrawPolygon(w, h, verts, color);
-            g.visible = true;
+            if (!g.visible) g.visible = true;
         }
 
         private void DrawDot(Point2 center, float radius, Color color)
         {
             float d = radius * 2f;
-            var g = AcquireGraph();
+            var g = AcquireLineGraph();
             g.SetXY(center.X - radius, center.Y - radius);
             g.SetSize(d, d);
             g.DrawEllipse(d, d, color);
-            g.visible = true;
+            if (!g.visible) g.visible = true;
         }
 
         private void DrawPillLabel(Point2 center, string text, int fontSize, Color textColor)
         {
-            var tf = AcquireText();
-            tf.textFormat = new TextFormat
+            var pill = AcquirePill();
+            text = text ?? string.Empty;
+
+            bool contentChanged = !pill.HasContent ||
+                pill.LastFontSize != fontSize ||
+                !string.Equals(pill.LastText, text, StringComparison.Ordinal) ||
+                !ColorsEqual(pill.LastColor, textColor);
+
+            if (contentChanged)
             {
-                size = fontSize,
-                bold = true,
-                color = textColor,
-                outline = 1.5f,
-                outlineColor = Color.black
-            };
-            tf.text = text;
-            float padX = 7f;
-            float padY = 3f;
-            float w = Math.Max(18f, tf.width + padX * 2f);
-            float h = Math.Max(16f, tf.height + padY * 2f);
-            float left = center.X - w * 0.5f;
-            float top = center.Y - h * 0.5f;
+                const float padX = 7f;
+                const float padY = 3f;
 
-            var bg = AcquireGraph();
-            bg.SetXY(left, top);
-            bg.SetSize(w, h);
-            bg.DrawRoundRect(w, h, BadgeBg, new[] { 6f, 6f, 6f, 6f });
-            bg.visible = true;
+                pill.Text.textFormat = new TextFormat
+                {
+                    size = fontSize,
+                    bold = true,
+                    color = textColor,
+                    outline = 1.5f,
+                    outlineColor = Color.black
+                };
+                pill.Text.text = text;
 
-            _layer.SetChildIndex(tf, _layer.numChildren - 1);
-            tf.SetXY(left + padX, top + padY);
-            tf.visible = true;
+                float w = (float)Math.Ceiling(Math.Max(18f, pill.Text.width + padX * 2f));
+                float h = (float)Math.Ceiling(Math.Max(16f, pill.Text.height + padY * 2f));
+
+                pill.Root.SetSize(w, h);
+                pill.Bg.SetSize(w, h);
+                pill.Bg.DrawRoundRect(w, h, BadgeBg, PillCornerRadii);
+                pill.Text.SetXY(padX, padY);
+
+                pill.Width = w;
+                pill.Height = h;
+                pill.LastText = text;
+                pill.LastFontSize = fontSize;
+                pill.LastColor = textColor;
+                pill.HasContent = true;
+            }
+
+            float left = (float)Math.Round(center.X - pill.Width * 0.5f);
+            float top = (float)Math.Round(center.Y - pill.Height * 0.5f);
+            if (!pill.HasPos || Math.Abs(left - pill.LastX) >= 0.5f || Math.Abs(top - pill.LastY) >= 0.5f)
+            {
+                pill.Root.SetXY(left, top);
+                pill.LastX = left;
+                pill.LastY = top;
+                pill.HasPos = true;
+            }
+
+            if (!pill.Root.visible) pill.Root.visible = true;
         }
 
-        private GGraph AcquireGraph()
+        private static bool ColorsEqual(Color a, Color b)
         {
-            if (_usedGraphs < _graphPool.Count)
+            return Math.Abs(a.r - b.r) < 0.002f &&
+                   Math.Abs(a.g - b.g) < 0.002f &&
+                   Math.Abs(a.b - b.b) < 0.002f &&
+                   Math.Abs(a.a - b.a) < 0.002f;
+        }
+
+        private GGraph AcquireLineGraph()
+        {
+            if (_usedLineGraphs < _lineGraphPool.Count)
             {
-                return _graphPool[_usedGraphs++];
+                return _lineGraphPool[_usedLineGraphs++];
             }
 
             var g = new GGraph { touchable = false };
-            _layer.AddChild(g);
-            _graphPool.Add(g);
-            _usedGraphs++;
+            _lineLayer.AddChild(g);
+            _lineGraphPool.Add(g);
+            _usedLineGraphs++;
             return g;
         }
 
-        private GTextField AcquireText()
+        private PooledPill AcquirePill()
         {
-            if (_usedTexts < _textPool.Count)
+            if (_usedPills < _pillPool.Count)
             {
-                return _textPool[_usedTexts++];
+                return _pillPool[_usedPills++];
             }
 
+            var root = new GComponent { touchable = false };
+            var bg = new GGraph { touchable = false };
             var tf = new GTextField
             {
                 touchable = false,
                 autoSize = AutoSizeType.Both
             };
-            _layer.AddChild(tf);
-            _textPool.Add(tf);
-            _usedTexts++;
-            return tf;
+
+            // Fixed child order inside each pill container: bg (0) always beneath text (1); never mutates.
+            root.AddChild(bg);
+            root.AddChild(tf);
+            _pillLayer.AddChild(root);
+
+            var pill = new PooledPill
+            {
+                Root = root,
+                Bg = bg,
+                Text = tf
+            };
+            _pillPool.Add(pill);
+            _usedPills++;
+            return pill;
         }
 
         public void Dispose()
         {
-            for (int i = 0; i < _graphPool.Count; i++)
+            for (int i = 0; i < _lineGraphPool.Count; i++)
             {
-                try { _graphPool[i].Dispose(); } catch { }
+                try { _lineGraphPool[i].Dispose(); } catch { }
             }
-            for (int i = 0; i < _textPool.Count; i++)
+            for (int i = 0; i < _pillPool.Count; i++)
             {
-                try { _textPool[i].Dispose(); } catch { }
+                try { _pillPool[i].Root.Dispose(); } catch { }
             }
-            _graphPool.Clear();
-            _textPool.Clear();
-            _usedGraphs = 0;
-            _usedTexts = 0;
+            _lineGraphPool.Clear();
+            _pillPool.Clear();
+            _stableHeaderHeight.Clear();
+            _usedLineGraphs = 0;
+            _usedPills = 0;
+
+            _lineLayer = null;
+            _pillLayer = null;
 
             if (_layer != null)
             {

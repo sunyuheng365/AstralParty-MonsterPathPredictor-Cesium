@@ -195,6 +195,41 @@ namespace MonsterPathPredictor.Core
         }
 
         /// <summary>
+        /// Returns the highest-priority neighbor at <paramref name="landId"/> (in exact raw game adjacency order:
+        /// index 0 = red, index 1 = blue, ...) restricted to <paramref name="allowedNeighbors"/>.
+        /// </summary>
+        public bool TryGetPriorityAmongCandidates(
+            int landId,
+            IReadOnlyList<int> allowedNeighbors,
+            out int nextLandId,
+            out bool isGlobalRed)
+        {
+            nextLandId = -1;
+            isGlobalRed = false;
+            if (allowedNeighbors == null || allowedNeighbors.Count == 0) return false;
+
+            var all = GetValidNeighbors(landId);
+            if (all.Count == 0) return false;
+
+            int globalRed = all[0];
+            for (int i = 0; i < all.Count; i++)
+            {
+                int candidate = all[i];
+                for (int j = 0; j < allowedNeighbors.Count; j++)
+                {
+                    if (allowedNeighbors[j] == candidate)
+                    {
+                        nextLandId = candidate;
+                        isGlobalRed = (candidate == globalRed);
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
         /// Computes full-board shortest road distances and exact equal-length shortest-path counts
         /// from every reachable tile to <paramref name="targetLandId"/> (including paths that require U-turning).
         /// </summary>

@@ -169,19 +169,33 @@ namespace MonsterPathPredictor.Core
                     bool postCombatNow = state.HasEncounteredPlayer;
                     bool encounteredOnThisTile = false;
 
-                    // When stepping onto a tile occupied by living player(s) during the walk (step > 0),
-                    // an aggressive monster initiates combat on this tile (once per turn).
-                    if (step > 0 && monster.IsNormalAggressive && !postCombatNow &&
-                        playersByLand.TryGetValue(state.LandId, out var targetsHere))
+                    // When stepping onto a tile occupied by living player(s) during the walk (step > 0):
+                    // - Aggressive monster initiates combat on this tile (once per turn).
+                    // - Thief steals coins from living player(s) with Gold != 0, interrupting movement on a fork
+                    //   so leaving that fork switches to Red > Blue (verified 99.83% across 746 real replays).
+                    if (step > 0 && !postCombatNow && playersByLand.TryGetValue(state.LandId, out var targetsHere))
                     {
-                        encounteredOnThisTile = true;
-                        postCombatNow = true;
-                        RecordCombat(combatMap, state.LandId, step, arrivalProb, targetsHere);
-
-                        if (options.PostCombatMode == PostCombatMode.StopAtFirstCombat)
+                        if (monster.IsNormalAggressive)
                         {
-                            AccumulateEndpoint(endpointMap, state.LandId, step, false, true, true, arrivalProb);
-                            continue;
+                            encounteredOnThisTile = true;
+                            postCombatNow = true;
+                            RecordCombat(combatMap, state.LandId, step, arrivalProb, targetsHere, isSteal: false);
+
+                            if (options.PostCombatMode == PostCombatMode.StopAtFirstCombat)
+                            {
+                                AccumulateEndpoint(endpointMap, state.LandId, step, false, true, true, arrivalProb);
+                                continue;
+                            }
+                        }
+                        else if (monster.IsThief)
+                        {
+                            var stealTargets = FilterStealablePlayers(targetsHere);
+                            if (stealTargets.Count > 0)
+                            {
+                                encounteredOnThisTile = true;
+                                postCombatNow = true;
+                                RecordCombat(combatMap, state.LandId, step, arrivalProb, stealTargets, isSteal: true);
+                            }
                         }
                     }
 
@@ -262,12 +276,23 @@ namespace MonsterPathPredictor.Core
                 if (finalState.Value <= Epsilon) continue;
                 bool stoppedCombat = false;
                 bool afterCombat = finalState.Key.HasEncounteredPlayer;
-                if (monster.IsNormalAggressive && !afterCombat &&
-                    playersByLand.TryGetValue(finalState.Key.LandId, out var endTargets))
+                if (!afterCombat && playersByLand.TryGetValue(finalState.Key.LandId, out var endTargets))
                 {
-                    RecordCombat(combatMap, finalState.Key.LandId, maxSteps, finalState.Value, endTargets);
-                    afterCombat = true;
-                    stoppedCombat = (options.PostCombatMode == PostCombatMode.StopAtFirstCombat);
+                    if (monster.IsNormalAggressive)
+                    {
+                        RecordCombat(combatMap, finalState.Key.LandId, maxSteps, finalState.Value, endTargets, isSteal: false);
+                        afterCombat = true;
+                        stoppedCombat = (options.PostCombatMode == PostCombatMode.StopAtFirstCombat);
+                    }
+                    else if (monster.IsThief)
+                    {
+                        var stealTargets = FilterStealablePlayers(endTargets);
+                        if (stealTargets.Count > 0)
+                        {
+                            RecordCombat(combatMap, finalState.Key.LandId, maxSteps, finalState.Value, stealTargets, isSteal: true);
+                            afterCombat = true;
+                        }
+                    }
                 }
 
                 AccumulateEndpoint(endpointMap, finalState.Key.LandId, maxSteps, false, stoppedCombat, afterCombat, finalState.Value);
@@ -334,40 +359,55 @@ namespace MonsterPathPredictor.Core
             int from = monster.FromLandId;
             bool isFork = board.IsFork(cur);
 
+            // 0. Taunt override (嘲讽 — the ONLY normal mechanic that allows U-turning or overriding current facing)
+            if (monster.IsTaunted && monster.TauntTargetPlayerId != 0 &&
+                TryDecideTauntStep(board, cur, monster.TauntTargetPlayerId, activePlayers, cache, out var tauntOutcome))
+            {
+                return tauntOutcome;
+            }
+
             // 1. Skill displacement rules (Bilibili video section 4)
             if (monster.SkillMoveKind != SkillMoveKind.None)
             {
                 return DecideSkillDisplacedStep(board, monster, isFork);
             }
 
-            // 2. Freshly spawned on a fork: follow explicit spawn triangle arrow (FrontNodeIds)
-            if (monster.JustSpawnedOnFork && isFork)
-            {
-                var validFront = FilterValidNeighbors(board, cur, monster.FrontNodeIds);
-                if (validFront.Count == 1)
-                {
-                    return SingleTransition(validFront[0], isForkDecision: true, ForkReasonKind.SpawnDirection, "出生朝向");
-                }
-            }
+            var validFront = FilterValidNeighbors(board, cur, monster.FrontNodeIds);
 
-            // 3. Standing on a fork:
-            //    - Turn start on fork OR post-combat on fork -> Red > Blue (ignores players)
-            //    - Already mid-walk at fork (without combat on this fork) -> Mid-walk queue & lottery (or Red>Blue if configured)
+            // 2. Standing on a fork:
+            //    - Turn start on fork / spawned on fork / post-combat on fork:
+            //      ALWAYS read the monster's current facing (FrontNodeIds) first!
+            //        * If FrontNodeIds has 1 direction -> strictly follow that current facing arrow (NOT map red/blue).
+            //        * If FrontNodeIds has 2+ directions -> choose Red > Blue strictly among FrontNodeIds.
+            //        * Only if FrontNodeIds is empty -> fallback to Red > Blue excluding FromLandId.
+            //    - Already mid-walk at fork (without combat on this fork) -> Mid-walk queue & lottery.
             if (isFork)
             {
                 if (monster.JustFoughtOnCurrentFork || !monster.IsCurrentlyMovingMidTurn)
                 {
-                    bool hasValidFrom = board.IsValidNeighbor(cur, from);
-                    if (!hasValidFrom)
+                    if (validFront.Count == 1)
                     {
-                        var validFront = FilterValidNeighbors(board, cur, monster.FrontNodeIds);
-                        if (validFront.Count == 1)
-                        {
-                            return SingleTransition(validFront[0], isForkDecision: true, ForkReasonKind.SpawnDirection, "朝向指示");
-                        }
+                        ForkReasonKind reason = monster.JustSpawnedOnFork
+                            ? ForkReasonKind.SpawnDirection
+                            : ForkReasonKind.CurrentFacing;
+                        string label = monster.JustSpawnedOnFork ? "出生朝向" : "当前朝向";
+                        return SingleTransition(validFront[0], isForkDecision: true, reason, label);
                     }
 
-                    if (board.TryGetPriorityForwardNeighbor(cur, hasValidFrom ? from : -1, out int nextId, out bool isGlobalRed))
+                    bool resolved;
+                    int nextId;
+                    bool isGlobalRed;
+                    if (validFront.Count >= 2)
+                    {
+                        resolved = board.TryGetPriorityAmongCandidates(cur, validFront, out nextId, out isGlobalRed);
+                    }
+                    else
+                    {
+                        bool hasValidFrom = board.IsValidNeighbor(cur, from);
+                        resolved = board.TryGetPriorityForwardNeighbor(cur, hasValidFrom ? from : -1, out nextId, out isGlobalRed);
+                    }
+
+                    if (resolved)
                     {
                         ForkReasonKind reason = monster.JustFoughtOnCurrentFork
                             ? (isGlobalRed ? ForkReasonKind.PostCombatRed : ForkReasonKind.PostCombatBlue)
@@ -395,21 +435,21 @@ namespace MonsterPathPredictor.Core
                 return EvaluateMidWalkFork(board, cur, from, activePlayers, cache, isAfterCombat: monster.HasLaunchedFightThisTurn);
             }
 
-            // 4. Normal tile (non-fork, degree <= 2)
+            // 3. Normal tile (non-fork, degree <= 2): prefer explicit single FrontNodeIds arrow if present
+            if (validFront.Count == 1)
+            {
+                return SingleTransition(validFront[0], isForkDecision: false, ForkReasonKind.CurrentFacing, string.Empty);
+            }
+
             var forward = board.GetForwardNeighbors(cur, from);
             if (forward.Count == 1)
             {
                 return SingleTransition(forward[0], isForkDecision: false, ForkReasonKind.MidForkChasePlayer, string.Empty);
             }
 
-            var frontOnNormal = FilterValidNeighbors(board, cur, monster.FrontNodeIds);
-            if (frontOnNormal.Count == 1)
+            if (validFront.Count > 1)
             {
-                return SingleTransition(frontOnNormal[0], isForkDecision: false, ForkReasonKind.SpawnDirection, string.Empty);
-            }
-            if (frontOnNormal.Count > 1)
-            {
-                return UniformSplit(frontOnNormal, ForkReasonKind.UnknownFacingSplit, "朝向未知");
+                return UniformSplit(validFront, ForkReasonKind.UnknownFacingSplit, "朝向未知");
             }
 
             var all = board.GetValidNeighbors(cur);
@@ -725,12 +765,80 @@ namespace MonsterPathPredictor.Core
             }
         }
 
+        private static bool TryDecideTauntStep(
+            BoardGraph board,
+            int curLandId,
+            long tauntTargetPlayerId,
+            List<TrackedPlayer> activePlayers,
+            Dictionary<int, ShortestPathField> cache,
+            out StepOutcome outcome)
+        {
+            outcome = default;
+            TrackedPlayer target = null;
+            for (int i = 0; i < activePlayers.Count; i++)
+            {
+                if (activePlayers[i].PlayerId == tauntTargetPlayerId)
+                {
+                    target = activePlayers[i];
+                    break;
+                }
+            }
+            if (target == null || target.LandId == curLandId) return false;
+
+            if (!cache.TryGetValue(target.LandId, out var field))
+            {
+                field = board.ComputeShortestPathsTo(target.LandId);
+                cache[target.LandId] = field;
+            }
+            int dist = field.GetDistance(curLandId);
+            if (dist == int.MaxValue || dist <= 0) return false;
+
+            var all = board.GetValidNeighbors(curLandId);
+            var bestExits = new List<(int NextLandId, double Lots)>();
+            double totalLots = 0.0;
+            for (int i = 0; i < all.Count; i++)
+            {
+                int nb = all[i];
+                if (field.GetDistance(nb) != dist - 1) continue;
+                double lots = field.GetPathCount(nb);
+                if (lots <= 0.0) continue;
+                bestExits.Add((nb, lots));
+                totalLots += lots;
+            }
+            if (bestExits.Count == 0 || totalLots <= 0.0) return false;
+
+            var transitions = new List<(int NextLandId, double Prob)>(bestExits.Count);
+            for (int i = 0; i < bestExits.Count; i++)
+                transitions.Add((bestExits[i].NextLandId, bestExits[i].Lots / totalLots));
+            transitions.Sort((a, b) => b.Prob.CompareTo(a.Prob));
+
+            outcome = new StepOutcome
+            {
+                Transitions = transitions,
+                IsForkDecision = board.IsFork(curLandId),
+                Reason = ForkReasonKind.TauntChase,
+                SummaryLabel = "嘲讽→" + target.SeatTag + "(" + dist + "格)"
+            };
+            return true;
+        }
+
+        private static List<TrackedPlayer> FilterStealablePlayers(List<TrackedPlayer> targetsHere)
+        {
+            var result = new List<TrackedPlayer>(targetsHere.Count);
+            for (int i = 0; i < targetsHere.Count; i++)
+            {
+                if (targetsHere[i].Gold != 0) result.Add(targetsHere[i]);
+            }
+            return result;
+        }
+
         private static void RecordCombat(
             Dictionary<int, PredictedCombat> combatMap,
             int landId,
             int stepIndex,
             double probability,
-            List<TrackedPlayer> targets)
+            List<TrackedPlayer> targets,
+            bool isSteal)
         {
             if (!combatMap.TryGetValue(landId, out var c))
             {
@@ -742,7 +850,8 @@ namespace MonsterPathPredictor.Core
                     LandId = landId,
                     StepIndex = stepIndex,
                     Probability = probability,
-                    TargetLabel = string.Join("/", seats)
+                    TargetLabel = string.Join("/", seats),
+                    IsSteal = isSteal
                 };
                 combatMap[landId] = c;
             }

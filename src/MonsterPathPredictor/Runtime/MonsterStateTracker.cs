@@ -674,6 +674,41 @@ namespace MonsterPathPredictor.Runtime
             }
         }
 
+        public bool IsMonsterConfirmedDead(long monsterId)
+        {
+            if (monsterId == 0) return true;
+            try
+            {
+                var allUnits = Players.All();
+                if (allUnits == null || allUnits.Count == 0) return false;
+
+                for (int i = 0; i < allUnits.Count; i++)
+                {
+                    var pd = allUnits[i];
+                    if (pd == null || pd.player == null || pd.player.Id != monsterId) continue;
+
+                    var prop = pd.Property;
+                    if (prop != null)
+                    {
+                        if (prop.HealthState == HealthState.Dead) return true;
+                        if (prop.maxHP > 0 && prop.HP != null && prop.HP.Value <= 0) return true;
+                    }
+
+                    var hero = pd.player.Hero;
+                    if (hero != null && hero.MaxHp > 0 && hero.Hp <= 0) return true;
+
+                    return !UnityObject.IsAlive(pd.CharacterInst);
+                }
+
+                // Unit has been completely removed from the battle unit roster -> dead/despawned.
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         private static bool IsThiefMonster(BattlePlayerData pd)
         {
             try

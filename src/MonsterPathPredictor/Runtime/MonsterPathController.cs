@@ -32,6 +32,7 @@ namespace MonsterPathPredictor.Runtime
         private DateTime _nextBoardScan;
         private DateTime _nextUnitSync;
         private DateTime _nextWarnAt;
+        private DateTime _selectedMissingSince;
         private bool _forceReplan;
 
         public override string Name => "怪物寻路预测";
@@ -95,6 +96,7 @@ namespace MonsterPathPredictor.Runtime
         private void OnPopupMonsterSelected(long monsterId)
         {
             _selectedMonsterId = (_selectedMonsterId == monsterId) ? 0 : monsterId;
+            _selectedMissingSince = DateTime.MinValue;
             _forceReplan = true;
             if (_selectedMonsterId != 0)
             {
@@ -138,6 +140,16 @@ namespace MonsterPathPredictor.Runtime
                     return;
                 }
 
+                // Combat window or in-battle pause/settings popup: only hide overlay temporarily
+                // without dropping the locked monster so tracking resumes automatically afterwards.
+                if (IsTemporaryOverlayOpen())
+                {
+                    _picker.CancelPendingPointer();
+                    _renderer.HideAll();
+                    _forceReplan = true;
+                    return;
+                }
+
                 var now = DateTime.UtcNow;
 
                 if (_board == null || now >= _nextBoardScan)
@@ -148,6 +160,24 @@ namespace MonsterPathPredictor.Runtime
                     {
                         _board = nextBoard;
                         _forceReplan = true;
+                    }
+                }
+
+                // Detect tile-to-tile movement of the tracked monster immediately (0-frame lag)
+                if (_selectedMonsterId != 0 && !_forceReplan)
+                {
+                    var prevSel = FindMonster(_selectedMonsterId);
+                    if (prevSel != null && prevSel.CharacterRef != null && UnityObject.IsAlive(prevSel.CharacterRef))
+                    {
+                        try
+                        {
+                            int liveLandId = prevSel.CharacterRef.standLand != null ? prevSel.CharacterRef.standLand.Id : -1;
+                            if (liveLandId >= 0 && liveLandId != prevSel.State.CurrentLandId)
+                            {
+                                _forceReplan = true;
+                            }
+                        }
+                        catch { }
                     }
                 }
 
@@ -165,6 +195,7 @@ namespace MonsterPathPredictor.Runtime
                 bool selectionChanged = _picker.ProcessInput(layer, camera, _monsters, _settings, _popup, ref _selectedMonsterId);
                 if (selectionChanged)
                 {
+                    _selectedMissingSince = DateTime.MinValue;
                     _forceReplan = true;
                     if (_selectedMonsterId != 0 && _selectedMonsterId != beforeSelection)
                     {
@@ -191,9 +222,27 @@ namespace MonsterPathPredictor.Runtime
                 var selected = FindMonster(_selectedMonsterId);
                 if (selected == null)
                 {
-                    ClearSelectionAndOverlay();
+                    if (_tracker.IsMonsterConfirmedDead(_selectedMonsterId))
+                    {
+                        ClearSelectionAndOverlay();
+                        return;
+                    }
+
+                    // Brief grace window against 1-frame teleport/re-parent hiccups while still alive
+                    if (_selectedMissingSince == DateTime.MinValue)
+                    {
+                        _selectedMissingSince = now;
+                    }
+                    else if ((now - _selectedMissingSince).TotalMilliseconds >= 350.0)
+                    {
+                        ClearSelectionAndOverlay();
+                        return;
+                    }
+
+                    _renderer.HideAll();
                     return;
                 }
+                _selectedMissingSince = DateTime.MinValue;
 
                 if (_forceReplan || _cachedPlan == null || _cachedPlan.MonsterId != _selectedMonsterId)
                 {
@@ -210,11 +259,18 @@ namespace MonsterPathPredictor.Runtime
                         });
                 }
 
+                // Refresh live sprite bounds every frame so the header badge smoothly tracks moving monsters
+                if (selected.CharacterRef != null && UnityObject.IsAlive(selected.CharacterRef))
+                {
+                    selected.VisualBounds = SpriteBoundsReader.Capture(selected.CharacterRef, selected.FeetWorldPos, camera);
+                }
+
                 _renderer.Render(camera, _board, selected, _cachedPlan, _settings);
             }
             catch (Exception ex)
             {
-                ClearSelectionAndOverlay();
+                _cachedPlan = null;
+                _renderer.HideAll();
                 if (DateTime.UtcNow >= _nextWarnAt)
                 {
                     _nextWarnAt = DateTime.UtcNow.AddSeconds(15);
@@ -250,7 +306,7 @@ namespace MonsterPathPredictor.Runtime
             battle = gm.battle;
             if (battle == null) return false;
 
-            if (IsOverlayBlocked()) return false;
+            if (IsBattleSettled()) return false;
 
             var sceneCtrl = BattleSceneController.inst;
             if (sceneCtrl == null) return false;
@@ -262,13 +318,23 @@ namespace MonsterPathPredictor.Runtime
             return landManager != null && landManager.NodeDict != null && landManager.NodeDict.Count > 0;
         }
 
-        private static bool IsOverlayBlocked()
+        private static bool IsBattleSettled()
+        {
+            try
+            {
+                if (!UIManager.hasInstance) return false;
+                return UIManager.inst.currentPanel is BattleSettlementPanel;
+            }
+            catch { }
+            return false;
+        }
+
+        private static bool IsTemporaryOverlayOpen()
         {
             try
             {
                 if (!UIManager.hasInstance) return false;
                 var ui = UIManager.inst;
-                if (ui.currentPanel is BattleSettlementPanel) return true;
                 if (ui.propUpWindows != null)
                 {
                     foreach (var popup in ui.propUpWindows)
@@ -286,6 +352,7 @@ namespace MonsterPathPredictor.Runtime
         private void ClearSelectionAndOverlay()
         {
             _selectedMonsterId = 0;
+            _selectedMissingSince = DateTime.MinValue;
             _cachedPlan = null;
             _renderer.HideAll();
         }
@@ -293,6 +360,7 @@ namespace MonsterPathPredictor.Runtime
         private void ResetBattleState()
         {
             ClearSelectionAndOverlay();
+            _picker.CancelPendingPointer();
             _popup.Hide();
             _board = null;
             _monsters.Clear();

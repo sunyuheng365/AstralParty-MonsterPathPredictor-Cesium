@@ -14,7 +14,15 @@ namespace MonsterPathPredictor.Runtime
     /// </summary>
     internal sealed class MonsterPicker
     {
+        private const float DragThresholdPx = 8f;
+
+        private readonly PointerClickTracker _clickTracker = new PointerClickTracker(DragThresholdPx);
         private int _lastProcessedFrame = -1;
+
+        public void CancelPendingPointer()
+        {
+            _clickTracker.Reset();
+        }
 
         public bool ProcessInput(
             GComponent layer,
@@ -50,28 +58,58 @@ namespace MonsterPathPredictor.Runtime
                 }
             }
 
-            if (!InputService.IsMouseButtonPressed(0)) return false;
+            bool isDown = InputService.IsMouseButtonPressed(0);
+            bool isHeld = InputService.IsMouseButtonHeld(0);
+            bool isUp = InputService.IsMouseButtonReleased(0);
 
-            if (!TryGetStageAndLayerMouse(layer, out Vector2 stagePos, out Vector2 clickLocal))
+            if (!isDown && !isHeld && !isUp && !_clickTracker.IsTracking)
                 return false;
 
-            // Never intercept clicks inside our own picker popup
-            if (popup != null && popup.IsOpen && popup.ContainsStagePoint(stagePos))
-                return false;
+            bool hasPos = TryGetStageAndLayerMouse(layer, out Vector2 stagePos, out Vector2 localPos);
 
-            // Ignore clicks consumed by interactive game UI buttons/cards/windows
-            if (IsPointerOverBlockingUi()) return false;
-
-            long hitMonsterId = HitTestMonsters(layer, camera, monsters, clickLocal, settings);
-            if (hitMonsterId != 0)
+            bool blockedOnDown = false;
+            long downHitId = 0;
+            if (isDown && hasPos)
             {
-                selectedMonsterId = (selectedMonsterId == hitMonsterId) ? 0 : hitMonsterId;
-                return true;
+                // Ignore clicks starting inside our own picker popup or blocking game UI (buttons/cards/windows)
+                if ((popup != null && popup.IsOpen && popup.ContainsStagePoint(stagePos)) ||
+                    IsPointerOverBlockingUi())
+                {
+                    blockedOnDown = true;
+                }
+                else
+                {
+                    // Snapshot hit right on MouseDown so clicking a fast-moving monster still resolves accurately on MouseUp
+                    downHitId = HitTestMonsters(layer, camera, monsters, localPos, settings);
+                }
             }
 
-            if (selectedMonsterId != 0 && settings.ClearOnEmptyClick)
+            var outcome = _clickTracker.Update(
+                isDownThisFrame: isDown,
+                isHeld: isHeld,
+                isUpThisFrame: isUp,
+                hasPosition: hasPos,
+                position: hasPos ? new Point2(stagePos.x, stagePos.y) : default,
+                blockedByUiOnDown: blockedOnDown,
+                downHitMonsterId: downHitId);
+
+            if (!outcome.IsBoardClick) return false;
+
+            // Evaluate click on release (only when pointer did not drag the map)
+            long hitMonsterId = HitTestMonsters(layer, camera, monsters, localPos, settings);
+            if (hitMonsterId == 0)
             {
-                selectedMonsterId = 0;
+                hitMonsterId = outcome.DownHitMonsterId;
+            }
+
+            long nextSelected = PointerClickTracker.ApplyBoardClickSelection(
+                selectedMonsterId,
+                hitMonsterId,
+                settings.ClearOnEmptyClick);
+
+            if (nextSelected != selectedMonsterId)
+            {
+                selectedMonsterId = nextSelected;
                 return true;
             }
 

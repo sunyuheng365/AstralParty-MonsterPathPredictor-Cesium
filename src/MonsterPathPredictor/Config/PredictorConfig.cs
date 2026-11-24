@@ -16,6 +16,15 @@ namespace MonsterPathPredictor.Config
 
             if (isInitial)
             {
+                // One-time migration from v1 configs where clearOnEmptyClick defaulted to true,
+                // so upgrading users immediately get persistent click-to-track behavior while
+                // still allowing explicit manual opt-in afterwards.
+                bool isLegacyV1 = config.Has("enabled") && config.GetInt("configVersion", 1) < 2;
+                if (isLegacyV1)
+                {
+                    config.Set("clearOnEmptyClick", false);
+                    config.Set("configVersion", 2);
+                }
                 ApplyDefaultsAndDocs(config);
             }
 
@@ -96,10 +105,15 @@ namespace MonsterPathPredictor.Config
                 "點擊怪物模型外緣時的容差半徑（像素，8-120；點在模型內部直接命中）",
                 "Near-miss tolerance radius outside monster sprite bounds in pixels (8-120)"));
 
-            cfg.SetDefault("clearOnEmptyClick", true, ConfigDoc.Of(
-                "点击棋盘空白处时自动取消当前选中的怪物",
-                "點擊棋盤空白處時自動取消目前選中的怪物",
-                "Clear selected monster when clicking empty board space"));
+            cfg.SetDefault("configVersion", 2, ConfigDoc.Of(
+                "内部配置架构版本号（自动迁移用，请勿手动修改）",
+                "內部設定架構版本號（自動遷移用，請勿手動修改）",
+                "Internal config schema version for one-time migrations"));
+
+            cfg.SetDefault("clearOnEmptyClick", false, ConfigDoc.Of(
+                "点击棋盘空白处时是否取消当前选中的怪物（默认 false：路线常驻跟踪，直到再次点击该怪/点击其他怪/怪物死亡或按清除键）",
+                "點擊棋盤空白處時是否取消目前選中的怪物（預設 false：路線常駐追蹤，直到再次點擊該怪/點擊其他怪/怪物死亡或按清除鍵）",
+                "Clear selected monster when clicking empty board space (default false: stay locked until re-clicked, switched, or dead)"));
 
             cfg.SetDefault("showReasonTag", true, ConfigDoc.Of(
                 "在岔路口旁显示简短判定依据（如 起步·红箭 / →P1(2格) / 掉头平分）",

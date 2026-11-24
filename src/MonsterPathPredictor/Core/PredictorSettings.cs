@@ -18,7 +18,7 @@ namespace MonsterPathPredictor.Core
         public float HeightOffset { get; set; } = 0.45f;
         public int FontSize { get; set; } = 18;
         public float ClickRadius { get; set; } = 28f;
-        public bool ClearOnEmptyClick { get; set; } = true;
+        public bool ClearOnEmptyClick { get; set; } = false;
         public bool ShowReasonTag { get; set; } = true;
         public bool ShowDeterministicPercent { get; set; } = false;
         public bool SimulateCombatOnFork { get; set; } = true;

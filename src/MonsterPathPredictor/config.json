@@ -1,4 +1,5 @@
 {
+  "configVersion": 2,
   "enabled": true,
   "previewSteps": 12,
   "dashLength": 12.0,
@@ -8,7 +9,7 @@
   "heightOffset": 0.45,
   "fontSize": 18,
   "clickRadius": 28.0,
-  "clearOnEmptyClick": true,
+  "clearOnEmptyClick": false,
   "showReasonTag": true,
   "showDeterministicPercent": false,
   "simulateCombatOnFork": true,
@@ -56,8 +57,8 @@
       "en": "Near-miss tolerance radius outside monster sprite bounds in pixels (8-120)"
     },
     "clearOnEmptyClick": {
-      "zh-Hans": "点击棋盘空白处时自动取消当前选中的怪物",
-      "en": "Clear selected monster when clicking empty board space"
+      "zh-Hans": "点击棋盘空白处时是否取消当前选中的怪物（默认 false：路线常驻跟踪，直到再次点击该怪/点击其他怪/怪物死亡或按清除键）",
+      "en": "Clear selected monster when clicking empty board space (default false: stay locked until re-clicked, switched, or dead)"
     },
     "showReasonTag": {
       "zh-Hans": "在岔路口旁显示简短判定依据（如 起步·红箭 / →P1(2格) / 掉头平分）",

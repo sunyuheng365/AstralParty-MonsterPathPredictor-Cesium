@@ -36,6 +36,7 @@ namespace MonsterPathPredictor.Runtime
             public bool JustFoughtOnFork;
             public int CombatForkLandId = -1;
             public int CombatTurnSequence = -1;
+            public int StolenTurnSequence = -1;
             public SkillMoveKind SkillMoveKind = SkillMoveKind.None;
             public int SkillMoveLandId = -1;
             public int SkillMovePushDirId = -1;
@@ -376,9 +377,16 @@ namespace MonsterPathPredictor.Runtime
             {
                 if (curRound >= 0 && _lastObservedRound < 0) _lastObservedRound = curRound;
                 int nowLand = SafeLandId(currentActor);
-                if (nowLand >= 0 && _activeActorStartLandId >= 0 && nowLand != _activeActorStartLandId)
+                if (nowLand >= 0)
                 {
-                    _activeActorSteppedThisTurn = true;
+                    if (_activeActorStartLandId < 0)
+                    {
+                        _activeActorStartLandId = nowLand;
+                    }
+                    else if (nowLand != _activeActorStartLandId)
+                    {
+                        _activeActorSteppedThisTurn = true;
+                    }
                 }
             }
 
@@ -515,12 +523,16 @@ namespace MonsterPathPredictor.Runtime
                 }
                 else
                 {
-                    // Invalidate any prior-turn post-combat marker as soon as turn sequence advances,
+                    // Invalidate any prior-turn post-combat / steal marker as soon as turn sequence advances,
                     // even when another actor is currently taking their turn (prevents stale preview pollution).
                     if (mem.JustFoughtOnFork && mem.CombatTurnSequence != _turnSequence)
                     {
                         mem.JustFoughtOnFork = false;
                         mem.CombatForkLandId = -1;
+                    }
+                    if (mem.StolenTurnSequence != -1 && mem.StolenTurnSequence != _turnSequence)
+                    {
+                        mem.StolenTurnSequence = -1;
                     }
 
                     if (mem.LastLandId != landId)
@@ -529,9 +541,15 @@ namespace MonsterPathPredictor.Runtime
                         bool isMonsterOwnTurn = (curActorId == mid);
                         bool movedNonAdjacently = mem.LastLandId >= 0 && !board.IsValidNeighbor(mem.LastLandId, landId);
 
-                        if (!isMonsterOwnTurn || movedNonAdjacently)
+                        // Always check exact target-bound 1040.Place displacement first (even on own-turn adjacent moves);
+                        // only fall back to the time-window SkillUsed heuristic when off-turn or non-adjacent.
+                        if (TryConsumeExactPlaceDisplacement(board, mid, mem, mem.LastLandId, landId, playerPositions, allUnits))
                         {
-                            TryTagSkillDisplacement(board, mid, mem, mem.LastLandId, landId, playerPositions, allUnits);
+                            // Exact displacement matched and tagged onto mem
+                        }
+                        else if (!isMonsterOwnTurn || movedNonAdjacently)
+                        {
+                            TryTagSkillDisplacementFromWindow(board, mid, mem, mem.LastLandId, landId, playerPositions, allUnits);
                         }
                         else
                         {
@@ -578,6 +596,10 @@ namespace MonsterPathPredictor.Runtime
                          stealEvt.TurnEpoch == currentEpoch &&
                          (stealEvt.Round < 0 || currentRound < 0 || stealEvt.Round == currentRound))
                 {
+                    // Record turn-level steal occurrence regardless of tile type so RedBlueAfterCombat
+                    // matches MonsterPathEngine's long forecast after normal-tile steals, while setting
+                    // JustFoughtOnFork ONLY when the steal occurred right on a fork tile.
+                    mem.StolenTurnSequence = _turnSequence;
                     int actualStealTile = stealEvt.LandId >= 0
                         ? stealEvt.LandId
                         : ((!isNew && !movedSinceLastSnapshot) ? landId : -1);
@@ -600,7 +622,8 @@ namespace MonsterPathPredictor.Runtime
                                   mem.CombatForkLandId == landId &&
                                   board.IsFork(landId);
                 bool isMovingMidTurn = (curActorId == mid) && _activeActorSteppedThisTurn && !justFought;
-                bool launchedFightThisTurn = (curActorId == mid) && SafeIsLaunchFight(pd);
+                bool launchedFightThisTurn = (curActorId == mid) &&
+                                             (SafeIsLaunchFight(pd) || (isThief && mem.StolenTurnSequence == _turnSequence));
 
                 int heroId = SafeHeroId(pd);
                 string monsterName = ResolveMonsterName(pd, heroId);
@@ -800,7 +823,7 @@ namespace MonsterPathPredictor.Runtime
             }
         }
 
-        private void TryTagSkillDisplacement(
+        private bool TryConsumeExactPlaceDisplacement(
             BoardGraph board,
             long monsterId,
             MonsterMemory mem,
@@ -809,7 +832,7 @@ namespace MonsterPathPredictor.Runtime
             Dictionary<long, int> playerPositions,
             IReadOnlyList<BattlePlayerData> allUnits)
         {
-            // 1. Prefer exact target-bound protocol Place event (cmd 1040 UpdateHeroAttrS2C) carrying exact victim MonsterId.
+            // Match exact target-bound protocol Place event (cmd 1040 UpdateHeroAttrS2C) carrying exact victim MonsterId.
             for (int i = _recentPlaces.Count - 1; i >= 0; i--)
             {
                 var pl = _recentPlaces[i];
@@ -818,15 +841,26 @@ namespace MonsterPathPredictor.Runtime
 
                 SkillMoveKind exactKind = IdentifyDisplacementSkill(pl.SkillId, pl.CasterPlayerId, allUnits);
                 _recentPlaces.RemoveAt(i);
-                if (exactKind == SkillMoveKind.None) return;
+                if (exactKind == SkillMoveKind.None) return false;
 
                 ApplyDisplacementTag(board, mem, exactKind, oldLandId, newLandId, pl.CasterPlayerId, playerPositions);
-                return;
+                return true;
             }
+            return false;
+        }
 
-            // 2. Fallback to SkillUsed window ONLY when unambiguous: if multiple conflicting displacement kinds
-            //    (or different Lingling push casters) occurred within the same window, leave SkillMoveKind unknown
-            //    instead of cross-attributing Cast 2 onto Cast 1's victim.
+        private void TryTagSkillDisplacementFromWindow(
+            BoardGraph board,
+            long monsterId,
+            MonsterMemory mem,
+            int oldLandId,
+            int newLandId,
+            Dictionary<long, int> playerPositions,
+            IReadOnlyList<BattlePlayerData> allUnits)
+        {
+            // Fallback to SkillUsed window ONLY when unambiguous: if multiple conflicting displacement kinds
+            // (or different Lingling push casters) occurred within the same window, leave SkillMoveKind unknown
+            // instead of cross-attributing Cast 2 onto Cast 1's victim.
             if (_recentSkills.Count == 0) return;
 
             SkillCastRecord uniqueCast = null;

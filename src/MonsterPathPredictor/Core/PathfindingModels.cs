@@ -255,8 +255,13 @@ namespace MonsterPathPredictor.Core
     {
         public static string Percent(double probability)
         {
-            double pct = Math.Max(0.0, Math.Min(100.0, probability * 100.0));
+            if (double.IsNaN(probability) || probability <= 0.0) return "0%";
+            if (probability >= 1.0) return "100%";
+
+            double pct = probability * 100.0;
             double rounded = Math.Round(pct, 1, MidpointRounding.AwayFromZero);
+            if (rounded <= 0.0) return "<0.1%";
+            if (rounded >= 100.0) return ">99.9%";
             if (Math.Abs(rounded - Math.Round(rounded)) < 0.05)
             {
                 return ((int)Math.Round(rounded)).ToString(CultureInfo.InvariantCulture) + "%";

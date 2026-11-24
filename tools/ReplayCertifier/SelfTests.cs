@@ -46,7 +46,11 @@ namespace MonsterPathPredictor.ReplayCertifier
         public sealed class StubPlace { public StubPlaceInner Place { get; set; } }
         public sealed class StubNotSelect { public bool NotSelect { get; set; } }
         public sealed class StubEffect { public long PlayerId { get; set; } public object Hp { get; set; } public StubGold Gold { get; set; } public object CrimeNum { get; set; } public StubNotSelect NotSelect { get; set; } public object Disappear { get; set; } public object Buff { get; set; } public StubPlace Place { get; set; } }
-        public sealed class StubAttr { public long PlayerId { get; set; } public List<StubEffect> EffectDatas { get; set; } = new(); }
+        public sealed class StubCause { public long Id { get; set; } }
+        public sealed class StubBuffSource { public int Id { get; set; } }
+        public sealed class StubBuffInfo { public int BuffId { get; set; } public int Progress { get; set; } public StubBuffSource Source { get; set; } }
+        public sealed class StubSnap { public long PlayerId { get; set; } public StubRoom Room { get; set; } }
+        public sealed class StubAttr { public long PlayerId { get; set; } public StubCause Cause { get; set; } public List<StubEffect> EffectDatas { get; set; } = new(); }
         public sealed class StubMoveEffectBucket { public List<StubAttr> Effects { get; set; } = new(); }
         public sealed class StubSkillMoveEffect { public long PlayerId { get; set; } public Dictionary<int, StubMoveEffectBucket> EffectData { get; set; } = new(); }
 
@@ -425,7 +429,229 @@ namespace MonsterPathPredictor.ReplayCertifier
                 return 1;
             }
 
-            Console.WriteLine("ReplayCertifier self-tests PASSED (16/16).");
+            // Test 17: Sherry (30601) 1040.Place onto 3-neighbor fork with Front=[Red(3)] -> 5022 -> 5028 moving Blue(4)
+            //          MUST pass SkillMoveKind.ShirleyThrow to MonsterPathEngine (3-way multi-branch, 0 Det mismatch, 0 OOS).
+            var dec17 = new StubDecoder();
+            int tokRun17 = dec17.Register(new StubRunning
+            {
+                Room = new StubRoom
+                {
+                    MapId = 82016,
+                    Players = new List<StubUnit> { new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 306, NodeId = 1 } } },
+                    Monsters = new List<StubUnit> { new StubUnit { Id = 400, Hero = new StubHero { HeroId = 1002, MonsterType = 11, NodeId = 1, BackNodeId = -1, FrontNodeIds = new[] { 2 } } } }
+                }
+            });
+            int tokPlace17 = dec17.Register(new StubAttr
+            {
+                PlayerId = 1,
+                Cause = new StubCause { Id = 30601 },
+                EffectDatas = new List<StubEffect> { new StubEffect { PlayerId = 400, Place = new StubPlace { Place = new StubPlaceInner { NodeId = 2, BackNodeId = 1, FrontNodeIds = new[] { 3 } } } } }
+            });
+            int tokRoll17 = dec17.Register(new StubThrowDice { PlayerId = 400 });
+            int tokMove17 = dec17.Register(new StubMove { PlayerId = 400, NodeIds = new[] { 2, 4 } });
+            int tokFin17 = dec17.Register(new StubFinish());
+            var res17 = ReplayEvaluator.EvaluateBytes("sherry-1040",
+                ConcatFrames(MakeFrame(1003, tokRun17), MakeFrame(1040, tokPlace17), MakeFrame(5022, tokRoll17), MakeFrame(5028, tokMove17), MakeFrame(1016, tokFin17)),
+                dec17, forkCatalog);
+            if (res17.ReplaysVerified != 1 || res17.Buckets["ForkStart"].ProbTotal != 1 || res17.Buckets["ForkStart"].DetTotal != 0 || res17.OutOfSupportPredictions != 0)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 17): Sherry SkillMoveKind not propagated (prob={res17.Buckets["ForkStart"].ProbTotal}, det={res17.Buckets["ForkStart"].DetTotal}, oos={res17.OutOfSupportPredictions}).");
+                return 1;
+            }
+
+            // Test 18: Off-turn 1096 deferred effect for actor B queued during actor A's turn MUST be discarded on 5022(B)
+            var dec18 = new StubDecoder();
+            int tokRun18 = dec18.Register(new StubRunning
+            {
+                Room = new StubRoom
+                {
+                    MapId = 82016,
+                    Players = new List<StubUnit> { new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 101, NodeId = 3 } } },
+                    Monsters = new List<StubUnit> { new StubUnit { Id = 410, Hero = new StubHero { HeroId = 1001, MonsterType = 1, NodeId = 1, BackNodeId = -1, FrontNodeIds = new[] { 2 } } } }
+                }
+            });
+            int tokRollA18 = dec18.Register(new StubThrowDice { PlayerId = 1 });
+            int tokOffTurn1096 = dec18.Register(new StubSkillMoveEffect
+            {
+                PlayerId = 410,
+                EffectData = new Dictionary<int, StubMoveEffectBucket>
+                {
+                    [2] = new StubMoveEffectBucket { Effects = new List<StubAttr> { new StubAttr { PlayerId = 410, EffectDatas = new List<StubEffect> { new StubEffect { PlayerId = 1, NotSelect = new StubNotSelect { NotSelect = true } } } } } }
+                }
+            });
+            int tokRollB18 = dec18.Register(new StubThrowDice { PlayerId = 410 });
+            int tokMoveB18 = dec18.Register(new StubMove { PlayerId = 410, NodeIds = new[] { 1, 2, 3 } });
+            int tokFin18 = dec18.Register(new StubFinish());
+            var res18 = ReplayEvaluator.EvaluateBytes("offturn-1096",
+                ConcatFrames(MakeFrame(1003, tokRun18), MakeFrame(5022, tokRollA18), MakeFrame(1096, tokOffTurn1096), MakeFrame(5022, tokRollB18), MakeFrame(5028, tokMoveB18), MakeFrame(1016, tokFin18)),
+                dec18, forkCatalog);
+            if (res18.Buckets["ThiefFork"].DetHits != 1 || res18.Buckets["ThiefFork"].DetTotal != 1 || res18.Buckets["ThiefFork"].ProbTotal != 0)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 18): Off-turn 1096 effect bled across 5022(B) (det={res18.Buckets["ThiefFork"].DetTotal}, prob={res18.Buckets["ThiefFork"].ProbTotal}).");
+                return 1;
+            }
+
+            // Test 19: (a) 1040.Place(1->4) + merged 5028[1,4,2] (non-adjacent echo + legal 4->2) -> 0 illegal edges;
+            //          (b) Player 1096.Place(1->4) + 1113 snapshot at 4 + echo 5028[1,4] -> 0 illegal edges;
+            //          (c) Friendly MonsterType=30 illegal edge 1->5 -> IllegalMoveEdges == 1!
+            var dec19 = new StubDecoder();
+            int tokRun19 = dec19.Register(new StubRunning
+            {
+                Room = new StubRoom
+                {
+                    MapId = 82016,
+                    Players = new List<StubUnit> { new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 101, NodeId = 1 } } },
+                    Monsters = new List<StubUnit>
+                    {
+                        new StubUnit { Id = 420, Hero = new StubHero { HeroId = 1002, MonsterType = 11, NodeId = 1 } },
+                        new StubUnit { Id = 421, Hero = new StubHero { HeroId = 1099, MonsterType = 30, NodeId = 1 } }
+                    }
+                }
+            });
+            int tokPlaceM19 = dec19.Register(new StubAttr { PlayerId = 1, EffectDatas = new List<StubEffect> { new StubEffect { PlayerId = 420, Place = new StubPlace { Place = new StubPlaceInner { NodeId = 4, BackNodeId = -1, FrontNodeIds = new[] { 2 } } } } } });
+            int tokMergedM19 = dec19.Register(new StubMove { PlayerId = 420, NodeIds = new[] { 1, 4, 2 } });
+            int tokPlaceP19 = dec19.Register(new StubSkillMoveEffect
+            {
+                PlayerId = 1,
+                EffectData = new Dictionary<int, StubMoveEffectBucket>
+                {
+                    [1] = new StubMoveEffectBucket { Effects = new List<StubAttr> { new StubAttr { PlayerId = 1, EffectDatas = new List<StubEffect> { new StubEffect { PlayerId = 1, Place = new StubPlace { Place = new StubPlaceInner { NodeId = 4, BackNodeId = -1 } } } } } } }
+                }
+            });
+            int tokSnap19 = dec19.Register(new StubSnap
+            {
+                PlayerId = 1,
+                Room = new StubRoom
+                {
+                    MapId = 82016,
+                    Players = new List<StubUnit> { new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 101, NodeId = 4 } } },
+                    Monsters = new List<StubUnit>
+                    {
+                        new StubUnit { Id = 420, Hero = new StubHero { HeroId = 1002, MonsterType = 11, NodeId = 2 } },
+                        new StubUnit { Id = 421, Hero = new StubHero { HeroId = 1099, MonsterType = 30, NodeId = 1 } }
+                    }
+                }
+            });
+            int tokEchoP19 = dec19.Register(new StubMove { PlayerId = 1, NodeIds = new[] { 1, 4 } });
+            int tokAllyIllegal19 = dec19.Register(new StubMove { PlayerId = 421, NodeIds = new[] { 1, 5 } });
+            int tokFin19 = dec19.Register(new StubFinish());
+            var res19 = ReplayEvaluator.EvaluateBytes("disp-echo-ally",
+                ConcatFrames(MakeFrame(1003, tokRun19), MakeFrame(1040, tokPlaceM19), MakeFrame(5028, tokMergedM19),
+                    MakeFrame(1096, tokPlaceP19), MakeFrame(1113, tokSnap19), MakeFrame(5028, tokEchoP19), MakeFrame(5028, tokAllyIllegal19), MakeFrame(1016, tokFin19)),
+                dec19, forkCatalog);
+            if (res19.ReplaysVerified != 1 || res19.IllegalMoveEdges != 1)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 19): Expected exactly 1 illegal edge (ally 1->5), got illegal={res19.IllegalMoveEdges}, verified={res19.ReplaysVerified}.");
+                return 1;
+            }
+
+            // Test 20: Buff 10013.Progress=1 with Hero.CrimeNum=0 MUST make Guard(1068) chase P1 deterministically onto Blue(4)
+            var dec20 = new StubDecoder();
+            int tokRun20 = dec20.Register(new StubRunning
+            {
+                Room = new StubRoom
+                {
+                    MapId = 82016,
+                    Players = new List<StubUnit>
+                    {
+                        new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 101, NodeId = 4, CrimeNum = 0, Buffs = new Dictionary<int, object> { [1] = new StubBuffInfo { BuffId = 10013, Progress = 1 } } } }
+                    },
+                    Monsters = new List<StubUnit> { new StubUnit { Id = 430, Hero = new StubHero { HeroId = 1068, MonsterType = 11, NodeId = 1, BackNodeId = -1, FrontNodeIds = new[] { 2 } } } }
+                }
+            });
+            int tokRoll20 = dec20.Register(new StubThrowDice { PlayerId = 430 });
+            int tokMove20 = dec20.Register(new StubMove { PlayerId = 430, NodeIds = new[] { 1, 2, 4 } });
+            int tokFin20 = dec20.Register(new StubFinish());
+            var res20 = ReplayEvaluator.EvaluateBytes("crime-buff",
+                ConcatFrames(MakeFrame(1003, tokRun20), MakeFrame(5022, tokRoll20), MakeFrame(5028, tokMove20), MakeFrame(1016, tokFin20)),
+                dec20, forkCatalog);
+            if (res20.Buckets["MidWalkFork"].DetHits != 1 || res20.Buckets["MidWalkFork"].DetTotal != 1 || res20.Buckets["MidWalkFork"].ProbTotal != 0)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 20): Buff 10013.Progress crime tracking failed (det={res20.Buckets["MidWalkFork"].DetTotal}, prob={res20.Buckets["MidWalkFork"].ProbTotal}).");
+                return 1;
+            }
+
+            // Test 21: (a) [1/2, 1/4, 1/4] MUST NOT mix into "50%" bin and 0.5004/0.4996 MUST NOT merge into "50%";
+            //          (b) Out-of-support 30 A / 30 B / 40 C MUST NOT censor calibration denominator (Opp=100, Chosen=30, GATE 3 FAIL).
+            var binMix = new Dictionary<string, ProbBin>();
+            ReplayEvaluator.RecordMultiBranchCalibration(board3, 1, new List<ForkExitPrediction>
+            {
+                new() { NextLandId = 2, ConditionalProbability = 0.5 },
+                new() { NextLandId = 3, ConditionalProbability = 0.25 },
+                new() { NextLandId = 4, ConditionalProbability = 0.25 }
+            }, actualNext: 2, binMix);
+            ReplayEvaluator.RecordMultiBranchCalibration(board, 23, new List<ForkExitPrediction>
+            {
+                new() { NextLandId = 22, ConditionalProbability = 0.5004 },
+                new() { NextLandId = 55, ConditionalProbability = 0.4996 }
+            }, actualNext: 22, binMix);
+            if (binMix.ContainsKey("50%") || !binMix.ContainsKey("50%(k=3)") || !binMix.ContainsKey("50.04%") || !binMix.ContainsKey("49.96%"))
+            {
+                Console.Error.WriteLine("SELF-TEST FAILED (Test 21a): Non-2-way or near-50% exits polluted dedicated 50% bin: " + string.Join(",", binMix.Keys));
+                return 1;
+            }
+            var uncensored = new CertificationSummary { ReplaysAttempted = 10, ReplaysVerified = 10 };
+            PopulatePassingBaseline(uncensored);
+            for (int i = 0; i < 30; i++) ReplayEvaluator.RecordMultiBranchCalibration(board, 23, exits, 22, uncensored.ProbBins);
+            for (int i = 0; i < 30; i++) ReplayEvaluator.RecordMultiBranchCalibration(board, 23, exits, 55, uncensored.ProbBins);
+            for (int i = 0; i < 40; i++) if (!ReplayEvaluator.RecordMultiBranchCalibration(board, 23, exits, 24, uncensored.ProbBins)) uncensored.OutOfSupportPredictions++;
+            var e21 = ReportWriter.EvaluateGates(uncensored, t);
+            if (uncensored.ProbBins["50%"].Opp != 100 || uncensored.ProbBins["50%"].Chosen != 30 || e21.CalibrationGate != GateStatus.Fail || e21.CoverageGate != GateStatus.Fail)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 21b): Out-of-support censored calibration (opp={uncensored.ProbBins["50%"].Opp}, chosen={uncensored.ProbBins["50%"].Chosen}, calibGate={e21.CalibrationGate}).");
+                return 1;
+            }
+
+            // Test 22: Truncated replay prefix hits MUST NOT leak into verified corpus stats on merge
+            var dec22 = new StubDecoder();
+            int tokRun22 = dec22.Register(new StubRunning
+            {
+                Room = new StubRoom
+                {
+                    MapId = 82016,
+                    Players = new List<StubUnit> { new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 101, NodeId = 3 } } },
+                    Monsters = new List<StubUnit> { new StubUnit { Id = 440, Hero = new StubHero { HeroId = 1002, MonsterType = 11, NodeId = 1, BackNodeId = -1, FrontNodeIds = new[] { 2 } } } }
+                }
+            });
+            int tokRoll22 = dec22.Register(new StubThrowDice { PlayerId = 440 });
+            int tokMove22 = dec22.Register(new StubMove { PlayerId = 440, NodeIds = new[] { 1, 2, 3 } });
+            var truncWithHit = ReplayEvaluator.EvaluateBytes("trunc-hit",
+                ConcatFrames(MakeFrame(1003, tokRun22), MakeFrame(5022, tokRoll22), MakeFrame(5028, tokMove22)), // Missing 1016!
+                dec22, forkCatalog);
+            var merged22 = new CertificationSummary();
+            merged22.MergeFrom(ok11);
+            merged22.MergeFrom(truncWithHit);
+            if (merged22.ReplaysVerified != 1 || merged22.TruncatedOrCorrupt != 1 || merged22.Buckets["MidWalkFork"].DetTotal != 0 || merged22.Buckets["MidWalkFork"].DetHits != 0)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 22): Truncated replay leaked prefix hits (verified={merged22.ReplaysVerified}, det={merged22.Buckets["MidWalkFork"].DetTotal}).");
+                return 1;
+            }
+
+            // Test 23: Non-finite CLI thresholds (--max-abs-z NaN/Infinity, out-of-range rates) AND Int32.MaxValue frame length overflow
+            if (Program.TryParseArgs(new[] { "--protocol-dir", "p", "--maps", "m.json", "--cache-dir", "c", "--max-abs-z", "NaN" }, out _, out _) ||
+                Program.TryParseArgs(new[] { "--protocol-dir", "p", "--maps", "m.json", "--cache-dir", "c", "--max-abs-z", "Infinity" }, out _, out _) ||
+                Program.TryParseArgs(new[] { "--protocol-dir", "p", "--maps", "m.json", "--cache-dir", "c", "--min-det-accuracy", "1.5" }, out _, out _))
+            {
+                Console.Error.WriteLine("SELF-TEST FAILED (Test 23a): Non-finite or out-of-range CLI threshold was accepted.");
+                return 1;
+            }
+            var nanGate = ReportWriter.EvaluateGates(biased, new GateThresholds { MaxAbsZ = double.NaN });
+            if (nanGate.Passed || nanGate.CalibrationGate != GateStatus.Fail)
+            {
+                Console.Error.WriteLine("SELF-TEST FAILED (Test 23b): NaN MaxAbsZ bypassed calibration gate.");
+                return 1;
+            }
+            var overflowFrame = new byte[10];
+            BinaryPrimitives.WriteInt16BigEndian(overflowFrame.AsSpan(0, 2), 1003);
+            BinaryPrimitives.WriteInt32BigEndian(overflowFrame.AsSpan(2, 4), int.MaxValue);
+            var overflowRes = ReplayEvaluator.EvaluateBytes("overflow", overflowFrame, dec11, forkCatalog);
+            if (overflowRes.TruncatedOrCorrupt != 1 || overflowRes.ParseErrors != 0)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 23c): Int32.MaxValue frame length misclassified (corrupt={overflowRes.TruncatedOrCorrupt}, err={overflowRes.ParseErrors}).");
+                return 1;
+            }
+
+            Console.WriteLine("ReplayCertifier self-tests PASSED (23/23).");
             return 0;
         }
     }

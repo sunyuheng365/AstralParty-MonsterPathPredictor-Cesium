@@ -77,8 +77,16 @@ namespace MonsterPathPredictor.ReplayCertifier
             bool bucketCountsConsistent = s.Buckets.Values.All(b => b.Total == b.DetTotal + b.ProbTotal);
             double dlFailRatio = s.ReplaysAttempted > 0 ? (double)s.DownloadFailed / s.ReplaysAttempted : 1.0;
 
+            bool thresholdsValid =
+                double.IsFinite(t.MinDetAccuracy) && t.MinDetAccuracy >= 0.0 && t.MinDetAccuracy <= 1.0 &&
+                double.IsFinite(t.MinThiefAccuracy) && t.MinThiefAccuracy >= 0.0 && t.MinThiefAccuracy <= 1.0 &&
+                double.IsFinite(t.MaxDownloadFailRatio) && t.MaxDownloadFailRatio >= 0.0 && t.MaxDownloadFailRatio <= 1.0 &&
+                double.IsFinite(t.MaxAbsZ) && t.MaxAbsZ >= 0.0;
+
             GateStatus coverageGate;
-            if (s.ReplaysAttempted <= 0 || s.ReplaysVerified <= 0)
+            if (!thresholdsValid)
+                coverageGate = GateStatus.Fail;
+            else if (s.ReplaysAttempted <= 0 || s.ReplaysVerified <= 0)
                 coverageGate = GateStatus.InsufficientSample;
             else if (s.MissingMap > 0 || s.ParseErrors > 0 || s.TruncatedOrCorrupt > 0 ||
                      s.MissingPredictions > 0 || s.OutOfSupportPredictions > 0 || s.IllegalMoveEdges > 0 ||
@@ -87,13 +95,17 @@ namespace MonsterPathPredictor.ReplayCertifier
             else
                 coverageGate = GateStatus.Pass;
 
-            GateStatus aggroGate = aggroDetTotal < t.MinAggroSamples
-                ? GateStatus.InsufficientSample
-                : (aggroAcc.GetValueOrDefault() >= t.MinDetAccuracy ? GateStatus.Pass : GateStatus.Fail);
+            GateStatus aggroGate = !thresholdsValid
+                ? GateStatus.Fail
+                : (aggroDetTotal < t.MinAggroSamples
+                    ? GateStatus.InsufficientSample
+                    : (aggroAcc.GetValueOrDefault() >= t.MinDetAccuracy ? GateStatus.Pass : GateStatus.Fail));
 
-            GateStatus thiefGate = thiefB.DetTotal < t.MinThiefSamples
-                ? GateStatus.InsufficientSample
-                : (thiefAcc.GetValueOrDefault() >= t.MinThiefAccuracy ? GateStatus.Pass : GateStatus.Fail);
+            GateStatus thiefGate = !thresholdsValid
+                ? GateStatus.Fail
+                : (thiefB.DetTotal < t.MinThiefSamples
+                    ? GateStatus.InsufficientSample
+                    : (thiefAcc.GetValueOrDefault() >= t.MinThiefAccuracy ? GateStatus.Pass : GateStatus.Fail));
 
             int evaluatedBins = 0;
             double worstZ = 0.0;
@@ -129,16 +141,18 @@ namespace MonsterPathPredictor.ReplayCertifier
                 {
                     evaluatedBins++;
                     if (Math.Abs(z) > worstZ) worstZ = Math.Abs(z);
-                    if (Math.Abs(z) > t.MaxAbsZ) calibOk = false;
+                    if (!double.IsFinite(z) || !double.IsFinite(t.MaxAbsZ) || Math.Abs(z) > t.MaxAbsZ) calibOk = false;
                 }
-                eval.CalibrationRows.Add(new { bin = kv.Key, n = pb.Opp, predicted = pred, observed = obs, diff = obs - pred, z });
+                eval.CalibrationRows.Add(new { bin = kv.Key, n = pb.Opp, predicted = pred, observed = obs, diff = obs - pred, z, shapes = pb.Shapes });
             }
 
             eval.EvaluatedBins = evaluatedBins;
             eval.WorstAbsZ = worstZ;
-            eval.CalibrationGate = evaluatedBins < t.MinCalibratedBins
-                ? GateStatus.InsufficientSample
-                : (calibOk ? GateStatus.Pass : GateStatus.Fail);
+            eval.CalibrationGate = !thresholdsValid
+                ? GateStatus.Fail
+                : (evaluatedBins < t.MinCalibratedBins
+                    ? GateStatus.InsufficientSample
+                    : (calibOk ? GateStatus.Pass : GateStatus.Fail));
 
             return eval;
         }

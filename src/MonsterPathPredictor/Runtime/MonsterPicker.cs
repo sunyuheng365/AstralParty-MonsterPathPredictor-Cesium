@@ -269,20 +269,8 @@ namespace MonsterPathPredictor.Runtime
 
             if (valid < 2) return false;
 
-            // Ensure a sensible minimum clickable box if monster is zoomed far away
-            if (maxX - minX < 28f)
-            {
-                float cx = (minX + maxX) * 0.5f;
-                minX = cx - 14f;
-                maxX = cx + 14f;
-            }
-            if (maxY - minY < 36f)
-            {
-                float cy = (minY + maxY) * 0.5f;
-                minY = cy - 18f;
-                maxY = cy + 18f;
-            }
-
+            // Keep the raw projected sprite bounds uninflated so MonsterHitTester directHits only matches
+            // clicks truly inside a monster's sprite; zoomed-out small sprites remain easy to pick via nearMissRadius.
             hitBox = new MonsterHitBox
             {
                 MonsterId = monsterId,

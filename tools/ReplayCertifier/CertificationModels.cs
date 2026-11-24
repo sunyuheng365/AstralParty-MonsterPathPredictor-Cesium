@@ -54,12 +54,25 @@ namespace MonsterPathPredictor.ReplayCertifier
         public long Opp;
         public double SumPred;
         public long Chosen;
+        public Dictionary<string, long> Shapes = new(StringComparer.Ordinal);
+
+        public void AddShape(string shape)
+        {
+            if (string.IsNullOrEmpty(shape)) return;
+            Shapes.TryGetValue(shape, out long cur);
+            Shapes[shape] = cur + 1;
+        }
 
         public void MergeFrom(ProbBin o)
         {
             Opp += o.Opp;
             SumPred += o.SumPred;
             Chosen += o.Chosen;
+            foreach (var kv in o.Shapes)
+            {
+                Shapes.TryGetValue(kv.Key, out long cur);
+                Shapes[kv.Key] = cur + kv.Value;
+            }
         }
     }
 

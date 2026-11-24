@@ -647,5 +647,60 @@ namespace MonsterPathPredictor.Tests
             Assert.Equal(10, MonsterHitTester.PickMonster(new Point2(0f, 0f), new[] { a, b }, 28f));
             Assert.Equal(10, MonsterHitTester.PickMonster(new Point2(0f, 0f), new[] { b, a }, 28f));
         }
+
+        [Fact]
+        public void ProbabilityFormat_TinyPositiveAndComplement_NeverDisplayAsExactZeroOrHundred()
+        {
+            // Round 4 (#14): exact endpoints remain 0% / 100%, while strictly interior tiny/complement
+            // probabilities (such as 1/(2^30+1)) render as "<0.1%" and ">99.9%".
+            Assert.Equal("0%", ProbabilityFormat.Percent(0.0));
+            Assert.Equal("100%", ProbabilityFormat.Percent(1.0));
+            Assert.Equal("50%", ProbabilityFormat.Percent(0.5));
+            double tiny = 1.0 / (Math.Pow(2.0, 30) + 1.0);
+            Assert.Equal("<0.1%", ProbabilityFormat.Percent(tiny));
+            Assert.Equal(">99.9%", ProbabilityFormat.Percent(1.0 - tiny));
+        }
+
+        [Fact]
+        public void ThiefNormalTileSteal_RedBlueAfterCombat_LongForecastMatchesArrivalRecomputation()
+        {
+            // Round 4 (#12): Thief walks 1 -> 2 (steals from P1 with Gold=10) -> Fork 3 (Red=4, Blue=5[P2]).
+            // Under PostCombatMode.RedBlueAfterCombat, both long forecast from 1 and arrival recomputation
+            // at Fork 3 (with HasLaunchedFightThisTurn=true from normal-tile steal) must select Red(4).
+            var board = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(1, new[] { 2 }),
+                new LandNodeSnapshot(2, new[] { 3, 1 }),
+                new LandNodeSnapshot(3, new[] { 4, 5, 2 }),
+                new LandNodeSnapshot(4, new[] { 3 }),
+                new LandNodeSnapshot(5, new[] { 3 })
+            });
+            var players = new List<TrackedPlayer>
+            {
+                new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = 2, IsAlive = true, IsTargetable = true, Gold = 10 },
+                new TrackedPlayer { PlayerId = 2, Slot = 1, LandId = 5, IsAlive = true, IsTargetable = true, Gold = 10 }
+            };
+            var opts = new PlanOptions { MaxSteps = 3, PostCombatMode = PostCombatMode.RedBlueAfterCombat };
+
+            var fromStart = new MonsterState
+            {
+                MonsterId = 940, IsNormalAggressive = false, IsThief = true,
+                CurrentLandId = 1, FromLandId = -1, FrontNodeIds = new[] { 2 }
+            };
+            var longPlan = MonsterPathEngine.Plan(board, fromStart, players, opts);
+            int longChoice = longPlan.Forks.Single(f => f.ForkLandId == 3).Exits[0].NextLandId;
+
+            var atForkAfterSteal = new MonsterState
+            {
+                MonsterId = 940, IsNormalAggressive = false, IsThief = true,
+                CurrentLandId = 3, FromLandId = 2,
+                IsCurrentlyMovingMidTurn = true, HasLaunchedFightThisTurn = true
+            };
+            var arrivalPlan = MonsterPathEngine.Plan(board, atForkAfterSteal, players, opts);
+            int arrivalChoice = arrivalPlan.Forks.Single(f => f.ForkLandId == 3).Exits[0].NextLandId;
+
+            Assert.Equal(4, longChoice);
+            Assert.Equal(longChoice, arrivalChoice);
+        }
     }
 }

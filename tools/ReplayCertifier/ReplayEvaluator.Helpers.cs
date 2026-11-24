@@ -20,7 +20,7 @@ namespace MonsterPathPredictor.ReplayCertifier
             {
                 int cmd = BinaryPrimitives.ReadInt16BigEndian(bytes.AsSpan(i, 2));
                 int len = BinaryPrimitives.ReadInt32BigEndian(bytes.AsSpan(i + 2, 4));
-                if (len < 0 || i + 6 + len > bytes.Length)
+                if (len < 0 || len > bytes.Length - i - 6)
                 {
                     truncated = true;
                     break;
@@ -71,17 +71,73 @@ namespace MonsterPathPredictor.ReplayCertifier
                         int bid = (int)kv.Value.BuffId;
                         u.BuffIds.Add(bid);
                         if (bid == 10011 && kv.Value.Source != null) u.TauntSkillId = (int)kv.Value.Source.Id;
+                        if (bid == 10013) u.CrimeBuffProgress = Math.Max(u.CrimeBuffProgress, (int)kv.Value.Progress);
                         if (bid == 10671303 || (bid == 10671301 && (int)kv.Value.Progress > 0)) u.WardenRevealed = true;
                     }
             }
             return u;
         }
 
-        private static bool ApplyAttr(dynamic attr, Dictionary<long, UnitSim> players, Dictionary<long, UnitSim> monsters, bool fromSkillMove, long curTurnActor)
+        private static SkillMoveKind IdentifyActiveDisplacementSkill(int skillId)
+        {
+            if (skillId >= 10000)
+            {
+                int heroPrefix = skillId / 100;
+                int sub = skillId % 100;
+                if (sub >= 1 && sub <= 9)
+                {
+                    if (heroPrefix == 109) return SkillMoveKind.TrashcanPull;
+                    if (heroPrefix == 128) return SkillMoveKind.LinglingPush;
+                    if (heroPrefix == 306) return SkillMoveKind.ShirleyThrow;
+                }
+            }
+            return SkillMoveKind.None;
+        }
+
+        private static void InferLinglingPushDirection(
+            BoardGraph board,
+            int oldLandId,
+            int newLandId,
+            int casterLandId,
+            out int pushNextId,
+            out int pushFromId)
+        {
+            pushNextId = -1;
+            pushFromId = -1;
+            if (board == null) return;
+            int origin = board.Contains(oldLandId) ? oldLandId : casterLandId;
+            if (!board.Contains(origin) || !board.Contains(newLandId)) return;
+
+            var field = board.ComputeShortestPathsTo(origin);
+            int d = field.GetDistance(newLandId);
+            if (d > 0 && d < int.MaxValue)
+            {
+                var neighbors = board.GetValidNeighbors(newLandId);
+                for (int i = 0; i < neighbors.Count; i++)
+                {
+                    if (field.GetDistance(neighbors[i]) == d - 1)
+                    {
+                        pushFromId = neighbors[i];
+                        break;
+                    }
+                }
+            }
+            if (pushFromId >= 0)
+            {
+                var fwd = board.GetForwardNeighbors(newLandId, pushFromId);
+                if (fwd.Count == 1) pushNextId = fwd[0];
+            }
+        }
+
+        private static bool ApplyAttr(dynamic attr, BoardGraph board, Dictionary<long, UnitSim> players, Dictionary<long, UnitSim> monsters, bool fromSkillMove, long curTurnActor)
         {
             bool thiefStole = false;
             if (attr?.EffectDatas == null) return false;
             long attrOwner = (long)attr.PlayerId;
+            int causeSkillId = 0;
+            try { if (attr.Cause != null) causeSkillId = (int)attr.Cause.Id; } catch { }
+            SkillMoveKind displacementKind = IdentifyActiveDisplacementSkill(causeSkillId);
+
             bool actorIsThief = curTurnActor != 0 && attrOwner == curTurnActor &&
                 monsters.TryGetValue(curTurnActor, out var curM) && curM.MonsterType == 1;
 
@@ -116,11 +172,17 @@ namespace MonsterPathPredictor.ReplayCertifier
                     if (eff.Buff.Buff != null)
                     {
                         int bid = (int)eff.Buff.Buff.BuffId;
-                        if (op == 2) { target.BuffIds.Remove(bid); if (bid == 10011) target.TauntSkillId = 0; }
+                        if (op == 2)
+                        {
+                            target.BuffIds.Remove(bid);
+                            if (bid == 10011) target.TauntSkillId = 0;
+                            if (bid == 10013) target.CrimeBuffProgress = 0;
+                        }
                         else if (op == 1 || op == 3)
                         {
                             target.BuffIds.Add(bid);
                             if (bid == 10011 && eff.Buff.Buff.Source != null) target.TauntSkillId = (int)eff.Buff.Buff.Source.Id;
+                            if (bid == 10013) target.CrimeBuffProgress = Math.Max(0, (int)eff.Buff.Buff.Progress);
                             if (bid == 10671303 || (bid == 10671301 && (int)eff.Buff.Buff.Progress > 0)) target.WardenRevealed = true;
                         }
                     }
@@ -130,11 +192,17 @@ namespace MonsterPathPredictor.ReplayCertifier
                         {
                             if (kv?.Value == null) continue;
                             int bid = (int)kv.Value.BuffId;
-                            if (op == 2) { target.BuffIds.Remove(bid); if (bid == 10011) target.TauntSkillId = 0; }
+                            if (op == 2)
+                            {
+                                target.BuffIds.Remove(bid);
+                                if (bid == 10011) target.TauntSkillId = 0;
+                                if (bid == 10013) target.CrimeBuffProgress = 0;
+                            }
                             else if (op == 1 || op == 3)
                             {
                                 target.BuffIds.Add(bid);
                                 if (bid == 10011 && kv.Value.Source != null) target.TauntSkillId = (int)kv.Value.Source.Id;
+                                if (bid == 10013) target.CrimeBuffProgress = Math.Max(0, (int)kv.Value.Progress);
                                 if (bid == 10671303 || (bid == 10671301 && (int)kv.Value.Progress > 0)) target.WardenRevealed = true;
                             }
                         }
@@ -151,10 +219,28 @@ namespace MonsterPathPredictor.ReplayCertifier
                     if (newNode >= 0) target.NodeId = newNode;
                     target.BackNodeId = newBack;
                     if (newFront.Length > 0) target.FrontNodeIds = newFront;
-                    if (fromSkillMove && newNode >= 0 && newNode != oldNode)
+
+                    // Record displacement (From -> To) pair for BOTH 1040.Place and 1096.Place so subsequent
+                    // MoveS2C echoes (standalone or prefix-merged) are stripped accurately without false illegal edges.
+                    if (newNode >= 0 && newNode != oldNode)
                     {
                         target.SkillDisplacedFromNode = oldNode;
                         target.SkillDisplacedToNode = newNode;
+                    }
+
+                    if (target.IsMonster && displacementKind != SkillMoveKind.None && newNode >= 0)
+                    {
+                        target.PendingSkillMoveKind = displacementKind;
+                        target.PendingSkillMoveLandId = newNode;
+                        target.PendingSkillMovePushDirId = -1;
+                        target.PendingSkillMovePushFromId = -1;
+                        if (displacementKind == SkillMoveKind.LinglingPush)
+                        {
+                            int casterLand = players.TryGetValue(attrOwner, out var casterUnit) ? casterUnit.NodeId : -1;
+                            InferLinglingPushDirection(board, oldNode, newNode, casterLand, out int pushDir, out int pushFrom);
+                            target.PendingSkillMovePushDirId = pushDir;
+                            target.PendingSkillMovePushFromId = pushFrom;
+                        }
                     }
                 }
             }

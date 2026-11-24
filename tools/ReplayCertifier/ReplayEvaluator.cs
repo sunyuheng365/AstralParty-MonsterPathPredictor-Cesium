@@ -29,9 +29,14 @@ namespace MonsterPathPredictor.ReplayCertifier
             public int Hp;
             public int Gold;
             public int CrimeNum;
+            public int CrimeBuffProgress;
             public bool NotSelect;
             public int SkillDisplacedFromNode = -1;
             public int SkillDisplacedToNode = -1;
+            public SkillMoveKind PendingSkillMoveKind = SkillMoveKind.None;
+            public int PendingSkillMoveLandId = -1;
+            public int PendingSkillMovePushDirId = -1;
+            public int PendingSkillMovePushFromId = -1;
             public int TauntSkillId;
             public bool WardenRevealed;
             public HashSet<int> BuffIds = new();
@@ -75,26 +80,53 @@ namespace MonsterPathPredictor.ReplayCertifier
                     else { unknownLayout = true; return; }
                 }
                 pendingMoveEffects.Clear();
-                var prevDisp = new Dictionary<long, (int From, int To)>();
-                foreach (var kv in monsters)
+                var prevPlayerDisp = new Dictionary<long, (int From, int To)>();
+                foreach (var kv in players)
                 {
                     if (kv.Value.SkillDisplacedToNode >= 0)
-                        prevDisp[kv.Key] = (kv.Value.SkillDisplacedFromNode, kv.Value.SkillDisplacedToNode);
+                        prevPlayerDisp[kv.Key] = (kv.Value.SkillDisplacedFromNode, kv.Value.SkillDisplacedToNode);
+                }
+                var prevMonsterState = new Dictionary<long, (int From, int To, SkillMoveKind Kind, int Land, int PushDir, int PushFrom)>();
+                foreach (var kv in monsters)
+                {
+                    if (kv.Value.SkillDisplacedToNode >= 0 || kv.Value.PendingSkillMoveKind != SkillMoveKind.None)
+                        prevMonsterState[kv.Key] = (kv.Value.SkillDisplacedFromNode, kv.Value.SkillDisplacedToNode,
+                            kv.Value.PendingSkillMoveKind, kv.Value.PendingSkillMoveLandId,
+                            kv.Value.PendingSkillMovePushDirId, kv.Value.PendingSkillMovePushFromId);
                 }
                 players.Clear();
                 monsters.Clear();
                 if (room.Players != null)
                     foreach (dynamic p in (IEnumerable)room.Players)
-                        if (p?.Hero != null) { UnitSim u = BuildUnit(p, false); players[u.Id] = u; }
+                        if (p?.Hero != null)
+                        {
+                            UnitSim u = BuildUnit(p, false);
+                            if (prevPlayerDisp.TryGetValue(u.Id, out var pd) && u.NodeId == pd.To)
+                            {
+                                u.SkillDisplacedFromNode = pd.From;
+                                u.SkillDisplacedToNode = pd.To;
+                            }
+                            players[u.Id] = u;
+                        }
                 if (room.Monsters != null)
                     foreach (dynamic m in (IEnumerable)room.Monsters)
                         if (m?.Hero != null)
                         {
                             UnitSim u = BuildUnit(m, true);
-                            if (prevDisp.TryGetValue(u.Id, out var disp) && u.NodeId == disp.To)
+                            if (prevMonsterState.TryGetValue(u.Id, out var ms))
                             {
-                                u.SkillDisplacedFromNode = disp.From;
-                                u.SkillDisplacedToNode = disp.To;
+                                if (ms.To >= 0 && u.NodeId == ms.To)
+                                {
+                                    u.SkillDisplacedFromNode = ms.From;
+                                    u.SkillDisplacedToNode = ms.To;
+                                }
+                                if (ms.Kind != SkillMoveKind.None && u.NodeId == ms.Land)
+                                {
+                                    u.PendingSkillMoveKind = ms.Kind;
+                                    u.PendingSkillMoveLandId = ms.Land;
+                                    u.PendingSkillMovePushDirId = ms.PushDir;
+                                    u.PendingSkillMovePushFromId = ms.PushFrom;
+                                }
                             }
                             monsters[u.Id] = u;
                             if (seenMonsters.Add(u.Id)) spawnedAtTile[u.Id] = u.NodeId;
@@ -201,8 +233,9 @@ namespace MonsterPathPredictor.ReplayCertifier
                     dynamic td = decoder.TryDecode("party.protocol.ThrowDiceS2C", payload);
                     if (td == null) { decodeFailed = true; break; }
                     long actorId = (long)td.PlayerId;
-                    // Discard unreached deferred 1096 tile effects from the previous actor instead of falsely applying them.
-                    if (curTurnActor != 0) pendingMoveEffects.Remove(curTurnActor);
+                    // Discard ALL unreached deferred 1096 tile effects from the previous turn (for any actor)
+                    // so off-turn queued effects can never bleed across turn boundaries.
+                    pendingMoveEffects.Clear();
                     // Always advance active turn context even when a player (non-monster) rolls dice.
                     curTurnActor = actorId;
                     stepped = foughtOnTile = foughtTurn = thiefStoleOnTile = false;
@@ -220,14 +253,14 @@ namespace MonsterPathPredictor.ReplayCertifier
                 else if (cmd == 1040)
                 {
                     dynamic attr = decoder.TryDecode("party.protocol.UpdateHeroAttrS2C", payload);
-                    if (attr == null) { decodeFailed = true; continue; }
-                    if (ApplyAttr(attr, players, monsters, false, curTurnActor))
+                    if (attr == null) { decodeFailed = true; break; }
+                    if (ApplyAttr(attr, board, players, monsters, false, curTurnActor))
                         thiefStoleOnTile = true;
                 }
                 else if (cmd == 1096)
                 {
                     dynamic sm = decoder.TryDecode("party.protocol.HeroSkillMoveEffectS2C", payload);
-                    if (sm == null) { decodeFailed = true; continue; }
+                    if (sm == null) { decodeFailed = true; break; }
                     long moverId = (long)sm.PlayerId;
                     UnitSim moverUnit = null;
                     if (moverId != 0 && !players.TryGetValue(moverId, out moverUnit))
@@ -244,7 +277,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                             {
                                 if (applyNow)
                                 {
-                                    ApplyAttr(attr, players, monsters, true, curTurnActor);
+                                    ApplyAttr(attr, board, players, monsters, true, curTurnActor);
                                 }
                                 else
                                 {
@@ -304,24 +337,30 @@ namespace MonsterPathPredictor.ReplayCertifier
                 }
             }
 
+            // Only commit prefix decision/map/calibration stats when the replay passes full lifecycle verification
+            // so truncated or corrupt replays can NEVER pollute verified corpus accuracy or calibration bins.
             if (unknownLayout)
             {
-                summary.MissingMap = 1;
+                return new CertificationSummary { ReplaysAttempted = 1, MissingMap = 1 };
             }
-            else if (parseError)
+            if (parseError)
             {
-                summary.ParseErrors = 1;
+                return new CertificationSummary { ReplaysAttempted = 1, ParseErrors = 1 };
             }
-            else if (isTruncated || decodeFailed || lifecycle != StreamLifecycleState.Finished)
+            if (isTruncated || decodeFailed || lifecycle != StreamLifecycleState.Finished)
             {
-                summary.TruncatedOrCorrupt = 1;
-            }
-            else
-            {
-                summary.ReplaysVerified = 1;
-                if (mapStat != null) mapStat.Replays = 1;
+                return new CertificationSummary
+                {
+                    ReplaysAttempted = 1,
+                    TruncatedOrCorrupt = 1,
+                    MissingPredictions = summary.MissingPredictions,
+                    OutOfSupportPredictions = summary.OutOfSupportPredictions,
+                    IllegalMoveEdges = summary.IllegalMoveEdges
+                };
             }
 
+            summary.ReplaysVerified = 1;
+            if (mapStat != null) mapStat.Replays = 1;
             return summary;
         }
     }

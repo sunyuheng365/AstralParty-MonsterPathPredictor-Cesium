@@ -126,21 +126,33 @@ namespace MonsterPathPredictor.ReplayCertifier
                 {
                     string v = ReadValue(tok);
                     if (parseErr != null) { error = parseErr; return false; }
-                    if (!double.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double d)) { error = $"ERROR: Invalid number for {tok}: \"{v}\""; return false; }
+                    if (!double.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double d) || !double.IsFinite(d) || d < 0.0 || d > 1.0)
+                    {
+                        error = $"ERROR: Invalid probability in [0, 1] for {tok}: \"{v}\"";
+                        return false;
+                    }
                     opts.Thresholds.MinDetAccuracy = d;
                 }
                 else if (string.Equals(tok, "--min-thief-accuracy", StringComparison.OrdinalIgnoreCase))
                 {
                     string v = ReadValue(tok);
                     if (parseErr != null) { error = parseErr; return false; }
-                    if (!double.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double d)) { error = $"ERROR: Invalid number for {tok}: \"{v}\""; return false; }
+                    if (!double.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double d) || !double.IsFinite(d) || d < 0.0 || d > 1.0)
+                    {
+                        error = $"ERROR: Invalid probability in [0, 1] for {tok}: \"{v}\"";
+                        return false;
+                    }
                     opts.Thresholds.MinThiefAccuracy = d;
                 }
                 else if (string.Equals(tok, "--max-abs-z", StringComparison.OrdinalIgnoreCase))
                 {
                     string v = ReadValue(tok);
                     if (parseErr != null) { error = parseErr; return false; }
-                    if (!double.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double d)) { error = $"ERROR: Invalid number for {tok}: \"{v}\""; return false; }
+                    if (!double.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double d) || !double.IsFinite(d) || d < 0.0)
+                    {
+                        error = $"ERROR: Invalid non-negative finite number for {tok}: \"{v}\"";
+                        return false;
+                    }
                     opts.Thresholds.MaxAbsZ = d;
                 }
                 else if (string.Equals(tok, "--min-aggro-samples", StringComparison.OrdinalIgnoreCase))
@@ -168,7 +180,11 @@ namespace MonsterPathPredictor.ReplayCertifier
                 {
                     string v = ReadValue(tok);
                     if (parseErr != null) { error = parseErr; return false; }
-                    if (!double.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double d)) { error = $"ERROR: Invalid number for {tok}: \"{v}\""; return false; }
+                    if (!double.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double d) || !double.IsFinite(d) || d < 0.0 || d > 1.0)
+                    {
+                        error = $"ERROR: Invalid rate in [0, 1] for {tok}: \"{v}\"";
+                        return false;
+                    }
                     opts.Thresholds.MaxDownloadFailRatio = d;
                 }
                 else
@@ -269,73 +285,70 @@ namespace MonsterPathPredictor.ReplayCertifier
             var perReplay = new ConcurrentBag<CertificationSummary>();
             int processed = 0, cacheHits = 0, streamed = 0;
 
+            async Task<byte[]> DownloadReplayAsync(string id, CancellationToken ct)
+            {
+                string[] cdns = cdnBase.Contains("sereplaycn", StringComparison.OrdinalIgnoreCase)
+                    ? new[] { cdnBase, "https://sereplayjp.feimogames.com/prod/" }
+                    : new[] { cdnBase };
+
+                foreach (string baseUrl in cdns)
+                {
+                    for (int attempt = 0; attempt < 2; attempt++)
+                    {
+                        try
+                        {
+                            byte[] fetched = await client.GetByteArrayAsync(baseUrl + id, ct);
+                            if (fetched.Length > 1000)
+                            {
+                                Interlocked.Increment(ref streamed);
+                                return fetched;
+                            }
+                        }
+                        catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+                        {
+                            break;
+                        }
+                        catch
+                        {
+                            if (attempt < 1) await Task.Delay(250 * (attempt + 1), ct);
+                        }
+                    }
+                }
+                return null;
+            }
+
             await Parallel.ForEachAsync(replayIds, new ParallelOptions { MaxDegreeOfParallelism = concurrency }, async (id, ct) =>
             {
                 byte[] bytes = null;
+                bool loadedFromCache = false;
                 bool hadCorruptLocalFile = false;
                 string cachedPath = ResolveCachedReplayPath(cacheDir, id);
                 if (cachedPath != null)
                 {
-                    var fi = new FileInfo(cachedPath);
-                    if (fi.Length > 1000)
+                    try
                     {
-                        bytes = await File.ReadAllBytesAsync(cachedPath, ct);
-                        Interlocked.Increment(ref cacheHits);
+                        var fi = new FileInfo(cachedPath);
+                        if (fi.Length > 1000)
+                        {
+                            bytes = await File.ReadAllBytesAsync(cachedPath, ct);
+                            loadedFromCache = true;
+                            Interlocked.Increment(ref cacheHits);
+                        }
+                        else
+                        {
+                            hadCorruptLocalFile = true;
+                        }
                     }
-                    else
+                    catch (Exception ex)
                     {
-                        hadCorruptLocalFile = true;
+                        Console.Error.WriteLine($"WARN: Failed to read cache file {cachedPath}: {ex.Message}");
                     }
                 }
                 string savePath = ResolveSaveCachePath(cacheDir, id, cachedPath);
 
                 if (bytes == null)
                 {
-                    string[] cdns = cdnBase.Contains("sereplaycn", StringComparison.OrdinalIgnoreCase)
-                        ? new[] { cdnBase, "https://sereplayjp.feimogames.com/prod/" }
-                        : new[] { cdnBase };
-
-                    foreach (string baseUrl in cdns)
-                    {
-                        for (int attempt = 0; attempt < 2; attempt++)
-                        {
-                            try
-                            {
-                                byte[] fetched = await client.GetByteArrayAsync(baseUrl + id, ct);
-                                if (fetched.Length > 1000)
-                                {
-                                    bytes = fetched;
-                                    Interlocked.Increment(ref streamed);
-                                    break;
-                                }
-                            }
-                            catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
-                            {
-                                break;
-                            }
-                            catch
-                            {
-                                if (attempt < 1) await Task.Delay(250 * (attempt + 1), ct);
-                            }
-                        }
-                        if (bytes != null) break;
-                    }
-
-                    // Persist downloaded replay back to cache in an isolated try/catch so a cache write error
-                    // NEVER clears the downloaded bytes or misclassifies a valid download as DownloadFailed.
-                    if (bytes != null && saveCache && savePath != null)
-                    {
-                        try
-                        {
-                            string parentDir = Path.GetDirectoryName(savePath);
-                            if (!string.IsNullOrEmpty(parentDir)) Directory.CreateDirectory(parentDir);
-                            await File.WriteAllBytesAsync(savePath, bytes, ct);
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.Error.WriteLine($"WARN: Failed to write cache file {savePath}: {ex.Message}");
-                        }
-                    }
+                    bytes = await DownloadReplayAsync(id, ct);
                 }
 
                 CertificationSummary local;
@@ -347,8 +360,31 @@ namespace MonsterPathPredictor.ReplayCertifier
                 }
                 else
                 {
-                    try { local = ReplayEvaluator.EvaluateBytes(id, bytes, decoder, catalog); }
-                    catch { local = new CertificationSummary { ReplaysAttempted = 1, ParseErrors = 1 }; }
+                    local = SafeEvaluateReplay(id, bytes, decoder, catalog);
+
+                    // If an existing cached file (>1000B) evaluated as corrupt/parse-error, allow ONE automatic CDN
+                    // recovery attempt before classifying as corrupt, and never persist corrupt downloads to cache.
+                    if (loadedFromCache && (local.TruncatedOrCorrupt > 0 || local.ParseErrors > 0))
+                    {
+                        byte[] refreshed = await DownloadReplayAsync(id, ct);
+                        if (refreshed != null)
+                        {
+                            var refreshedResult = SafeEvaluateReplay(id, refreshed, decoder, catalog);
+                            if (refreshedResult.TruncatedOrCorrupt == 0 && refreshedResult.ParseErrors == 0)
+                            {
+                                bytes = refreshed;
+                                local = refreshedResult;
+                                loadedFromCache = false; // Eligible to atomically overwrite corrupt cache below
+                            }
+                        }
+                    }
+
+                    // Atomically publish to cache ONLY AFTER verifying the replay is not corrupt/parse-error.
+                    if (!loadedFromCache && saveCache && savePath != null &&
+                        local.TruncatedOrCorrupt == 0 && local.ParseErrors == 0)
+                    {
+                        TryWriteCacheAtomic(savePath, bytes);
+                    }
                 }
 
                 perReplay.Add(local);
@@ -410,6 +446,33 @@ namespace MonsterPathPredictor.ReplayCertifier
             string flat = Path.Combine(cacheDir, replayId);
             if (Directory.Exists(flat)) return Path.Combine(flat, replayId);
             return flat;
+        }
+
+        public static CertificationSummary SafeEvaluateReplay(string replayId, byte[] bytes, IProtocolDecoder decoder, BoardCatalog catalog)
+        {
+            try { return ReplayEvaluator.EvaluateBytes(replayId, bytes, decoder, catalog); }
+            catch { return new CertificationSummary { ReplaysAttempted = 1, ParseErrors = 1 }; }
+        }
+
+        public static bool TryWriteCacheAtomic(string savePath, byte[] bytes)
+        {
+            if (string.IsNullOrWhiteSpace(savePath) || bytes == null) return false;
+            string tmpPath = null;
+            try
+            {
+                string parentDir = Path.GetDirectoryName(savePath);
+                if (!string.IsNullOrEmpty(parentDir)) Directory.CreateDirectory(parentDir);
+                tmpPath = savePath + ".tmp." + Guid.NewGuid().ToString("N");
+                File.WriteAllBytes(tmpPath, bytes);
+                File.Move(tmpPath, savePath, overwrite: true);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"WARN: Failed to write cache file {savePath}: {ex.Message}");
+                try { if (tmpPath != null && File.Exists(tmpPath)) File.Delete(tmpPath); } catch { }
+                return false;
+            }
         }
     }
 }

@@ -8,7 +8,9 @@ param(
     [string]$CacheDir,
     [string]$JsonOut = "dist/replay-certification.json",
     [string]$MdOut = "dist/replay-certification.md",
+    [ValidateRange(1, 64)]
     [int]$Concurrency = 24,
+    [ValidateRange(0, [int]::MaxValue)]
     [int]$Limit = 0,
     [switch]$SaveCache
 )
@@ -31,7 +33,7 @@ foreach ($entry in $Maps) {
 }
 if ($CorpusFile) { $cliArgs += @("--corpus", $CorpusFile) }
 if ($CacheDir) { $cliArgs += @("--cache-dir", $CacheDir) }
-if ($Limit -gt 0) { $cliArgs += @("--limit", $Limit.ToString()) }
+if ($PSBoundParameters.ContainsKey('Limit') -or $Limit -gt 0) { $cliArgs += @("--limit", $Limit.ToString()) }
 if ($SaveCache) { $cliArgs += "--save-cache" }
 
 Write-Host "=== Running Automated Replay Certification ===" -ForegroundColor Cyan

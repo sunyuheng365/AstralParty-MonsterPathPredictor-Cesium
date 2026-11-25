@@ -25,10 +25,17 @@ namespace MonsterPathPredictor.Core
         public bool SimulateCombatOnFork { get; set; } = true;
         public PostCombatMode PostCombatMode { get; set; } = PostCombatMode.ContinueByGuide;
         public bool AllowNonAggressiveMonsters { get; set; } = true;
-        public string PickerHotkey { get; set; } = "F8";
+        public string PickerHotkey { get; set; } = "F10";
         public bool ClosePickerOnSelect { get; set; } = false;
         public string ClearHotkey { get; set; } = "Escape";
         public HashSet<int> ExcludedPlayerBuffIds { get; set; } = new HashSet<int>();
+
+        public string DeterministicColorHex { get; set; } = StyleColor.DefaultDeterministicHex;
+        public string MajorBranchColorHex { get; set; } = StyleColor.DefaultMajorBranchHex;
+        public string MinorBranchColorHex { get; set; } = StyleColor.DefaultMinorBranchHex;
+        public string PostCombatColorHex { get; set; } = StyleColor.DefaultPostCombatHex;
+        public string GuideRedColorHex { get; set; } = StyleColor.DefaultGuideRedHex;
+        public string GuideBlueColorHex { get; set; } = StyleColor.DefaultGuideBlueHex;
 
         public void ClampInPlace()
         {
@@ -40,9 +47,36 @@ namespace MonsterPathPredictor.Core
             HeightOffset = ClampFloat(HeightOffset, 0f, 5f, 0.45f);
             FontSize = ClampInt(FontSize, 12, 36);
             ClickRadius = ClampFloat(ClickRadius, 8f, 120f, 28f);
-            if (string.IsNullOrWhiteSpace(PickerHotkey)) PickerHotkey = "F8";
+            if (string.IsNullOrWhiteSpace(PickerHotkey)) PickerHotkey = "F10";
             if (string.IsNullOrWhiteSpace(ClearHotkey)) ClearHotkey = "Escape";
             if (ExcludedPlayerBuffIds == null) ExcludedPlayerBuffIds = new HashSet<int>();
+
+            DeterministicColorHex = StyleColor.NormalizeHex(DeterministicColorHex, StyleColor.DefaultDeterministicHex);
+            MajorBranchColorHex = StyleColor.NormalizeHex(MajorBranchColorHex, StyleColor.DefaultMajorBranchHex);
+            MinorBranchColorHex = StyleColor.NormalizeHex(MinorBranchColorHex, StyleColor.DefaultMinorBranchHex);
+            PostCombatColorHex = StyleColor.NormalizeHex(PostCombatColorHex, StyleColor.DefaultPostCombatHex);
+            GuideRedColorHex = StyleColor.NormalizeHex(GuideRedColorHex, StyleColor.DefaultGuideRedHex);
+            GuideBlueColorHex = StyleColor.NormalizeHex(GuideBlueColorHex, StyleColor.DefaultGuideBlueHex);
+        }
+
+        public void ResetStyleToDefaults()
+        {
+            DashLength = 12f;
+            GapLength = 8f;
+            DashSpeed = 26f;
+            LineWidth = 4.5f;
+            HeightOffset = 0.45f;
+            FontSize = 18;
+            ShowReasonTag = true;
+            ShowStepNumbers = true;
+            ShowDeterministicPercent = false;
+            PostCombatMode = PostCombatMode.ContinueByGuide;
+            DeterministicColorHex = StyleColor.DefaultDeterministicHex;
+            MajorBranchColorHex = StyleColor.DefaultMajorBranchHex;
+            MinorBranchColorHex = StyleColor.DefaultMinorBranchHex;
+            PostCombatColorHex = StyleColor.DefaultPostCombatHex;
+            GuideRedColorHex = StyleColor.DefaultGuideRedHex;
+            GuideBlueColorHex = StyleColor.DefaultGuideBlueHex;
         }
 
         public static PostCombatMode ParsePostCombatMode(string raw)

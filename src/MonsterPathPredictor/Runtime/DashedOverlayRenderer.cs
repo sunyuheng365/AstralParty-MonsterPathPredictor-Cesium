@@ -15,16 +15,35 @@ namespace MonsterPathPredictor.Runtime
     /// </summary>
     internal sealed class DashedOverlayRenderer : IDisposable
     {
-        private static readonly Color DeterministicColor = new Color(0.24f, 0.90f, 1.00f, 0.96f);      // Bright cyan
-        private static readonly Color PostCombatCyan = new Color(0.58f, 0.78f, 0.95f, 0.56f);          // Softer post-combat continuation
-        private static readonly Color MajorBranchColor = new Color(1.00f, 0.82f, 0.22f, 0.96f);        // Bright gold
-        private static readonly Color MinorBranchColor = new Color(1.00f, 0.48f, 0.28f, 0.88f);        // Warm coral
-        private static readonly Color GuideRedArrow = new Color(1.00f, 0.32f, 0.32f, 0.98f);           // Guide red arrow
-        private static readonly Color GuideBlueArrow = new Color(0.26f, 0.68f, 1.00f, 0.98f);          // Guide blue arrow
         private static readonly Color CombatBadgeColor = new Color(1.00f, 0.40f, 0.34f, 0.98f);        // Encounter marker
         private static readonly Color RingColor = new Color(1.00f, 0.88f, 0.25f, 0.95f);               // Selection ring
+        private static readonly Color VirtualGhostColor = new Color(0.82f, 0.42f, 1.00f, 0.98f);       // Virtual player ghost marker
+        private static readonly Color VirtualTetherColor = new Color(0.82f, 0.42f, 1.00f, 0.72f);      // Real -> Virtual dashed tether
+        private static readonly Color VirtualInnerDotColor = new Color(0.98f, 0.92f, 1.00f, 0.98f);    // Inner ghost core
         private static readonly Color BadgeBg = new Color(0.06f, 0.09f, 0.14f, 0.86f);                 // Dark pill
         private static readonly float[] PillCornerRadii = { 6f, 6f, 6f, 6f };
+
+        private readonly struct RoutePalette
+        {
+            public readonly Color Deterministic;
+            public readonly Color MajorBranch;
+            public readonly Color MinorBranch;
+            public readonly Color PostCombat;
+            public readonly Color GuideRed;
+            public readonly Color GuideBlue;
+
+            public RoutePalette(PredictorSettings settings)
+            {
+                Deterministic = ToUnityColor(StyleColor.GetRoleColor(settings, RouteColorRole.Deterministic));
+                MajorBranch = ToUnityColor(StyleColor.GetRoleColor(settings, RouteColorRole.MajorBranch));
+                MinorBranch = ToUnityColor(StyleColor.GetRoleColor(settings, RouteColorRole.MinorBranch));
+                PostCombat = ToUnityColor(StyleColor.GetRoleColor(settings, RouteColorRole.PostCombat));
+                GuideRed = ToUnityColor(StyleColor.GetRoleColor(settings, RouteColorRole.GuideRed));
+                GuideBlue = ToUnityColor(StyleColor.GetRoleColor(settings, RouteColorRole.GuideBlue));
+            }
+
+            private static Color ToUnityColor(RgbaColor c) => new Color(c.Rf, c.Gf, c.Bf, c.Af);
+        }
 
         private sealed class PooledPill
         {
@@ -55,6 +74,7 @@ namespace MonsterPathPredictor.Runtime
         private readonly Dictionary<int, float> _forkTagNextTopY = new Dictionary<int, float>();
         private readonly Dictionary<long, int> _forkExitLabelStack = new Dictionary<long, int>();
         private readonly Dictionary<long, float> _forkExitNextTopY = new Dictionary<long, float>();
+        private readonly Dictionary<int, int> _ghostTileStack = new Dictionary<int, int>();
         private readonly HashSet<int> _combatLandSet = new HashSet<int>();
         private readonly List<DashQuad> _dashQuadBuf = new List<DashQuad>(32);
         private readonly List<Vector2> _vertBuf = new List<Vector2>(4);
@@ -122,10 +142,13 @@ namespace MonsterPathPredictor.Runtime
             BoardGraph board,
             LiveMonsterInfo selectedMonster,
             PathPlan plan,
-            PredictorSettings settings)
+            PredictorSettings settings,
+            IReadOnlyList<VirtualPlayerGhost> virtualGhosts = null)
         {
             var layer = EnsureLayer();
-            if (layer == null || camera == null || board == null || selectedMonster == null || plan == null)
+            bool hasMonsterPlan = selectedMonster != null && plan != null;
+            bool hasVirtualGhosts = virtualGhosts != null && virtualGhosts.Count > 0;
+            if (layer == null || camera == null || board == null || settings == null || (!hasMonsterPlan && !hasVirtualGhosts))
             {
                 HideAll();
                 return;
@@ -134,6 +157,7 @@ namespace MonsterPathPredictor.Runtime
             _usedLineGraphs = 0;
             _usedPills = 0;
 
+            var palette = new RoutePalette(settings);
             var camTr = UnityObject.GetTransform(camera);
             var camPos = TransformService.GetPosition(camTr);
             var camForward = TransformService.GetForward(camTr);
@@ -149,16 +173,6 @@ namespace MonsterPathPredictor.Runtime
             float phaseOffset = settings.DashSpeed > 0.01f
                 ? UnityTime.RealtimeSinceStartup * settings.DashSpeed
                 : 0f;
-
-            // 0. Selected monster header badge FIRST (always Pill #0 so its cached FairyGUI mesh never swaps)
-            Vector3 headerWorld = GetStableHeaderAnchorWorld(selectedMonster);
-            if (TryProjectWorld(layer, camera, camPos, camForward, headerWorld, out var headerPt, nearClipDist))
-            {
-                string headerText = !string.IsNullOrEmpty(plan.HeadlineNote)
-                    ? plan.MonsterName + " (" + plan.HeadlineNote + ")"
-                    : plan.MonsterName;
-                DrawPillLabel(new Point2(headerPt.X, headerPt.Y - 12f), headerText, Math.Max(13, settings.FontSize - 2), RingColor);
-            }
 
             _screenCache.Clear();
             bool TryProjectTileRaw(int landId, out Point2 pt)
@@ -181,10 +195,28 @@ namespace MonsterPathPredictor.Runtime
                 return pt.X >= -300f && pt.X <= layer.width + 300f && pt.Y >= -300f && pt.Y <= layer.height + 300f;
             }
 
-            // 1. Highlight dot on the selected monster's starting tile
-            if (TryProjectTile(plan.StartLandId, out var startPt))
+            if (hasMonsterPlan)
             {
-                DrawDot(startPt, 8.5f, RingColor);
+                // 0. Selected monster header badge FIRST (always Pill #0 so its cached FairyGUI mesh never swaps)
+                Vector3 headerWorld = GetStableHeaderAnchorWorld(selectedMonster);
+                if (TryProjectWorld(layer, camera, camPos, camForward, headerWorld, out var headerPt, nearClipDist))
+                {
+                    string note = plan.HeadlineNote;
+                    if (hasVirtualGhosts)
+                    {
+                        note = string.IsNullOrEmpty(note) ? "虚拟站位" : (note + "·虚拟站位");
+                    }
+                    string headerText = !string.IsNullOrEmpty(note)
+                        ? plan.MonsterName + " (" + note + ")"
+                        : plan.MonsterName;
+                    DrawPillLabel(new Point2(headerPt.X, headerPt.Y - 12f), headerText, Math.Max(13, settings.FontSize - 2), hasVirtualGhosts ? VirtualGhostColor : RingColor);
+                }
+
+                // 1. Highlight dot on the selected monster's starting tile
+                if (TryProjectTile(plan.StartLandId, out var startPt))
+                {
+                    DrawDot(startPt, 8.5f, RingColor);
+                }
             }
 
             // 2. Animated forward-marching dashed lines for all predicted edges:
@@ -193,6 +225,8 @@ namespace MonsterPathPredictor.Runtime
             //    via exact float-rational Liang-Barsky, and preserve exact dash phase in 106-bit double-double.
             double dashPeriod = (double)settings.DashLength + Math.Max(0.0, settings.GapLength);
 
+            if (hasMonsterPlan)
+            {
             for (int i = 0; i < plan.Edges.Count; i++)
             {
                 var edge = plan.Edges[i];
@@ -239,7 +273,7 @@ namespace MonsterPathPredictor.Runtime
                         out double clippedFromStartPx, out double clippedStartModPeriod, out double clippedEndPx))
                     continue;
 
-                Color color = PickEdgeColor(edge.Probability, edge.IsAfterCombat);
+                Color color = PickEdgeColor(palette, edge.Probability, edge.IsAfterCombat);
                 float baseWidth = edge.IsAfterCombat ? Math.Max(2.2f, settings.LineWidth * 0.78f) : settings.LineWidth;
                 float width = edge.Probability >= 0.999
                     ? baseWidth
@@ -286,7 +320,7 @@ namespace MonsterPathPredictor.Runtime
                 var fork = plan.Forks[i];
                 if (!TryProjectTile(fork.ForkLandId, out var forkPt)) continue;
 
-                Color forkAccent = PickForkAccentColor(fork);
+                Color forkAccent = PickForkAccentColor(palette, fork);
                 DrawDot(forkPt, 5.5f, forkAccent);
 
                 _forkTagStack.TryGetValue(fork.ForkLandId, out int visitIndex);
@@ -296,7 +330,7 @@ namespace MonsterPathPredictor.Runtime
                     var exit = fork.Exits[e];
                     if (!TryProjectTile(exit.NextLandId, out var exitPt)) continue;
 
-                    Color exitColor = PickForkExitColor(fork, exit);
+                    Color exitColor = PickForkExitColor(palette, fork, exit);
                     float arrowLen = Math.Max(14f, settings.LineWidth * 3.5f);
                     float arrowHalfW = Math.Max(7f, settings.LineWidth * 1.8f);
                     if (DashGeometry.TryBuildArrowHead(forkPt, exitPt, arrowLen, arrowHalfW, out var arrow, 0.56f))
@@ -343,7 +377,7 @@ namespace MonsterPathPredictor.Runtime
                 var combat = plan.Combats[i];
                 if (!TryProjectTile(combat.LandId, out var cPt)) continue;
 
-                Color badgeColor = combat.IsSteal ? MajorBranchColor : CombatBadgeColor;
+                Color badgeColor = combat.IsSteal ? palette.MajorBranch : CombatBadgeColor;
                 DrawDot(cPt, 7.5f, badgeColor);
                 string prefix = combat.IsSteal ? "偷" : "⚔遇";
                 string cLabel = prefix + combat.TargetLabel + "(第" + combat.StepIndex + "格)";
@@ -363,7 +397,7 @@ namespace MonsterPathPredictor.Runtime
 
                     Color stepColor = ts.StepIndex == 0
                         ? RingColor
-                        : PickEdgeColor(ts.Probability, ts.IsAfterCombat);
+                        : PickEdgeColor(palette, ts.Probability, ts.IsAfterCombat);
 
                     if (ts.IsEndpoint)
                     {
@@ -388,13 +422,20 @@ namespace MonsterPathPredictor.Runtime
                     if (ep.StoppedAtCombat && _combatLandSet.Contains(ep.LandId)) continue;
                     if (!TryProjectTile(ep.LandId, out var epPt)) continue;
 
-                    Color epColor = PickEdgeColor(ep.Probability, ep.IsAfterCombat);
+                    Color epColor = PickEdgeColor(palette, ep.Probability, ep.IsAfterCombat);
                     DrawDot(epPt, 6.5f, epColor);
 
                     string epLabel = ep.IsDeadEnd ? ("终点(" + ep.StepIndex + "格)") : (ep.StepIndex + "格");
                     float yOff = _combatLandSet.Contains(ep.LandId) ? -22f : 16f;
                     DrawPillLabel(new Point2(epPt.X, epPt.Y + yOff), epLabel, Math.Max(12, settings.FontSize - 4), epColor);
                 }
+            }
+            }
+
+            // 6. Virtual player ghost markers & real -> virtual tethers (visible even when no monster is selected)
+            if (hasVirtualGhosts)
+            {
+                RenderVirtualGhosts(layer, camera, camPos, camForward, board, virtualGhosts, settings, hOffset, nearClipDist, phaseOffset);
             }
 
             for (int i = _usedLineGraphs; i < _lineGraphPool.Count; i++)
@@ -439,46 +480,134 @@ namespace MonsterPathPredictor.Runtime
             return new Vector3(x, basePos.y + measuredHeight + 0.18f, z);
         }
 
-        private static Color PickEdgeColor(double probability, bool isAfterCombat)
+        private void RenderVirtualGhosts(
+            GComponent layer,
+            Camera camera,
+            Vector3 camPos,
+            Vector3 camForward,
+            BoardGraph board,
+            IReadOnlyList<VirtualPlayerGhost> ghosts,
+            PredictorSettings settings,
+            float hOffset,
+            float nearClipDist,
+            float phaseOffset)
+        {
+            const float TetherDashLen = 8f;
+            const float TetherGapLen = 6f;
+            const double TetherPeriod = TetherDashLen + TetherGapLen;
+            int labelFont = Math.Max(12, settings.FontSize - 3);
+            _ghostTileStack.Clear();
+
+            for (int i = 0; i < ghosts.Count; i++)
+            {
+                var ghost = ghosts[i];
+                if (!board.TryGetNode(ghost.VirtualLandId, out var virtNode)) continue;
+
+                // Dashed tether from real tile -> virtual tile
+                if (ghost.RealLandId >= 0 && ghost.RealLandId != ghost.VirtualLandId &&
+                    board.TryGetNode(ghost.RealLandId, out var realNode))
+                {
+                    if (DashGeometry.TryClipSegmentToNearPlane(
+                            realNode.X, realNode.Y + hOffset, realNode.Z,
+                            virtNode.X, virtNode.Y + hOffset, virtNode.Z,
+                            camPos.x, camPos.y, camPos.z,
+                            camForward.x, camForward.y, camForward.z,
+                            nearClipDist,
+                            out float cax, out float cay, out float caz,
+                            out float cbx, out float cby, out float cbz,
+                            out bool clippedNearStart, out bool clippedNearEnd) &&
+                        TryProjectWorldUnclipped(layer, camera, camPos, camForward, new Vector3(cax, cay, caz), out var pReal, nearClipDist, skipDepthCheck: true) &&
+                        TryProjectWorldUnclipped(layer, camera, camPos, camForward, new Vector3(cbx, cby, cbz), out var pVirtClip, nearClipDist, skipDepthCheck: true) &&
+                        DashGeometry.TryClipSegmentToRect(
+                            pReal, pVirtClip, -40f, -40f, layer.width + 40f, layer.height + 40f,
+                            TetherPeriod,
+                            out var clipFrom, out var clipTo,
+                            out double clippedFromStartPx, out double clippedStartModPeriod, out double clippedEndPx))
+                    {
+                        double origTrim = clippedNearStart ? 0.0 : 8.0;
+                        double origTrimEnd = clippedNearEnd ? 0.0 : 10.0;
+                        double trimStart = Math.Max(0.0, origTrim - clippedFromStartPx);
+                        double trimEnd = Math.Max(0.0, origTrimEnd - clippedEndPx);
+                        float clippedPhase = DashGeometry.ComputeClippedDashPhase(phaseOffset * 0.65f, origTrim, clippedStartModPeriod, trimStart, TetherPeriod);
+
+                        DashGeometry.BuildDashedSegmentsInto(
+                            _dashQuadBuf,
+                            clipFrom, clipTo,
+                            TetherDashLen,
+                            TetherGapLen,
+                            Math.Max(2.5f, Math.Min(4.5f, settings.LineWidth * 0.72f)),
+                            trimStart: (float)trimStart,
+                            trimEnd: (float)trimEnd,
+                            phaseOffset: clippedPhase);
+
+                        for (int q = 0; q < _dashQuadBuf.Count; q++)
+                        {
+                            DrawQuad(_dashQuadBuf[q], VirtualTetherColor);
+                        }
+                    }
+                }
+
+                // Virtual position ring & label pill
+                var virtWorld = new Vector3(virtNode.X, virtNode.Y + hOffset, virtNode.Z);
+                if (!TryProjectWorld(layer, camera, camPos, camForward, virtWorld, out var vPt, nearClipDist))
+                    continue;
+
+                Color accent = ghost.IsSelectedForEdit ? RingColor : VirtualGhostColor;
+                DrawDot(vPt, 11.5f, accent);
+                DrawDot(vPt, 5.5f, VirtualInnerDotColor);
+
+                _ghostTileStack.TryGetValue(ghost.VirtualLandId, out int stackIdx);
+                _ghostTileStack[ghost.VirtualLandId] = stackIdx + 1;
+
+                string selfTag = ghost.IsLocalPlayer ? "(我)" : string.Empty;
+                string badge = "虚·" + ghost.SeatTag + selfTag + " #" + ghost.VirtualLandId;
+                float yOffset = -24f - stackIdx * (labelFont + 10f);
+                DrawPillLabel(new Point2(vPt.X, vPt.Y + yOffset), badge, labelFont, accent);
+            }
+        }
+
+        private static Color PickEdgeColor(RoutePalette palette, double probability, bool isAfterCombat)
         {
             if (isAfterCombat)
             {
-                if (probability >= 0.999) return PostCombatCyan;
-                var c = probability >= 0.50 ? MajorBranchColor : MinorBranchColor;
-                return new Color(c.r, c.g, c.b, 0.55f);
+                if (probability >= 0.999) return palette.PostCombat;
+                var c = probability >= 0.50 ? palette.MajorBranch : palette.MinorBranch;
+                return new Color(c.r, c.g, c.b, Math.Min(0.60f, c.a * 0.65f));
             }
-            if (probability >= 0.999) return DeterministicColor;
-            if (probability >= 0.50) return MajorBranchColor;
-            return MinorBranchColor;
+            if (probability >= 0.999) return palette.Deterministic;
+            if (probability >= 0.50) return palette.MajorBranch;
+            return palette.MinorBranch;
         }
 
-        private static Color PickForkAccentColor(PredictedFork fork)
+        private static Color PickForkAccentColor(RoutePalette palette, PredictedFork fork)
         {
             switch (fork.ReasonKind)
             {
                 case ForkReasonKind.ForkStartRed:
                 case ForkReasonKind.PostCombatRed:
                 case ForkReasonKind.SkillTrashcanRed:
-                    return GuideRedArrow;
+                    return palette.GuideRed;
                 case ForkReasonKind.ForkStartBlue:
                 case ForkReasonKind.PostCombatBlue:
-                    return GuideBlueArrow;
+                    return palette.GuideBlue;
                 case ForkReasonKind.SkillLinglingRedBlue:
-                    return (fork.Exits.Count > 0 && fork.Exits[0].IsGlobalRedArrow) ? GuideRedArrow : GuideBlueArrow;
+                    return (fork.Exits.Count > 0 && fork.Exits[0].IsGlobalRedArrow) ? palette.GuideRed : palette.GuideBlue;
                 default:
                     if (fork.HasMultipleBranches)
-                        return fork.IsAfterCombat ? new Color(MajorBranchColor.r, MajorBranchColor.g, MajorBranchColor.b, 0.72f) : MajorBranchColor;
-                    return fork.IsAfterCombat ? PostCombatCyan : DeterministicColor;
+                        return fork.IsAfterCombat
+                            ? new Color(palette.MajorBranch.r, palette.MajorBranch.g, palette.MajorBranch.b, Math.Min(0.72f, palette.MajorBranch.a * 0.78f))
+                            : palette.MajorBranch;
+                    return fork.IsAfterCombat ? palette.PostCombat : palette.Deterministic;
             }
         }
 
-        private static Color PickForkExitColor(PredictedFork fork, ForkExitPrediction exit)
+        private static Color PickForkExitColor(RoutePalette palette, PredictedFork fork, ForkExitPrediction exit)
         {
             if (!fork.HasMultipleBranches)
             {
-                return PickForkAccentColor(fork);
+                return PickForkAccentColor(palette, fork);
             }
-            return PickEdgeColor(exit.ConditionalProbability, fork.IsAfterCombat);
+            return PickEdgeColor(palette, exit.ConditionalProbability, fork.IsAfterCombat);
         }
 
         private static bool TryProjectWorldUnclipped(

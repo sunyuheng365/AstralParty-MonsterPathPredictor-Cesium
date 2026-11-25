@@ -72,6 +72,14 @@ namespace MonsterPathPredictor.Core
         public bool IsNormalAggressive { get; set; } = true;
         public bool IsThief { get; set; }
         public int ActionWeight { get; set; }
+        /// <summary>1-based monotonic spawn sequence within the match (handles 100k -> 1 MonsterId wraparound).</summary>
+        public int SpawnSequence { get; set; }
+        /// <summary>1-based live action-order rank in the sorted monster list.</summary>
+        public int ActionOrderRank { get; set; }
+        /// <summary>True when this monster is the active turn actor right now.</summary>
+        public bool IsCurrentlyActing { get; set; }
+        /// <summary>True when this monster already completed its turn in the current round.</summary>
+        public bool HasActedThisRound { get; set; }
 
         public int CurrentLandId { get; set; } = -1;
         public int FromLandId { get; set; } = -1;

@@ -20,6 +20,7 @@ namespace MonsterPathPredictor.Runtime
         private readonly MonsterPicker _picker = new MonsterPicker();
         private readonly MonsterPickerPopup _popup = new MonsterPickerPopup();
         private readonly DashedOverlayRenderer _renderer = new DashedOverlayRenderer();
+        private readonly VirtualPlayerSandbox _virtualSandbox = new VirtualPlayerSandbox();
 
         private PredictorSettings _settings = new PredictorSettings();
         private BoardGraph _board;
@@ -35,6 +36,7 @@ namespace MonsterPathPredictor.Runtime
         private DateTime _selectedMissingSince;
         private bool _needsUnitSync;
         private bool _planDirty;
+        private bool _savingSelfConfig;
 
         public override string Name => "怪物寻路预测";
         public override string Version => "1.0.0";
@@ -49,26 +51,38 @@ namespace MonsterPathPredictor.Runtime
             _popup.MonsterSelected += OnPopupMonsterSelected;
             _popup.ClearRequested += OnPopupClearRequested;
             _popup.StepsDeltaRequested += OnPopupStepsDelta;
+            _popup.VirtualPlayerSelected += OnVirtualPlayerSelected;
+            _popup.VirtualMoveRequested += OnVirtualMoveRequested;
+            _popup.VirtualUndoRequested += OnVirtualUndoRequested;
+            _popup.VirtualResetPlayerRequested += OnVirtualResetPlayerRequested;
+            _popup.VirtualResetAllRequested += OnVirtualResetAllRequested;
+            _popup.VirtualBoardPickToggled += OnVirtualBoardPickToggled;
+            _popup.StyleMutationRequested += OnStyleMutationRequested;
+            _popup.StyleResetRequested += OnStyleResetRequested;
 
             UpdateEvents.LateUpdate += DrawAndTrack;
             Context?.RegisterCleanup(Stop);
             Log.Info("怪物寻路预测已启用：点击怪物模型任意处或按 " + _settings.PickerHotkey +
-                     " 弹窗选怪（延伸 " + _settings.PreviewSteps + " 格，按 " + _settings.ClearHotkey + " 取消）。");
+                     " 弹窗选怪/虚拟走位/自定义路线样式（延伸 " + _settings.PreviewSteps + " 格，按 " + _settings.ClearHotkey + " 取消）。");
         }
 
         public override void OnConfigChanged()
         {
+            if (_savingSelfConfig) return;
             _settings = PredictorConfig.Load(Config, isInitial: false);
             _needsUnitSync = true;
             _planDirty = true;
+            _popup.Invalidate();
             if (!_settings.Enabled)
             {
                 _tracker.SetEventCollectionEnabled(false);
                 ClearSelectionAndOverlay();
+                _virtualSandbox.ResetAll(disarmBoardPick: true);
                 _popup.Hide();
             }
             Log.Info("配置已热重载：enabled=" + _settings.Enabled +
                      ", previewSteps=" + _settings.PreviewSteps +
+                     ", lineWidth=" + _settings.LineWidth +
                      ", dashSpeed=" + _settings.DashSpeed +
                      ", pickerHotkey=" + _settings.PickerHotkey +
                      ", postCombatMode=" + PredictorSettings.FormatPostCombatMode(_settings.PostCombatMode));
@@ -90,6 +104,14 @@ namespace MonsterPathPredictor.Runtime
             _popup.MonsterSelected -= OnPopupMonsterSelected;
             _popup.ClearRequested -= OnPopupClearRequested;
             _popup.StepsDeltaRequested -= OnPopupStepsDelta;
+            _popup.VirtualPlayerSelected -= OnVirtualPlayerSelected;
+            _popup.VirtualMoveRequested -= OnVirtualMoveRequested;
+            _popup.VirtualUndoRequested -= OnVirtualUndoRequested;
+            _popup.VirtualResetPlayerRequested -= OnVirtualResetPlayerRequested;
+            _popup.VirtualResetAllRequested -= OnVirtualResetAllRequested;
+            _popup.VirtualBoardPickToggled -= OnVirtualBoardPickToggled;
+            _popup.StyleMutationRequested -= OnStyleMutationRequested;
+            _popup.StyleResetRequested -= OnStyleResetRequested;
             _tracker.Stop();
             ResetBattleState();
             _popup.Dispose();
@@ -113,7 +135,14 @@ namespace MonsterPathPredictor.Runtime
 
         private void OnPopupClearRequested()
         {
-            ClearSelectionAndOverlay();
+            if (_selectedMonsterId != 0)
+            {
+                ClearSelectionAndOverlay();
+            }
+            else if (_virtualSandbox.HasOverrides)
+            {
+                OnVirtualResetAllRequested();
+            }
         }
 
         private void OnPopupStepsDelta(int delta)
@@ -122,15 +151,94 @@ namespace MonsterPathPredictor.Runtime
             if (nextSteps == _settings.PreviewSteps) return;
             _settings.PreviewSteps = nextSteps;
             _planDirty = true;
+            _popup.Invalidate();
+            SaveCurrentStyleSettings();
+        }
+
+        private void OnVirtualPlayerSelected(long playerId)
+        {
+            _virtualSandbox.SelectPlayer(playerId);
+            _popup.Invalidate();
+        }
+
+        private void OnVirtualMoveRequested(long playerId, int targetLandId)
+        {
+            var player = FindPlayer(playerId);
+            if (player == null || !player.IsAlive || _board == null) return;
+            if (_virtualSandbox.SetVirtualLand(playerId, targetLandId, player.LandId, _board))
+            {
+                _planDirty = true;
+                _popup.Invalidate();
+            }
+        }
+
+        private void OnVirtualUndoRequested(long playerId)
+        {
+            var player = FindPlayer(playerId);
+            int liveLand = player != null ? player.LandId : -1;
+            if (_virtualSandbox.Undo(playerId, liveLand, _board))
+            {
+                _planDirty = true;
+                _popup.Invalidate();
+            }
+        }
+
+        private void OnVirtualResetPlayerRequested(long playerId)
+        {
+            if (_virtualSandbox.ResetPlayer(playerId))
+            {
+                _planDirty = true;
+                _popup.Invalidate();
+            }
+        }
+
+        private void OnVirtualResetAllRequested()
+        {
+            if (_virtualSandbox.ResetAll(disarmBoardPick: false))
+            {
+                _planDirty = true;
+                _popup.Invalidate();
+            }
+        }
+
+        private void OnVirtualBoardPickToggled(bool armed)
+        {
+            _virtualSandbox.BoardPickArmed = armed;
+            _popup.Invalidate();
+        }
+
+        private void OnStyleMutationRequested(Action<PredictorSettings> mutate)
+        {
+            if (mutate == null) return;
+            mutate(_settings);
+            _settings.ClampInPlace();
+            _planDirty = true;
+            _popup.Invalidate();
+            SaveCurrentStyleSettings();
+        }
+
+        private void OnStyleResetRequested()
+        {
+            _settings.ResetStyleToDefaults();
+            _settings.ClampInPlace();
+            _planDirty = true;
+            _popup.Invalidate();
+            SaveCurrentStyleSettings();
+        }
+
+        private void SaveCurrentStyleSettings()
+        {
+            if (Config == null) return;
             try
             {
-                if (Config != null)
-                {
-                    Config.Set("previewSteps", nextSteps);
-                    Config.Save();
-                }
+                _savingSelfConfig = true;
+                PredictorConfig.SaveStyle(Config, _settings);
             }
             catch { }
+            finally
+            {
+                _savingSelfConfig = false;
+            }
         }
 
         private void DrawAndTrack()
@@ -195,6 +303,7 @@ namespace MonsterPathPredictor.Runtime
                         if (layoutChanged)
                         {
                             _tracker.NotifyBoardTopologyChanged();
+                            _virtualSandbox.Reconcile(_players, _board, _tracker.LocalPlayerId);
                         }
                         _needsUnitSync = true;
                         _planDirty = true;
@@ -232,6 +341,7 @@ namespace MonsterPathPredictor.Runtime
                         InvalidateMatchCache();
                         return;
                     }
+                    _virtualSandbox.Reconcile(_players, _board, _tracker.LocalPlayerId);
                     _planDirty = true;
                 }
 
@@ -239,7 +349,28 @@ namespace MonsterPathPredictor.Runtime
                 if (layer == null) return;
 
                 long beforeSelection = _selectedMonsterId;
-                bool selectionChanged = _picker.ProcessInput(layer, camera, _monsters, _settings, _popup, ref _selectedMonsterId);
+                bool virtualPickArmed = _virtualSandbox.BoardPickArmed && _virtualSandbox.SelectedPlayerId != 0;
+                bool selectionChanged = _picker.ProcessInput(
+                    layer,
+                    camera,
+                    _board,
+                    _monsters,
+                    _settings,
+                    _popup,
+                    virtualPickArmed,
+                    ref _selectedMonsterId,
+                    out int pickedVirtualLandId,
+                    out bool clearVirtualRequested);
+
+                if (pickedVirtualLandId >= 0 && _virtualSandbox.SelectedPlayerId != 0)
+                {
+                    OnVirtualMoveRequested(_virtualSandbox.SelectedPlayerId, pickedVirtualLandId);
+                }
+                if (clearVirtualRequested && _virtualSandbox.HasOverrides)
+                {
+                    OnVirtualResetAllRequested();
+                }
+
                 if (selectionChanged)
                 {
                     _selectedMissingSince = DateTime.MinValue;
@@ -256,13 +387,18 @@ namespace MonsterPathPredictor.Runtime
 
                 if (_popup.IsOpen)
                 {
-                    _popup.Refresh(_monsters, _selectedMonsterId, _settings);
+                    _popup.Refresh(_monsters, _players, _board, _virtualSandbox, _tracker.LocalPlayerId, _selectedMonsterId, _settings);
                 }
+
+                var virtualGhosts = _virtualSandbox.BuildGhosts(_players, _board, _tracker.LocalPlayerId);
 
                 if (_selectedMonsterId == 0)
                 {
                     _cachedPlan = null;
-                    _renderer.HideAll();
+                    if (virtualGhosts.Count > 0)
+                        _renderer.Render(camera, _board, null, null, _settings, virtualGhosts);
+                    else
+                        _renderer.HideAll();
                     return;
                 }
 
@@ -272,15 +408,20 @@ namespace MonsterPathPredictor.Runtime
                     if (_tracker.IsMonsterConfirmedDead(_selectedMonsterId))
                     {
                         ClearSelectionAndOverlay();
+                        if (virtualGhosts.Count > 0)
+                            _renderer.Render(camera, _board, null, null, _settings, virtualGhosts);
                         return;
                     }
 
                     // Monster is still alive in the battle roster (only its CharacterInst/model is
-                    // momentarily unrendered/rebuilding): keep lock & memory intact, just hide overlay.
+                    // momentarily unrendered/rebuilding): keep lock & memory intact, hide path overlay only.
                     if (_tracker.IsMonsterInAliveRoster(_selectedMonsterId))
                     {
                         _selectedMissingSince = DateTime.MinValue;
-                        _renderer.HideAll();
+                        if (virtualGhosts.Count > 0)
+                            _renderer.Render(camera, _board, null, null, _settings, virtualGhosts);
+                        else
+                            _renderer.HideAll();
                         return;
                     }
 
@@ -292,10 +433,15 @@ namespace MonsterPathPredictor.Runtime
                     else if ((now - _selectedMissingSince).TotalMilliseconds >= 350.0)
                     {
                         ClearSelectionAndOverlay();
+                        if (virtualGhosts.Count > 0)
+                            _renderer.Render(camera, _board, null, null, _settings, virtualGhosts);
                         return;
                     }
 
-                    _renderer.HideAll();
+                    if (virtualGhosts.Count > 0)
+                        _renderer.Render(camera, _board, null, null, _settings, virtualGhosts);
+                    else
+                        _renderer.HideAll();
                     return;
                 }
                 _selectedMissingSince = DateTime.MinValue;
@@ -303,10 +449,13 @@ namespace MonsterPathPredictor.Runtime
                 if (_planDirty || _cachedPlan == null || _cachedPlan.MonsterId != _selectedMonsterId)
                 {
                     _planDirty = false;
+                    var effectivePlayers = _virtualSandbox.HasOverrides
+                        ? _virtualSandbox.ApplyOverrides(_players, _board)
+                        : _players;
                     _cachedPlan = MonsterPathEngine.Plan(
                         _board,
                         selected.State,
-                        _players,
+                        effectivePlayers,
                         new PlanOptions
                         {
                             MaxSteps = _settings.PreviewSteps,
@@ -321,7 +470,7 @@ namespace MonsterPathPredictor.Runtime
                     selected.VisualBounds = SpriteBoundsReader.Capture(selected.CharacterRef, selected.FeetWorldPos, camera);
                 }
 
-                _renderer.Render(camera, _board, selected, _cachedPlan, _settings);
+                _renderer.Render(camera, _board, selected, _cachedPlan, _settings, virtualGhosts);
             }
             catch (Exception ex)
             {
@@ -340,6 +489,15 @@ namespace MonsterPathPredictor.Runtime
             for (int i = 0; i < _monsters.Count; i++)
             {
                 if (_monsters[i].State.MonsterId == monsterId) return _monsters[i];
+            }
+            return null;
+        }
+
+        private TrackedPlayer FindPlayer(long playerId)
+        {
+            for (int i = 0; i < _players.Count; i++)
+            {
+                if (_players[i] != null && _players[i].PlayerId == playerId) return _players[i];
             }
             return null;
         }
@@ -421,6 +579,7 @@ namespace MonsterPathPredictor.Runtime
         private void InvalidateMatchCache()
         {
             ClearSelectionAndOverlay();
+            _virtualSandbox.ResetAll(disarmBoardPick: true);
             _picker.CancelPendingPointer();
             _board = null;
             _monsters.Clear();
@@ -429,11 +588,13 @@ namespace MonsterPathPredictor.Runtime
             _nextUnitSync = DateTime.MinValue;
             _needsUnitSync = true;
             _planDirty = true;
+            _popup.Invalidate();
         }
 
         private void ResetBattleState()
         {
             ClearSelectionAndOverlay();
+            _virtualSandbox.ResetAll(disarmBoardPick: true);
             _picker.CancelPendingPointer();
             _popup.Hide();
             _board = null;

@@ -17,26 +17,36 @@ namespace MonsterPathPredictor.Runtime
         private const float DragThresholdPx = 8f;
 
         private readonly PointerClickTracker _clickTracker = new PointerClickTracker(DragThresholdPx);
+        private readonly PointerClickTracker _rightClickTracker = new PointerClickTracker(DragThresholdPx);
+        private readonly List<ProjectedBoardTile> _tileProjBuf = new List<ProjectedBoardTile>(96);
         private int _lastProcessedFrame = -1;
 
         public void CancelPendingPointer()
         {
             _clickTracker.Reset();
+            _rightClickTracker.Reset();
         }
 
         public bool ProcessInput(
             GComponent layer,
             Camera camera,
+            BoardGraph board,
             IReadOnlyList<LiveMonsterInfo> monsters,
             PredictorSettings settings,
             MonsterPickerPopup popup,
-            ref long selectedMonsterId)
+            bool virtualBoardPickArmed,
+            ref long selectedMonsterId,
+            out int pickedVirtualLandId,
+            out bool clearVirtualRequested)
         {
+            pickedVirtualLandId = -1;
+            clearVirtualRequested = false;
+
             int frame = UnityTime.FrameCount;
             if (frame == _lastProcessedFrame) return false;
             _lastProcessedFrame = frame;
 
-            // 1. Toggle monster picker popup hotkey (default F8)
+            // 1. Toggle monster picker popup hotkey (default F10)
             if (IsHotkeyDown(settings.PickerHotkey))
             {
                 popup?.Toggle();
@@ -44,7 +54,8 @@ namespace MonsterPathPredictor.Runtime
             }
 
             // 2. Clear hotkey (default Escape): cancel any in-flight pointer gesture so releasing the mouse
-            //    cannot immediately re-select a monster, then close popup first if open, otherwise clear selection.
+            //    cannot immediately re-select a monster, then close popup first if open, otherwise clear selection,
+            //    otherwise clear active virtual overrides.
             if (IsHotkeyDown(settings.ClearHotkey))
             {
                 CancelPendingPointer();
@@ -58,7 +69,18 @@ namespace MonsterPathPredictor.Runtime
                     selectedMonsterId = 0;
                     return true;
                 }
+                clearVirtualRequested = true;
                 return false;
+            }
+
+            // 3. Optional right-click board tile placement when virtual-move board picking is armed
+            if (virtualBoardPickArmed && board != null && camera != null)
+            {
+                pickedVirtualLandId = ProcessRightClickTilePick(layer, camera, board, settings, popup);
+            }
+            else if (_rightClickTracker.IsTracking)
+            {
+                _rightClickTracker.Reset();
             }
 
             bool isDown = InputService.IsMouseButtonPressed(0);
@@ -122,6 +144,83 @@ namespace MonsterPathPredictor.Runtime
             }
 
             return false;
+        }
+
+        private int ProcessRightClickTilePick(
+            GComponent layer,
+            Camera camera,
+            BoardGraph board,
+            PredictorSettings settings,
+            MonsterPickerPopup popup)
+        {
+            bool isDown = InputService.IsMouseButtonPressed(1);
+            bool isHeld = InputService.IsMouseButtonHeld(1);
+            bool isUp = InputService.IsMouseButtonReleased(1);
+
+            if (!isDown && !isHeld && !isUp && !_rightClickTracker.IsTracking)
+                return -1;
+
+            bool hasPos = TryGetStageAndLayerMouse(layer, out Vector2 stagePos, out Vector2 localPos);
+
+            bool blockedOnDown = false;
+            if (isDown && hasPos)
+            {
+                if ((popup != null && popup.IsOpen && popup.ContainsStagePoint(stagePos)) ||
+                    IsPointerOverBlockingUi())
+                {
+                    blockedOnDown = true;
+                }
+            }
+
+            var outcome = _rightClickTracker.Update(
+                isDownThisFrame: isDown,
+                isHeld: isHeld,
+                isUpThisFrame: isUp,
+                hasPosition: hasPos,
+                position: hasPos ? new Point2(localPos.x, localPos.y) : default,
+                blockedByUiOnDown: blockedOnDown,
+                downHitMonsterId: 0);
+
+            if (!outcome.IsBoardClick || !hasPos) return -1;
+
+            return HitTestBoardTile(layer, camera, board, localPos, settings);
+        }
+
+        private int HitTestBoardTile(
+            GComponent layer,
+            Camera camera,
+            BoardGraph board,
+            Vector2 clickLocal,
+            PredictorSettings settings)
+        {
+            var camTr = UnityObject.GetTransform(camera);
+            var camPos = TransformService.GetPosition(camTr);
+            var camForward = TransformService.GetForward(camTr);
+            float nearClip = 0.01f;
+            try { if (camera.nearClipPlane > 0f) nearClip = Math.Max(0.01f, camera.nearClipPlane); } catch { }
+
+            _tileProjBuf.Clear();
+            foreach (var node in board.ActiveNodes())
+            {
+                if (node == null || node.Disabled) continue;
+                var w = new Vector3(node.X, node.Y + settings.HeightOffset * 0.5f, node.Z);
+                double depth = DashGeometry.ComputeCameraDepth(
+                    w.x, w.y, w.z,
+                    camPos.x, camPos.y, camPos.z,
+                    camForward.x, camForward.y, camForward.z);
+                if (depth < nearClip) continue;
+
+                Vector2 p = layer.WorldToLocal(w, camera);
+                if (float.IsNaN(p.x) || float.IsInfinity(p.x) || float.IsNaN(p.y) || float.IsInfinity(p.y))
+                    continue;
+                if (p.x < -80f || p.x > layer.width + 80f || p.y < -80f || p.y > layer.height + 80f)
+                    continue;
+
+                _tileProjBuf.Add(new ProjectedBoardTile(node.Id, new Point2(p.x, p.y), (float)depth));
+            }
+
+            float pickRadius = Math.Max(46f, settings.ClickRadius * 1.6f);
+            return BoardTileHitTester.PickTile(new Point2(clickLocal.x, clickLocal.y), _tileProjBuf, pickRadius);
         }
 
         private static bool IsMonsterPresent(IReadOnlyList<LiveMonsterInfo> monsters, long monsterId)

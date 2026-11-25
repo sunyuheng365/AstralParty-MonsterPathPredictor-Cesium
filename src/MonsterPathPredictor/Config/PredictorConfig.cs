@@ -16,14 +16,26 @@ namespace MonsterPathPredictor.Config
 
             if (isInitial)
             {
-                // One-time migration from v1 configs where clearOnEmptyClick defaulted to true,
-                // so upgrading users immediately get persistent click-to-track behavior while
-                // still allowing explicit manual opt-in afterwards.
-                bool isLegacyV1 = config.Has("enabled") && config.GetInt("configVersion", 1) < 2;
-                if (isLegacyV1)
+                bool hasExistingConfig = config.Has("enabled");
+                int prevVersion = config.GetInt("configVersion", 1);
+
+                // One-time migration from v1 configs where clearOnEmptyClick defaulted to true.
+                if (hasExistingConfig && prevVersion < 2)
                 {
                     config.Set("clearOnEmptyClick", false);
-                    config.Set("configVersion", 2);
+                }
+
+                // One-time migration from v1/v2 configs where pickerHotkey defaulted to F8 -> F10,
+                // while preserving any custom user-chosen hotkey (e.g. F7).
+                if (hasExistingConfig && prevVersion < 3)
+                {
+                    string existingHotkey = config.GetString("pickerHotkey", "F8");
+                    if (string.IsNullOrWhiteSpace(existingHotkey) ||
+                        string.Equals(existingHotkey.Trim(), "F8", System.StringComparison.OrdinalIgnoreCase))
+                    {
+                        config.Set("pickerHotkey", "F10");
+                    }
+                    config.Set("configVersion", 3);
                 }
                 ApplyDefaultsAndDocs(config);
             }
@@ -48,6 +60,12 @@ namespace MonsterPathPredictor.Config
             settings.ClosePickerOnSelect = config.GetBool("closePickerOnSelect", settings.ClosePickerOnSelect);
             settings.ClearHotkey = config.GetString("clearHotkey", settings.ClearHotkey);
             settings.ExcludedPlayerBuffIds = PredictorSettings.ParseIdCsv(config.GetString("excludedPlayerBuffIds", ""));
+            settings.DeterministicColorHex = config.GetString("deterministicColor", settings.DeterministicColorHex);
+            settings.MajorBranchColorHex = config.GetString("majorBranchColor", settings.MajorBranchColorHex);
+            settings.MinorBranchColorHex = config.GetString("minorBranchColor", settings.MinorBranchColorHex);
+            settings.PostCombatColorHex = config.GetString("postCombatColor", settings.PostCombatColorHex);
+            settings.GuideRedColorHex = config.GetString("guideRedColor", settings.GuideRedColorHex);
+            settings.GuideBlueColorHex = config.GetString("guideBlueColor", settings.GuideBlueColorHex);
 
             settings.ClampInPlace();
 
@@ -57,6 +75,30 @@ namespace MonsterPathPredictor.Config
             }
 
             return settings;
+        }
+
+        public static void SaveStyle(ModConfig config, PredictorSettings settings)
+        {
+            if (config == null || settings == null) return;
+            settings.ClampInPlace();
+            config.Set("previewSteps", settings.PreviewSteps);
+            config.Set("dashLength", settings.DashLength);
+            config.Set("gapLength", settings.GapLength);
+            config.Set("dashSpeed", settings.DashSpeed);
+            config.Set("lineWidth", settings.LineWidth);
+            config.Set("heightOffset", settings.HeightOffset);
+            config.Set("fontSize", settings.FontSize);
+            config.Set("showReasonTag", settings.ShowReasonTag);
+            config.Set("showStepNumbers", settings.ShowStepNumbers);
+            config.Set("showDeterministicPercent", settings.ShowDeterministicPercent);
+            config.Set("postCombatMode", PredictorSettings.FormatPostCombatMode(settings.PostCombatMode));
+            config.Set("deterministicColor", settings.DeterministicColorHex);
+            config.Set("majorBranchColor", settings.MajorBranchColorHex);
+            config.Set("minorBranchColor", settings.MinorBranchColorHex);
+            config.Set("postCombatColor", settings.PostCombatColorHex);
+            config.Set("guideRedColor", settings.GuideRedColorHex);
+            config.Set("guideBlueColor", settings.GuideBlueColorHex);
+            config.Save();
         }
 
         private static void ApplyDefaultsAndDocs(ModConfig cfg)
@@ -106,7 +148,7 @@ namespace MonsterPathPredictor.Config
                 "點擊怪物模型外緣時的容差半徑（像素，8-120；點在模型內部直接命中）",
                 "Near-miss tolerance radius outside monster sprite bounds in pixels (8-120)"));
 
-            cfg.SetDefault("configVersion", 2, ConfigDoc.Of(
+            cfg.SetDefault("configVersion", 3, ConfigDoc.Of(
                 "内部配置架构版本号（自动迁移用，请勿手动修改）",
                 "內部設定架構版本號（自動遷移用，請勿手動修改）",
                 "Internal config schema version for one-time migrations"));
@@ -146,10 +188,10 @@ namespace MonsterPathPredictor.Config
                 "允許點擊小偷等非普通主動攻擊怪（會在頂部提示非主動怪）",
                 "Allow selecting non-aggressive monsters (with an informational banner note)"));
 
-            cfg.SetDefault("pickerHotkey", "F8", ConfigDoc.Of(
-                "打开/关闭怪物快速选择弹窗的热键（Unity KeyCode 名称，默认 F8）",
-                "開啟/關閉怪物快速選擇彈窗的熱鍵（Unity KeyCode 名稱，預設 F8）",
-                "Hotkey to toggle the monster picker popup (Unity KeyCode name, default F8)"));
+            cfg.SetDefault("pickerHotkey", "F10", ConfigDoc.Of(
+                "打开/关闭怪物寻路面板的热键（Unity KeyCode 名称，默认 F10）",
+                "開啟/關閉怪物尋路面板的熱鍵（Unity KeyCode 名稱，預設 F10）",
+                "Hotkey to toggle the monster path predictor popup (Unity KeyCode name, default F10)"));
 
             cfg.SetDefault("closePickerOnSelect", false, ConfigDoc.Of(
                 "在选怪弹窗中点击某个怪物后是否自动关闭弹窗（默认 false，方便连续切换对比不同怪物）",
@@ -165,6 +207,36 @@ namespace MonsterPathPredictor.Config
                 "额外排除出怪物追踪名单的玩家 Buff ID（逗号分隔，例如隐身类特殊 Buff）",
                 "額外排除出怪物追蹤名單的玩家 Buff ID（逗號分隔，例如隱身類特殊 Buff）",
                 "Extra comma-separated player Buff IDs excluded from monster tracking"));
+
+            cfg.SetDefault("deterministicColor", StyleColor.DefaultDeterministicHex, ConfigDoc.Of(
+                "确定主路线颜色（#RRGGBB 或 #RRGGBBAA）",
+                "確定主路線顏色（#RRGGBB 或 #RRGGBBAA）",
+                "Deterministic route color (#RRGGBB or #RRGGBBAA)"));
+
+            cfg.SetDefault("majorBranchColor", StyleColor.DefaultMajorBranchHex, ConfigDoc.Of(
+                "高概率分支路线颜色（概率 ≥ 50%，#RRGGBB 或 #RRGGBBAA）",
+                "高機率分支路線顏色（機率 ≥ 50%，#RRGGBB 或 #RRGGBBAA）",
+                "Major branch color (probability >= 50%, #RRGGBB or #RRGGBBAA)"));
+
+            cfg.SetDefault("minorBranchColor", StyleColor.DefaultMinorBranchHex, ConfigDoc.Of(
+                "低概率分支路线颜色（概率 < 50%，#RRGGBB 或 #RRGGBBAA）",
+                "低機率分支路線顏色（機率 < 50%，#RRGGBB 或 #RRGGBBAA）",
+                "Minor branch color (probability < 50%, #RRGGBB or #RRGGBBAA)"));
+
+            cfg.SetDefault("postCombatColor", StyleColor.DefaultPostCombatHex, ConfigDoc.Of(
+                "交战后续行路线颜色（#RRGGBB 或 #RRGGBBAA）",
+                "交戰後續行路線顏色（#RRGGBB 或 #RRGGBBAA）",
+                "Post-combat continuation route color (#RRGGBB or #RRGGBBAA)"));
+
+            cfg.SetDefault("guideRedColor", StyleColor.DefaultGuideRedHex, ConfigDoc.Of(
+                "岔路红箭标记颜色（#RRGGBB 或 #RRGGBBAA）",
+                "岔路紅箭標記顏色（#RRGGBB 或 #RRGGBBAA）",
+                "Fork red-arrow highlight color (#RRGGBB or #RRGGBBAA)"));
+
+            cfg.SetDefault("guideBlueColor", StyleColor.DefaultGuideBlueHex, ConfigDoc.Of(
+                "岔路蓝箭标记颜色（#RRGGBB 或 #RRGGBBAA）",
+                "岔路藍箭標記顏色（#RRGGBB 或 #RRGGBBAA）",
+                "Fork blue-arrow highlight color (#RRGGBB or #RRGGBBAA)"));
         }
     }
 }

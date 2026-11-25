@@ -1,5 +1,5 @@
 {
-  "configVersion": 2,
+  "configVersion": 3,
   "enabled": true,
   "previewSteps": 12,
   "dashLength": 12.0,
@@ -16,10 +16,16 @@
   "simulateCombatOnFork": true,
   "postCombatMode": "continue",
   "allowNonAggressiveMonsters": true,
-  "pickerHotkey": "F8",
+  "pickerHotkey": "F10",
   "closePickerOnSelect": false,
   "clearHotkey": "Escape",
   "excludedPlayerBuffIds": "",
+  "deterministicColor": "#3DE6FFF5",
+  "majorBranchColor": "#FFD138F5",
+  "minorBranchColor": "#FF7A47E0",
+  "postCombatColor": "#94C7F28F",
+  "guideRedColor": "#FF5252FA",
+  "guideBlueColor": "#42ADFFFA",
   "_comments": {
     "enabled": {
       "zh-Hans": "是否启用怪物寻路预测模组",
@@ -86,8 +92,8 @@
       "en": "Allow selecting non-aggressive monsters (with an informational banner note)"
     },
     "pickerHotkey": {
-      "zh-Hans": "打开/关闭怪物快速选择弹窗的热键（Unity KeyCode 名称，默认 F8）",
-      "en": "Hotkey to toggle the monster picker popup (Unity KeyCode name, default F8)"
+      "zh-Hans": "打开/关闭怪物寻路面板的热键（Unity KeyCode 名称，默认 F10）",
+      "en": "Hotkey to toggle the monster path predictor popup (Unity KeyCode name, default F10)"
     },
     "closePickerOnSelect": {
       "zh-Hans": "在选怪弹窗中点击某个怪物后是否自动关闭弹窗（默认 false，方便连续切换对比不同怪物）",
@@ -100,6 +106,30 @@
     "excludedPlayerBuffIds": {
       "zh-Hans": "额外排除出怪物追踪名单的玩家 Buff ID（逗号分隔，例如隐身类特殊 Buff）",
       "en": "Extra comma-separated player Buff IDs excluded from monster tracking"
+    },
+    "deterministicColor": {
+      "zh-Hans": "确定主路线颜色（#RRGGBB 或 #RRGGBBAA）",
+      "en": "Deterministic route color (#RRGGBB or #RRGGBBAA)"
+    },
+    "majorBranchColor": {
+      "zh-Hans": "高概率分支路线颜色（概率 ≥ 50%，#RRGGBB 或 #RRGGBBAA）",
+      "en": "Major branch color (probability >= 50%, #RRGGBB or #RRGGBBAA)"
+    },
+    "minorBranchColor": {
+      "zh-Hans": "低概率分支路线颜色（概率 < 50%，#RRGGBB 或 #RRGGBBAA）",
+      "en": "Minor branch color (probability < 50%, #RRGGBB or #RRGGBBAA)"
+    },
+    "postCombatColor": {
+      "zh-Hans": "交战后续行路线颜色（#RRGGBB 或 #RRGGBBAA）",
+      "en": "Post-combat continuation route color (#RRGGBB or #RRGGBBAA)"
+    },
+    "guideRedColor": {
+      "zh-Hans": "岔路红箭标记颜色（#RRGGBB 或 #RRGGBBAA）",
+      "en": "Fork red-arrow highlight color (#RRGGBB or #RRGGBBAA)"
+    },
+    "guideBlueColor": {
+      "zh-Hans": "岔路蓝箭标记颜色（#RRGGBB 或 #RRGGBBAA）",
+      "en": "Fork blue-arrow highlight color (#RRGGBB or #RRGGBBAA)"
     }
   }
 }

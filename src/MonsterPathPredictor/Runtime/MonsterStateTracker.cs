@@ -30,6 +30,8 @@ namespace MonsterPathPredictor.Runtime
     {
         private sealed class MonsterMemory
         {
+            public int SpawnSequence;
+            public bool LastServerActionEnd;
             public int LastLandId = -1;
             public int LastFromLandId = -1;
             public bool JustSpawnedOnFork;
@@ -116,9 +118,12 @@ namespace MonsterPathPredictor.Runtime
 
         private readonly Dictionary<long, MonsterMemory> _memories = new Dictionary<long, MonsterMemory>();
         private readonly HashSet<long> _rosterAliveMonsterIds = new HashSet<long>();
+        private readonly HashSet<long> _actedMonsterIdsThisRound = new HashSet<long>();
         private readonly List<SkillCastRecord> _recentSkills = new List<SkillCastRecord>();
         private readonly Dictionary<long, List<SkillDisplacementRecord>> _pendingPlaceByMonster = new Dictionary<long, List<SkillDisplacementRecord>>();
 
+        private int _nextSpawnSequence = 1;
+        private long _localPlayerId;
         private long _activeActorId;
         private int _activeActorStartLandId = -1;
         private int _activeActorLastSeenLandId = -1;
@@ -173,16 +178,21 @@ namespace MonsterPathPredictor.Runtime
             }
         }
 
+        public long LocalPlayerId => _localPlayerId;
+
         public void Reset()
         {
             _memories.Clear();
             _rosterAliveMonsterIds.Clear();
+            _actedMonsterIdsThisRound.Clear();
             _recentSkills.Clear();
             _pendingPlaceByMonster.Clear();
             while (_skillQueue.TryDequeue(out _)) { }
             while (_placeQueue.TryDequeue(out _)) { }
             while (_combatQueue.TryDequeue(out _)) { }
             while (_thiefStealQueue.TryDequeue(out _)) { }
+            _nextSpawnSequence = 1;
+            _localPlayerId = 0;
             _activeActorId = 0;
             _activeActorStartLandId = -1;
             _activeActorLastSeenLandId = -1;
@@ -468,14 +478,34 @@ namespace MonsterPathPredictor.Runtime
             long curActorId = (currentActor != null && currentActor.player != null) ? currentActor.player.Id : 0;
             int curEpoch = Volatile.Read(ref _eventTurnEpoch);
             int curRound = TryReadCurrentRound();
+            bool roundChanged = curRound >= 0 && _lastObservedRound >= 0 && curRound != _lastObservedRound;
 
             bool boundaryAdvanced =
                 curActorId != _activeActorId ||
                 curEpoch != _lastObservedTurnEpoch ||
-                (curRound >= 0 && _lastObservedRound >= 0 && curRound != _lastObservedRound);
+                roundChanged;
 
             if (boundaryAdvanced)
             {
+                if (roundChanged)
+                {
+                    _actedMonsterIdsThisRound.Clear();
+                }
+                else
+                {
+                    if (curActorId != _activeActorId &&
+                        _activeActorId != 0 &&
+                        _rosterAliveMonsterIds.Contains(_activeActorId))
+                    {
+                        _actedMonsterIdsThisRound.Add(_activeActorId);
+                    }
+                    // Fallback round reset if Room.Round reflection is unavailable: hero phase starts a new round.
+                    if (curRound < 0 && _actedMonsterIdsThisRound.Count > 0 && TryIsUnitHero(curActorId))
+                    {
+                        _actedMonsterIdsThisRound.Clear();
+                    }
+                }
+
                 _turnSequence++;
                 _activeActorId = curActorId;
                 _lastObservedTurnEpoch = curEpoch;
@@ -601,6 +631,7 @@ namespace MonsterPathPredictor.Runtime
                     {
                         players.Add(tp);
                         if (tp.LandId >= 0) playerPositions[tp.PlayerId] = tp.LandId;
+                        try { if (Players.IsSelf(tp.PlayerId)) _localPlayerId = tp.PlayerId; } catch { }
                         int pHeroId = SafeHeroId(pd);
                         if (pHeroId > 0 && tp.IsAlive && !heroIdToPlayerId.ContainsKey(pHeroId))
                             heroIdToPlayerId[pHeroId] = tp.PlayerId;
@@ -635,6 +666,7 @@ namespace MonsterPathPredictor.Runtime
                 bool isNew = !_memories.TryGetValue(mid, out var mem);
                 bool movedSinceLastSnapshot = false;
                 int[] frontIds;
+                bool serverActionEnd = SafeActionEnd(pd);
                 if (isNew)
                 {
                     int serverNodeId = SafeRoomPlayerNodeId(pd);
@@ -642,6 +674,8 @@ namespace MonsterPathPredictor.Runtime
                         board, landId, serverNodeId, fromLandId, SafeRawProtocolFrontNodeIds(pd));
                     mem = new MonsterMemory
                     {
+                        SpawnSequence = _nextSpawnSequence++,
+                        LastServerActionEnd = serverActionEnd,
                         LastLandId = landId,
                         LastFromLandId = fromLandId,
                         ExplicitFrontNodeIds = initialExplicitFront,
@@ -649,6 +683,10 @@ namespace MonsterPathPredictor.Runtime
                         ExplicitFrontFromLandId = initialExplicitFront != null ? fromLandId : -1
                     };
                     _memories[mid] = mem;
+                    if (serverActionEnd && curActorId != mid)
+                    {
+                        _actedMonsterIdsThisRound.Add(mid);
+                    }
                     // On first observation, consume a pending Place ONLY if it already matches landId;
                     // never delete an ahead-of-visual Place whose CharacterInst.standLand has not updated yet.
                     TryConsumeExactPlaceDisplacement(board, mid, mem, fromLandId, landId, fromLandId, leftPreviousTile: false, playerPositions, allUnits);
@@ -724,6 +762,14 @@ namespace MonsterPathPredictor.Runtime
                     }
 
                     frontIds = ResolveMonsterFrontNodeIds(board, chForFacing, hasLiveChar, landId, fromLandId, mem);
+                    if (serverActionEnd != mem.LastServerActionEnd)
+                    {
+                        mem.LastServerActionEnd = serverActionEnd;
+                        if (serverActionEnd && curActorId != mid)
+                            _actedMonsterIdsThisRound.Add(mid);
+                        else if (!serverActionEnd)
+                            _actedMonsterIdsThisRound.Remove(mid);
+                    }
                 }
 
                 int heroId = SafeHeroId(pd);
@@ -820,6 +866,10 @@ namespace MonsterPathPredictor.Runtime
                 SafeHp(pd, out int hp, out int maxHp);
                 bool bossTargetClearedThisTurn = (curActorId == mid) && (mem.BossTargetClearedTurnSequence == _turnSequence);
 
+                bool isCurrentlyActing = (curActorId == mid);
+                if (isCurrentlyActing) _actedMonsterIdsThisRound.Remove(mid);
+                bool hasActedThisRound = !isCurrentlyActing && _actedMonsterIdsThisRound.Contains(mid);
+
                 var state = new MonsterState
                 {
                     MonsterId = mid,
@@ -831,6 +881,9 @@ namespace MonsterPathPredictor.Runtime
                     IsNormalAggressive = isNormalAggressive,
                     IsThief = isThief,
                     ActionWeight = actionWeight,
+                    SpawnSequence = mem.SpawnSequence,
+                    IsCurrentlyActing = isCurrentlyActing,
+                    HasActedThisRound = hasActedThisRound,
                     CurrentLandId = landId,
                     FromLandId = fromLandId,
                     FrontNodeIds = frontIds,
@@ -869,34 +922,16 @@ namespace MonsterPathPredictor.Runtime
                 });
             }
 
-            // Sort monsters by action order (ActionWeight ASC), then stable MonsterId ASC
-            monsters.Sort((a, b) =>
-            {
-                int w = a.State.ActionWeight.CompareTo(b.State.ActionWeight);
-                if (w != 0) return w;
-                return a.State.MonsterId.CompareTo(b.State.MonsterId);
-            });
+            // Sort monsters by exact server-verified action order (currently acting -> upcoming by
+            // ActionWeight ASC + SpawnSequence ASC -> already acted this round) with stable duplicate naming.
+            MonsterActionOrder.SortAndAssign(monsters, m => m.State);
 
-            // Disambiguate duplicate monster names ("迎宾燕 1", "迎宾燕 2") matching game convention
-            var nameCounts = new Dictionary<string, int>(StringComparer.Ordinal);
-            for (int i = 0; i < monsters.Count; i++)
+            // Sort players by seat slot ASC (P1-P4) so virtual-move UI is always cleanly ordered.
+            players.Sort((a, b) =>
             {
-                string n = monsters[i].State.Name;
-                nameCounts.TryGetValue(n, out int cnt);
-                nameCounts[n] = cnt + 1;
-            }
-            var seenIndex = new Dictionary<string, int>(StringComparer.Ordinal);
-            for (int i = 0; i < monsters.Count; i++)
-            {
-                string n = monsters[i].State.Name;
-                if (nameCounts[n] > 1)
-                {
-                    seenIndex.TryGetValue(n, out int idx);
-                    idx++;
-                    seenIndex[n] = idx;
-                    monsters[i].State.DisplayName = n + " " + idx;
-                }
-            }
+                int slotCmp = a.Slot.CompareTo(b.Slot);
+                return slotCmp != 0 ? slotCmp : a.PlayerId.CompareTo(b.PlayerId);
+            });
 
             _rosterAliveMonsterIds.Clear();
             foreach (long id in rosterAliveIds) _rosterAliveMonsterIds.Add(id);
@@ -918,6 +953,7 @@ namespace MonsterPathPredictor.Runtime
                 {
                     _memories.Remove(stale[i]);
                     _pendingPlaceByMonster.Remove(stale[i]);
+                    _actedMonsterIdsThisRound.Remove(stale[i]);
                 }
             }
             // Also prune any orphaned pending Place records for non-alive/hero units that never enter _memories.
@@ -950,6 +986,9 @@ namespace MonsterPathPredictor.Runtime
         {
             _memories.Clear();
             _rosterAliveMonsterIds.Clear();
+            _actedMonsterIdsThisRound.Clear();
+            _nextSpawnSequence = 1;
+            _localPlayerId = 0;
             _activeActorId = 0;
             _activeActorStartLandId = -1;
             _activeActorLastSeenLandId = -1;
@@ -2044,6 +2083,12 @@ namespace MonsterPathPredictor.Runtime
         {
             try { return pd.player != null && pd.player.Hero != null ? pd.player.Hero.ActionWeight : 0; }
             catch { return 0; }
+        }
+
+        private static bool SafeActionEnd(BattlePlayerData pd)
+        {
+            try { return pd.player != null && pd.player.Hero != null && pd.player.Hero.ActionEnd; }
+            catch { return false; }
         }
 
         private static string ResolveMonsterName(BattlePlayerData pd, int heroId)

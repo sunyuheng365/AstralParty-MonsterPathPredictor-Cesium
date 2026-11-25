@@ -1,0 +1,497 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+using FairyGUI;
+using UnityEngine;
+using MonsterPathPredictor.Core;
+
+namespace MonsterPathPredictor.Runtime
+{
+    internal sealed partial class MonsterPickerPopup
+    {
+        private void EnsureCreated()
+        {
+            if (_root != null && !_root.isDisposed && _root.parent == GRoot.inst) return;
+            Dispose();
+            if (GRoot.inst == null) return;
+
+            _root = new GComponent
+            {
+                name = "MonsterPathPredictor.PickerPopup",
+                touchable = true,
+                opaque = true,
+                draggable = true,
+                sortingOrder = 2200,
+                visible = IsOpen
+            };
+            GRoot.inst.AddChild(_root);
+
+            _panelBg = new GGraph { touchable = false };
+            _root.AddChild(_panelBg);
+
+            _headerBg = new GGraph { touchable = false };
+            _headerBg.SetSize(PanelWidth, HeaderHeight);
+            _headerBg.DrawRect(PanelWidth, HeaderHeight, 0, Color.clear, HeaderBg);
+            _root.AddChild(_headerBg);
+
+            _titleText = new GTextField
+            {
+                touchable = false,
+                autoSize = AutoSizeType.None,
+                singleLine = true,
+                textFormat = new TextFormat { size = 15, bold = true, color = AccentCyan }
+            };
+            _titleText.SetXY(10f, 7f);
+            _titleText.SetSize(PanelWidth - 52f, 20f);
+            _root.AddChild(_titleText);
+
+            _closeBtn = CreateMiniButton("×", 28f, 24f, () => Hide());
+            _closeBtn.SetXY(PanelWidth - 36f, 5f);
+            _root.AddChild(_closeBtn);
+
+            _tabHost = new GComponent { touchable = true };
+            _tabHost.SetSize(PanelWidth, TabBarHeight);
+            _tabMonstersBtn = CreateMiniButton("怪物列表", 96f, 24f, () => SwitchTab(PickerPopupTab.Monsters));
+            _tabVirtualBtn = CreateMiniButton("虚拟走位", 96f, 24f, () => SwitchTab(PickerPopupTab.VirtualMove));
+            _tabStyleBtn = CreateMiniButton("路线样式", 96f, 24f, () => SwitchTab(PickerPopupTab.RouteStyle));
+            _tabHost.AddChild(_tabMonstersBtn);
+            _tabHost.AddChild(_tabVirtualBtn);
+            _tabHost.AddChild(_tabStyleBtn);
+            _root.AddChild(_tabHost);
+
+            _contentHost = new GComponent { touchable = true };
+            _root.AddChild(_contentHost);
+
+            _pagerHost = new GComponent { touchable = true, visible = false };
+            _pagerHost.SetSize(PanelWidth, 28f);
+            _prevBtn = CreateMiniButton("◀", 28f, 22f, () => { _pageIndex = Math.Max(0, _pageIndex - 1); _lastSignature = string.Empty; });
+            _prevBtn.SetXY(Padding, 3f);
+            _pagerHost.AddChild(_prevBtn);
+            _pageLabel = new GTextField
+            {
+                touchable = false,
+                autoSize = AutoSizeType.None,
+                align = AlignType.Center,
+                textFormat = new TextFormat { size = 13, color = TextMuted }
+            };
+            _pageLabel.SetXY(44f, 5f);
+            _pageLabel.SetSize(PanelWidth - 88f, 18f);
+            _pagerHost.AddChild(_pageLabel);
+            _nextBtn = CreateMiniButton("▶", 28f, 22f, () => { _pageIndex++; _lastSignature = string.Empty; });
+            _nextBtn.SetXY(PanelWidth - Padding - 28f, 3f);
+            _pagerHost.AddChild(_nextBtn);
+            _root.AddChild(_pagerHost);
+
+            _emptyText = new GTextField
+            {
+                touchable = false,
+                autoSize = AutoSizeType.None,
+                singleLine = true,
+                textFormat = new TextFormat { size = 14, color = TextMuted },
+                text = "当前棋盘上没有存活怪物"
+            };
+            _root.AddChild(_emptyText);
+
+            _footerHost = new GComponent { touchable = true, opaque = true };
+            _footerHost.SetSize(PanelWidth, FooterHeight);
+            _footerBg = new GGraph { touchable = false };
+            _footerBg.SetSize(PanelWidth, FooterHeight);
+            _footerBg.DrawRect(PanelWidth, FooterHeight, 0, Color.clear, HeaderBg);
+            _footerHost.AddChild(_footerBg);
+
+            _minusBtn = CreateMiniButton("-", 26f, 24f, () => StepsDeltaRequested?.Invoke(-1));
+            _footerHost.AddChild(_minusBtn);
+
+            _stepsLabel = new GTextField
+            {
+                touchable = false,
+                autoSize = AutoSizeType.None,
+                align = AlignType.Center,
+                textFormat = new TextFormat { size = 14, bold = true, color = TextPrimary }
+            };
+            _footerHost.AddChild(_stepsLabel);
+
+            _plusBtn = CreateMiniButton("+", 26f, 24f, () => StepsDeltaRequested?.Invoke(1));
+            _footerHost.AddChild(_plusBtn);
+
+            _clearBtn = CreateMiniButton("清除预览", 76f, 24f, () => ClearRequested?.Invoke());
+            _footerHost.AddChild(_clearBtn);
+
+            _root.AddChild(_footerHost);
+        }
+
+        private static GComponent CreateMiniButton(string text, float w, float h, Action onClick, int fontSize = 13)
+        {
+            return CreateStyledButton(text, w, h, BtnBg, new Color(0.35f, 0.45f, 0.60f, 0.8f), TextPrimary, onClick, fontSize);
+        }
+
+        private static GComponent CreateStyledButton(
+            string text,
+            float w,
+            float h,
+            Color fill,
+            Color border,
+            Color textColor,
+            Action onClick,
+            int fontSize = 13)
+        {
+            var btn = new GComponent { touchable = true, opaque = true };
+            btn.SetSize(w, h);
+
+            var bg = new GGraph { touchable = false };
+            bg.SetSize(w, h);
+            bg.DrawRect(w, h, 1, border, fill);
+            btn.AddChild(bg);
+
+            var tf = new GTextField
+            {
+                touchable = false,
+                autoSize = AutoSizeType.None,
+                singleLine = true,
+                align = AlignType.Center,
+                verticalAlign = VertAlignType.Middle,
+                textFormat = new TextFormat { size = fontSize, bold = true, color = textColor },
+                text = text ?? string.Empty
+            };
+            tf.SetSize(w, h);
+            btn.AddChild(tf);
+
+            btn.onRollOver.Add(() => bg.DrawRect(btn.width, btn.height, 1, PanelBorder, BtnHoverBg));
+            btn.onRollOut.Add(() => bg.DrawRect(btn.width, btn.height, 1, border, fill));
+            btn.onClick.Add(() => onClick?.Invoke());
+            return btn;
+        }
+
+        private static void ResizeMiniButton(GComponent btn, float w, float h)
+        {
+            if (btn == null || btn.isDisposed) return;
+            btn.SetSize(w, h);
+            if (btn.numChildren >= 1 && btn.GetChildAt(0) is GGraph bg)
+            {
+                bg.SetSize(w, h);
+                bg.DrawRect(w, h, 1, new Color(0.35f, 0.45f, 0.60f, 0.8f), BtnBg);
+            }
+            if (btn.numChildren >= 2 && btn.GetChildAt(1) is GTextField tf)
+            {
+                tf.SetSize(w, h);
+            }
+        }
+
+        private static void StyleTabButton(GComponent btn, string label, float w, float h, bool active, bool accentViolet)
+        {
+            if (btn == null || btn.isDisposed) return;
+            btn.SetSize(w, h);
+            Color fill = active ? (accentViolet ? BtnVioletBg : BtnActiveBg) : BtnBg;
+            Color border = active ? (accentViolet ? BtnVioletBorder : AccentCyan) : (accentViolet ? BtnVioletBorder : new Color(0.35f, 0.45f, 0.60f, 0.8f));
+            Color txtCol = active ? AccentGold : (accentViolet ? AccentViolet : TextPrimary);
+
+            if (btn.numChildren >= 1 && btn.GetChildAt(0) is GGraph bg)
+            {
+                bg.SetSize(w, h);
+                bg.DrawRect(w, h, active ? 2 : 1, border, fill);
+                btn.onRollOver.Clear();
+                btn.onRollOut.Clear();
+                btn.onRollOver.Add(() => bg.DrawRect(btn.width, btn.height, active ? 2 : 1, PanelBorder, BtnHoverBg));
+                btn.onRollOut.Add(() => bg.DrawRect(btn.width, btn.height, active ? 2 : 1, border, fill));
+            }
+            if (btn.numChildren >= 2 && btn.GetChildAt(1) is GTextField tf)
+            {
+                tf.SetSize(w, h);
+                var fmt = tf.textFormat;
+                fmt.size = w < 64f ? 11 : 12;
+                fmt.color = txtCol;
+                tf.textFormat = fmt;
+                tf.text = label;
+            }
+        }
+
+        private void ClampToStage()
+        {
+            if (_root == null || GRoot.inst == null) return;
+            float maxX = Math.Max(0f, GRoot.inst.width - _root.width);
+            float maxY = Math.Max(0f, GRoot.inst.height - _root.height);
+            float x = Math.Max(0f, Math.Min(maxX, _root.x));
+            float y = Math.Max(0f, Math.Min(maxY, _root.y));
+            _root.SetXY(x, y);
+        }
+
+        private readonly struct CompactLayout
+        {
+            public readonly float HeaderH;
+            public readonly float TabH;
+            public readonly float FooterH;
+            public readonly float PagerH;
+            public readonly float Pad;
+            public readonly float RowH;
+            public readonly float RowGap;
+            public readonly float MaxContentHeight;
+
+            public CompactLayout(float headerH, float tabH, float footerH, float pagerH, float pad, float rowH, float rowGap, float maxContentHeight)
+            {
+                HeaderH = headerH;
+                TabH = tabH;
+                FooterH = footerH;
+                PagerH = pagerH;
+                Pad = pad;
+                RowH = rowH;
+                RowGap = rowGap;
+                MaxContentHeight = maxContentHeight;
+            }
+        }
+
+        private static CompactLayout ComputeCompactLayout(float stageHeight, bool showPager)
+        {
+            const float NormalPagerH = 28f;
+            float normalPager = showPager ? NormalPagerH : 0f;
+            float normalChrome = HeaderHeight + TabBarHeight + Padding * 2f + normalPager + FooterHeight;
+            if (stageHeight >= normalChrome + RowHeight + 8f)
+            {
+                float maxContent = Math.Max(RowHeight + 8f, stageHeight - normalChrome);
+                return new CompactLayout(HeaderHeight, TabBarHeight, FooterHeight, normalPager, Padding, RowHeight, 4f, maxContent);
+            }
+
+            float headerH = 22f;
+            float tabH = 20f;
+            float footerH = 24f;
+            float pagerH = showPager ? 20f : 0f;
+            float pad = 2f;
+            float rowGap = 2f;
+            float avail = stageHeight - (headerH + tabH + footerH + pagerH + pad * 2f);
+            if (avail >= 22f)
+            {
+                float rowH = Math.Min(28f, Math.Max(18f, avail - rowGap));
+                return new CompactLayout(headerH, tabH, footerH, pagerH, pad, rowH, rowGap, avail);
+            }
+
+            pad = 1f;
+            rowGap = 1f;
+            float desiredRowH = Math.Min(20f, Math.Max(12f, stageHeight * 0.25f));
+            float listBudget = desiredRowH + rowGap;
+            float chromeBudget = Math.Max(0f, stageHeight - listBudget - pad * 2f);
+            float baseChrome = 15f + 15f + 18f + (showPager ? 14f : 0f);
+            float chromeScale = baseChrome > 0f ? Math.Min(1f, chromeBudget / baseChrome) : 1f;
+            headerH = 15f * chromeScale;
+            tabH = 15f * chromeScale;
+            footerH = 18f * chromeScale;
+            pagerH = showPager ? 14f * chromeScale : 0f;
+            float maxContentH = Math.Max(0f, stageHeight - headerH - tabH - footerH - pagerH - pad * 2f);
+            float finalRowH = Math.Min(22f, Math.Max(10f, maxContentH - rowGap));
+            return new CompactLayout(headerH, tabH, footerH, pagerH, pad, finalRowH, rowGap, maxContentH);
+        }
+
+        private void ApplyChromeLayout(CompactLayout layout, float panelW, float padX, int virtualOverrideCount)
+        {
+            _headerBg.SetSize(panelW, layout.HeaderH);
+            _headerBg.DrawRect(panelW, layout.HeaderH, 0, Color.clear, HeaderBg);
+            float closeW = panelW < 200f ? 22f : 28f;
+            float closeH = Math.Min(24f, Math.Max(14f, layout.HeaderH - 4f));
+            float closeX = Math.Max(padX, panelW - padX - closeW);
+            ResizeMiniButton(_closeBtn, closeW, closeH);
+            _closeBtn.SetXY(closeX, Math.Max(1f, (layout.HeaderH - closeH) * 0.5f));
+            _titleText.SetXY(padX, Math.Max(1f, (layout.HeaderH - 20f) * 0.5f));
+            _titleText.SetSize(Math.Max(40f, closeX - padX - 4f), Math.Min(20f, layout.HeaderH - 2f));
+
+            // 3-tab bar directly under header
+            _tabHost.SetXY(0f, layout.HeaderH);
+            _tabHost.SetSize(panelW, layout.TabH);
+            float tabGap = panelW < 220f ? 3f : 4f;
+            float tabW = Math.Max(36f, (panelW - padX * 2f - tabGap * 2f) / 3f);
+            float tabBtnH = Math.Min(24f, Math.Max(13f, layout.TabH - 4f));
+            float tabBtnY = Math.Max(1f, (layout.TabH - tabBtnH) * 0.5f);
+
+            string virtualLabel = virtualOverrideCount > 0 ? ("虚拟(" + virtualOverrideCount + ")") : "虚拟走位";
+            StyleTabButton(_tabMonstersBtn, panelW < 210f ? "怪物" : "怪物列表", tabW, tabBtnH, _activeTab == PickerPopupTab.Monsters, accentViolet: false);
+            StyleTabButton(_tabVirtualBtn, panelW < 210f ? (virtualOverrideCount > 0 ? "虚(" + virtualOverrideCount + ")" : "虚拟") : virtualLabel, tabW, tabBtnH, _activeTab == PickerPopupTab.VirtualMove, accentViolet: virtualOverrideCount > 0);
+            StyleTabButton(_tabStyleBtn, panelW < 210f ? "样式" : "路线样式", tabW, tabBtnH, _activeTab == PickerPopupTab.RouteStyle, accentViolet: false);
+
+            _tabMonstersBtn.SetXY(padX, tabBtnY);
+            _tabVirtualBtn.SetXY(padX + tabW + tabGap, tabBtnY);
+            _tabStyleBtn.SetXY(padX + (tabW + tabGap) * 2f, tabBtnY);
+
+            if (layout.PagerH > 0f)
+            {
+                _pagerHost.SetSize(panelW, layout.PagerH);
+                float pBtnW = panelW < 200f ? 24f : 28f;
+                float pBtnH = Math.Min(22f, Math.Max(13f, layout.PagerH - 4f));
+                float pBtnY = Math.Max(1f, (layout.PagerH - pBtnH) * 0.5f);
+                ResizeMiniButton(_prevBtn, pBtnW, pBtnH);
+                _prevBtn.SetXY(padX, pBtnY);
+                float nextX = Math.Max(padX + pBtnW + 4f, panelW - padX - pBtnW);
+                ResizeMiniButton(_nextBtn, pBtnW, pBtnH);
+                _nextBtn.SetXY(nextX, pBtnY);
+                float labelX = padX + pBtnW + 4f;
+                _pageLabel.SetXY(labelX, Math.Max(1f, (layout.PagerH - 18f) * 0.5f));
+                _pageLabel.SetSize(Math.Max(24f, nextX - labelX - 4f), Math.Min(18f, layout.PagerH - 2f));
+            }
+
+            _footerHost.SetSize(panelW, layout.FooterH);
+            _footerBg.SetSize(panelW, layout.FooterH);
+            _footerBg.DrawRect(panelW, layout.FooterH, 0, Color.clear, HeaderBg);
+            float fBtnH = Math.Min(24f, Math.Max(14f, layout.FooterH - 4f));
+            float fBtnY = Math.Max(1f, (layout.FooterH - fBtnH) * 0.5f);
+            float gap = panelW < 220f ? 3f : 4f;
+            float stepBtnW = panelW < 200f ? 20f : 26f;
+            float clearW = panelW < 200f ? 52f : (panelW < 260f ? 68f : 76f);
+            float clearX = Math.Max(padX, panelW - padX - clearW);
+            float minusX = padX;
+            float stepsX = minusX + stepBtnW + gap;
+            float maxStepsW = Math.Max(28f, clearX - gap - stepBtnW - gap - stepsX);
+            float stepsW = Math.Min(88f, maxStepsW);
+            float plusX = stepsX + stepsW + gap;
+
+            ResizeMiniButton(_minusBtn, stepBtnW, fBtnH);
+            _minusBtn.SetXY(minusX, fBtnY);
+            _stepsLabel.SetXY(stepsX, Math.Max(1f, (layout.FooterH - 20f) * 0.5f));
+            _stepsLabel.SetSize(stepsW, Math.Min(22f, layout.FooterH - 2f));
+            ResizeMiniButton(_plusBtn, stepBtnW, fBtnH);
+            _plusBtn.SetXY(plusX, fBtnY);
+            ResizeMiniButton(_clearBtn, clearW, fBtnH);
+            _clearBtn.SetXY(clearX, fBtnY);
+        }
+
+        private static int ComputeRowsPerPage(float stageHeight)
+        {
+            const float PagerReserve = 28f;
+            const float MarginReserve = 28f;
+            float chrome = HeaderHeight + TabBarHeight + Padding + PagerReserve + Padding + FooterHeight + MarginReserve;
+            float availList = stageHeight - chrome;
+            if (availList <= RowHeight + 4f) return 1;
+            int rows = (int)((availList - 4f) / (RowHeight + 4f));
+            return Math.Max(1, Math.Min(MaxVisibleRows, rows));
+        }
+
+        private string BuildSignature(
+            IReadOnlyList<LiveMonsterInfo> visibleMonsters,
+            IReadOnlyList<TrackedPlayer> players,
+            BoardGraph board,
+            VirtualPlayerSandbox sandbox,
+            long localPlayerId,
+            long selectedId,
+            PredictorSettings settings,
+            int pageIndex,
+            int totalPages,
+            int rowsPerPage,
+            float stageWidth,
+            float stageHeight)
+        {
+            var sb = new StringBuilder(256);
+            sb.Append((int)_activeTab).Append('|')
+              .Append((int)_selectedColorRole).Append('|')
+              .Append(selectedId).Append('|')
+              .Append(settings.PreviewSteps).Append('|')
+              .Append(settings.PickerHotkey).Append('|')
+              .Append(settings.AllowNonAggressiveMonsters ? '1' : '0')
+              .Append(settings.ClosePickerOnSelect ? '1' : '0').Append('|')
+              .Append(pageIndex).Append('/').Append(totalPages).Append(':').Append(rowsPerPage)
+              .Append('@').Append((int)Math.Round(stageWidth)).Append('x').Append((int)Math.Round(stageHeight)).Append('|');
+
+            if (sandbox != null)
+            {
+                sb.Append("VS:").Append(sandbox.SelectedPlayerId).Append(':')
+                  .Append(sandbox.BoardPickArmed ? '1' : '0').Append(':')
+                  .Append(sandbox.OverrideCount).Append(':')
+                  .Append(sandbox.CanUndo(sandbox.SelectedPlayerId) ? '1' : '0').Append('|');
+            }
+
+            if (_activeTab == PickerPopupTab.Monsters && visibleMonsters != null)
+            {
+                for (int i = 0; i < visibleMonsters.Count; i++)
+                {
+                    var st = visibleMonsters[i].State;
+                    sb.Append(st.MonsterId).Append(':')
+                      .Append(st.ActionOrderRank).Append(':')
+                      .Append(st.IsCurrentlyActing ? 'C' : (st.HasActedThisRound ? 'D' : 'W')).Append(':')
+                      .Append(st.DisplayName).Append(':')
+                      .Append(st.CurrentLandId).Append(':')
+                      .Append(st.Hp).Append('/').Append(st.MaxHp).Append(':')
+                      .Append(st.ActionWeight).Append(':')
+                      .Append(st.IsNormalAggressive ? 'A' : 'N').Append(';');
+                }
+            }
+            else if (_activeTab == PickerPopupTab.VirtualMove && players != null)
+            {
+                sb.Append("L:").Append(localPlayerId).Append('|');
+                for (int i = 0; i < players.Count; i++)
+                {
+                    var p = players[i];
+                    if (p == null) continue;
+                    int eff = sandbox != null ? sandbox.GetEffectiveLandId(p) : p.LandId;
+                    sb.Append(p.PlayerId).Append(':')
+                      .Append(p.Slot).Append(':')
+                      .Append(p.Name).Append(':')
+                      .Append(p.IsAlive ? '1' : '0').Append(':')
+                      .Append(p.LandId).Append('>').Append(eff).Append(';');
+                }
+                if (sandbox != null && board != null && sandbox.SelectedPlayerId != 0)
+                {
+                    int curTile = -1;
+                    for (int i = 0; i < players.Count; i++)
+                    {
+                        if (players[i] != null && players[i].PlayerId == sandbox.SelectedPlayerId)
+                        {
+                            curTile = sandbox.GetEffectiveLandId(players[i]);
+                            break;
+                        }
+                    }
+                    var nbs = VirtualPlayerSandbox.GetReachableNeighbors(board, curTile);
+                    sb.Append("NB:");
+                    for (int i = 0; i < nbs.Count; i++) sb.Append(nbs[i]).Append(',');
+                }
+            }
+            else if (_activeTab == PickerPopupTab.RouteStyle)
+            {
+                sb.Append("ST:")
+                  .Append((int)Math.Round(settings.LineWidth * 10f)).Append(':')
+                  .Append((int)Math.Round(settings.DashSpeed)).Append(':')
+                  .Append((int)Math.Round(settings.DashLength)).Append(':')
+                  .Append((int)Math.Round(settings.GapLength)).Append(':')
+                  .Append(settings.FontSize).Append(':')
+                  .Append((int)settings.PostCombatMode).Append(':')
+                  .Append(settings.ShowStepNumbers ? '1' : '0')
+                  .Append(settings.ShowReasonTag ? '1' : '0')
+                  .Append(settings.ShowDeterministicPercent ? '1' : '0').Append(':')
+                  .Append(settings.DeterministicColorHex).Append(':')
+                  .Append(settings.MajorBranchColorHex).Append(':')
+                  .Append(settings.MinorBranchColorHex).Append(':')
+                  .Append(settings.PostCombatColorHex).Append(':')
+                  .Append(settings.GuideRedColorHex).Append(':')
+                  .Append(settings.GuideBlueColorHex);
+            }
+
+            return sb.ToString();
+        }
+
+        public void Dispose()
+        {
+            _lastSignature = string.Empty;
+            _positioned = false;
+            _temporarilyHidden = false;
+            _pageIndex = 0;
+            if (_root != null)
+            {
+                try { _root.Dispose(); } catch { }
+                _root = null;
+            }
+            _panelBg = null;
+            _headerBg = null;
+            _titleText = null;
+            _closeBtn = null;
+            _tabHost = null;
+            _tabMonstersBtn = null;
+            _tabVirtualBtn = null;
+            _tabStyleBtn = null;
+            _contentHost = null;
+            _pagerHost = null;
+            _prevBtn = null;
+            _nextBtn = null;
+            _pageLabel = null;
+            _footerHost = null;
+            _footerBg = null;
+            _minusBtn = null;
+            _plusBtn = null;
+            _clearBtn = null;
+            _stepsLabel = null;
+            _emptyText = null;
+        }
+    }
+}

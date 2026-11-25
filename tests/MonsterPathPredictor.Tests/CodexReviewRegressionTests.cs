@@ -1023,5 +1023,109 @@ namespace MonsterPathPredictor.Tests
             Assert.Equal(100f, cb.X, 2);
             Assert.Equal(100f, cb.Y, 2);
         }
+
+        [Fact]
+        public void Round8CoreRegressions_ExactUniformSplit_LinglingDirectedFork_NearAxisClip_OneSidedHugeClip_PerTermPhase_Over999Percent()
+        {
+            // Round 8 (#15): Directed 0->1, 1->[2,3], stationary Lingling-pushed monster at 1 with
+            // SkillMovePushFromLandId=0, Front=[] MUST treat 1 as a directed fork and deterministically pick Red(2)!
+            var dir2Board = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(0, new[] { 1 }),
+                new LandNodeSnapshot(1, new[] { 2, 3 }),
+                new LandNodeSnapshot(2, Array.Empty<int>()),
+                new LandNodeSnapshot(3, Array.Empty<int>())
+            });
+            var lingMonster = new MonsterState
+            {
+                MonsterId = 980,
+                CurrentLandId = 1,
+                FromLandId = 0,
+                FrontNodeIds = Array.Empty<int>(),
+                SkillMoveKind = SkillMoveKind.LinglingPush,
+                SkillMovePushFromLandId = 0
+            };
+            Assert.True(MonsterPathEngine.IsForkForFirstStep(dir2Board, lingMonster));
+            var lingPlan = MonsterPathEngine.Plan(dir2Board, lingMonster, new List<TrackedPlayer>(), new PlanOptions { MaxSteps = 1 });
+            var lingFork = lingPlan.Forks.Single(f => f.ForkLandId == 1);
+            Assert.Single(lingFork.Exits);
+            Assert.Equal(2, lingFork.Exits[0].NextLandId);
+            Assert.False(lingFork.IsExactUniformSplit);
+
+            // Round 8 (#2): Exact 50/50 split sets PredictedFork.IsExactUniformSplit == true
+            var eqBoard = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(0, new[] { 1 }),
+                new LandNodeSnapshot(1, new[] { 2, 3, 0 }),
+                new LandNodeSnapshot(2, new[] { 4, 1 }),
+                new LandNodeSnapshot(3, new[] { 4, 1 }),
+                new LandNodeSnapshot(4, new[] { 2, 3 })
+            });
+            var eqPlan = MonsterPathEngine.Plan(
+                eqBoard,
+                new MonsterState { MonsterId = 981, CurrentLandId = 1, FromLandId = 0, IsCurrentlyMovingMidTurn = true },
+                new List<TrackedPlayer> { new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = 4, IsAlive = true, IsTargetable = true } },
+                new PlanOptions { MaxSteps = 1 });
+            var eqFork = eqPlan.Forks.Single(f => f.ForkLandId == 1);
+            Assert.True(eqFork.IsExactUniformSplit);
+            Assert.Equal(0.5, eqFork.Exits[0].ConditionalProbability);
+            Assert.Equal(0.5, eqFork.Exits[1].ConditionalProbability);
+
+            // Round 8 (#17): Near-vertical (0,0)->(1e-27f,100) and near-horizontal (0,0)->(100,1e-27f) MUST NOT throw OverflowException!
+            Assert.True(DashGeometry.TryClipSegmentToRect(new Point2(0f, 0f), new Point2(1e-27f, 100f), 0f, 0f, 100f, 100f, out var va, out var vb, out double _));
+            Assert.Equal(0f, va.X);
+            Assert.Equal(0f, va.Y);
+            Assert.Equal(100f, vb.Y, 3);
+            Assert.True(DashGeometry.TryClipSegmentToRect(new Point2(0f, 0f), new Point2(100f, 1e-27f), 0f, 0f, 100f, 100f, out var ha, out var hb, out double _));
+            Assert.Equal(0f, ha.X);
+            Assert.Equal(100f, hb.X, 3);
+
+            // Round 8 (#20): Huge one-sided H=2^100: (0,0)->(H,H) and (H,H)->(0,0) clipped to [0,800]x[0,100] -> exact (0,0)<->(100,100)!
+            float h100 = (float)Math.Pow(2.0, 100);
+            Assert.True(DashGeometry.TryClipSegmentToRect(new Point2(0f, 0f), new Point2(h100, h100), 0f, 0f, 800f, 100f, out var oa, out var ob, out double _));
+            Assert.Equal(0f, oa.X, 2);
+            Assert.Equal(0f, oa.Y, 2);
+            Assert.Equal(100f, ob.X, 2);
+            Assert.Equal(100f, ob.Y, 2);
+            Assert.True(DashGeometry.TryClipSegmentToRect(new Point2(h100, h100), new Point2(0f, 0f), 0f, 0f, 800f, 100f, out var ra, out var rb, out double _));
+            Assert.Equal(100f, ra.X, 2);
+            Assert.Equal(100f, ra.Y, 2);
+            Assert.Equal(0f, rb.X, 2);
+            Assert.Equal(0f, rb.Y, 2);
+
+            // Round 8 (#21): Per-term modulo in ComputeClippedDashPhase(0, 10, 2^60, 0, 20) == 14f (NOT 4f)
+            Assert.Equal(14f, DashGeometry.ComputeClippedDashPhase(0.0, 10.0, Math.Pow(2.0, 60), 0.0, 20.0), 3);
+
+            // Round 8 (#22): 54-diamond chain vs single chain -> dominant branch rounds to 1.0 in double,
+            // MUST format as ">99.9%" (NOT "100%") alongside sibling "<0.1%"!
+            const int D = 54;
+            var adj54 = new Dictionary<int, List<int>> { [0] = new List<int> { 1 }, [1] = new List<int> { 2, 3, 0 } };
+            void AddE(int u, int v) { if (!adj54.TryGetValue(u, out var l)) adj54[u] = l = new List<int>(); if (!l.Contains(v)) l.Add(v); }
+            int curA = 2;
+            int nextId = 10;
+            for (int d = 0; d < D; d++)
+            {
+                int l1 = nextId++, l2 = nextId++, join = nextId++;
+                AddE(curA, l1); AddE(curA, l2); AddE(l1, join); AddE(l2, join);
+                curA = join;
+            }
+            int curB = 3;
+            for (int step = 0; step < 2 * D - 1; step++) { int nb = nextId++; AddE(curB, nb); curB = nb; }
+            AddE(curB, curA);
+            AddE(curA, curA);
+            var d54Board = new BoardGraph(adj54.Select(kv => new LandNodeSnapshot(kv.Key, kv.Value.ToArray())).ToArray());
+            var d54Plan = MonsterPathEngine.Plan(
+                d54Board,
+                new MonsterState { MonsterId = 982, CurrentLandId = 1, FromLandId = 0, IsCurrentlyMovingMidTurn = true },
+                new List<TrackedPlayer> { new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = curA, IsAlive = true, IsTargetable = true } },
+                new PlanOptions { MaxSteps = 1 });
+            var d54Fork = d54Plan.Forks.Single(f => f.ForkLandId == 1);
+            var domExit = d54Fork.Exits.Single(e => e.NextLandId == 2);
+            var tinyExit = d54Fork.Exits.Single(e => e.NextLandId == 3);
+            Assert.True(domExit.HasOtherPositiveExits);
+            Assert.Equal(">99.9%", domExit.FormatConditionalPercent());
+            Assert.Equal("<0.1%", tinyExit.FormatConditionalPercent());
+            Assert.False(d54Fork.IsExactUniformSplit);
+        }
     }
 }

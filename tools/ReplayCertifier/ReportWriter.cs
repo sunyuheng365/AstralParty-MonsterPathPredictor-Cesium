@@ -202,10 +202,18 @@ namespace MonsterPathPredictor.ReplayCertifier
             _ => "FAIL"
         };
 
+        private static string TrimTrailingSepPreservingRoot(string full)
+        {
+            if (string.IsNullOrEmpty(full)) return full;
+            string root = Path.GetPathRoot(full) ?? string.Empty;
+            if (full.Length <= root.Length) return full;
+            return full.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        }
+
         public static string ResolveCanonicalPath(string path)
         {
             if (string.IsNullOrWhiteSpace(path)) return null;
-            string full = Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            string full = TrimTrailingSepPreservingRoot(Path.GetFullPath(path));
             if (string.IsNullOrEmpty(full)) return Path.GetFullPath(path);
 
             try
@@ -234,7 +242,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                         if (target != null) cur = Path.GetFullPath(target.FullName);
                     }
                 }
-                return Path.GetFullPath(cur).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                return TrimTrailingSepPreservingRoot(Path.GetFullPath(cur));
             }
             catch
             {
@@ -260,6 +268,16 @@ namespace MonsterPathPredictor.ReplayCertifier
             }
         }
 
+        public static bool IsNormalizedPathInsideDirectory(string normFile, string normDir, char directorySeparator, StringComparison comparison)
+        {
+            if (string.IsNullOrEmpty(normFile) || string.IsNullOrEmpty(normDir)) return false;
+            if (string.Equals(normFile, normDir, comparison)) return true;
+            string prefix = (normDir.EndsWith(directorySeparator) || normDir.EndsWith('/'))
+                ? normDir
+                : normDir + directorySeparator;
+            return normFile.StartsWith(prefix, comparison);
+        }
+
         public static bool IsPathInsideDirectory(string filePath, string dirPath)
         {
             if (string.IsNullOrWhiteSpace(filePath) || string.IsNullOrWhiteSpace(dirPath)) return false;
@@ -270,9 +288,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                 var cmp = (OperatingSystem.IsWindows() || OperatingSystem.IsMacOS())
                     ? StringComparison.OrdinalIgnoreCase
                     : StringComparison.Ordinal;
-                if (string.Equals(normFile, normDir, cmp)) return true;
-                string prefix = normDir + Path.DirectorySeparatorChar;
-                return normFile.StartsWith(prefix, cmp);
+                return IsNormalizedPathInsideDirectory(normFile, normDir, Path.DirectorySeparatorChar, cmp);
             }
             catch
             {

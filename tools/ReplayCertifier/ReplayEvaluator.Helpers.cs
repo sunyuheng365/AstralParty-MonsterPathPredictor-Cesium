@@ -59,6 +59,7 @@ namespace MonsterPathPredictor.ReplayCertifier
             if (isTruncated || frames.Count == 0) return false;
 
             var state = StreamLifecycleState.Unstarted;
+            int expectedMapId = 0;
             for (int i = 0; i < frames.Count; i++)
             {
                 var (cmd, payload) = frames[i];
@@ -76,6 +77,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                     {
                         dynamic running = decoder.TryDecode("party.protocol.RunningGameS2C", payload);
                         if (running?.Room == null) return false;
+                        expectedMapId = (int)running.Room.MapId;
                     }
                     state = StreamLifecycleState.Running;
                     continue;
@@ -118,20 +120,23 @@ namespace MonsterPathPredictor.ReplayCertifier
                 // can never pass CDN preflight, block healthy backup CDNs, or hide under SkippedNonPve/MissingMap.
                 if (decoder != null && isState)
                 {
-                    if (!CanDecodeRunningStateFrame(cmd, payload, decoder)) return false;
+                    if (!CanDecodeRunningStateFrame(cmd, payload, decoder, expectedMapId)) return false;
                 }
             }
             return state == StreamLifecycleState.Finished;
         }
 
-        private static bool CanDecodeRunningStateFrame(int cmd, byte[] payload, IProtocolDecoder decoder)
+        private static bool CanDecodeRunningStateFrame(int cmd, byte[] payload, IProtocolDecoder decoder, int expectedMapId)
         {
             switch (cmd)
             {
                 case 1113:
                 {
                     dynamic snap = decoder.TryDecode("party.protocol.ReplaySnapshotS2C", payload);
-                    return snap?.Room != null;
+                    if (snap?.Room == null) return false;
+                    int snapMapId = (int)snap.Room.MapId;
+                    if (expectedMapId != 0 && snapMapId != 0 && snapMapId != expectedMapId) return false;
+                    return true;
                 }
                 case 1018: return decoder.TryDecode("party.protocol.MonsterRefreshS2C", payload) != null;
                 case 5022: return decoder.TryDecode("party.protocol.ThrowDiceS2C", payload) != null;
@@ -232,7 +237,7 @@ namespace MonsterPathPredictor.ReplayCertifier
             }
         }
 
-        private static bool ApplyAttr(dynamic attr, BoardGraph board, Dictionary<long, UnitSim> players, Dictionary<long, UnitSim> monsters, bool fromSkillMove, long curTurnActor)
+        private static bool ApplyAttr(dynamic attr, BoardGraph board, Dictionary<long, UnitSim> players, Dictionary<long, UnitSim> monsters, bool fromSkillMove, long curTurnActor, CertificationSummary summary = null)
         {
             bool thiefStole = false;
             if (attr?.EffectDatas == null) return false;
@@ -319,6 +324,15 @@ namespace MonsterPathPredictor.ReplayCertifier
                     int newNode = (int)pl.NodeId;
                     int newBack = (int)pl.BackNodeId;
                     int[] newFront = ToIntArray((IEnumerable)pl.FrontNodeIds);
+
+                    // Teleports/displacements may cross non-adjacent tiles, but any non-negative destination
+                    // on a loaded board layout MUST exist on that layout; otherwise fail GATE 0 integrity.
+                    if (newNode >= 0 && board != null && !board.Contains(newNode))
+                    {
+                        if (summary != null) summary.IllegalMoveEdges++;
+                        continue;
+                    }
+
                     bool tileChanged = newNode >= 0 && newNode != oldNode;
                     if (newNode >= 0) target.NodeId = newNode;
                     target.BackNodeId = newBack;
@@ -363,8 +377,16 @@ namespace MonsterPathPredictor.ReplayCertifier
                             target.PendingSkillMovePushFromId = -1;
                             if (displacementKind == SkillMoveKind.LinglingPush)
                             {
+                                // Unified predecessor priority matching Runtime MonsterStateTracker:
+                                // (1) existing confirmed Lingling direction on duplicate same-tile Place,
+                                // (2) previous tile when tileChanged,
+                                // (3) valid in-board protocol BackNodeId != newNode,
+                                // (4) fallback to caster position.
+                                int pushOrigin = tileChanged
+                                    ? oldNode
+                                    : (newBack >= 0 && newBack != newNode && board != null && board.Contains(newBack) ? newBack : -1);
                                 int casterLand = players.TryGetValue(attrOwner, out var casterUnit) ? casterUnit.NodeId : -1;
-                                InferLinglingPushDirection(board, tileChanged ? oldNode : -1, newNode, casterLand, out int pushDir, out int pushFrom);
+                                InferLinglingPushDirection(board, pushOrigin, newNode, casterLand, out int pushDir, out int pushFrom);
                                 target.PendingSkillMovePushDirId = pushDir;
                                 target.PendingSkillMovePushFromId = pushFrom;
                             }

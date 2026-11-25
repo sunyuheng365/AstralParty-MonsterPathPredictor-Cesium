@@ -26,9 +26,15 @@ if ($LASTEXITCODE -ne 0) { throw "ReplayCertifier build failed." }
 $Exe = Join-Path $RepoRoot "tools\ReplayCertifier\bin\Release\net8.0\ReplayCertifier.exe"
 $cliArgs = @("--protocol-dir", $ProtocolDir, "--concurrency", $Concurrency.ToString(), "--json-out", $JsonOut, "--md-out", $MdOut)
 foreach ($entry in $Maps) {
-    foreach ($m in ($entry -split ',')) {
-        $trimmed = $m.Trim()
-        if ($trimmed) { $cliArgs += @("--maps", $trimmed) }
+    $literal = $entry.Trim()
+    if (-not $literal) { continue }
+    if (Test-Path -LiteralPath $literal -PathType Leaf) {
+        $cliArgs += @("--maps", $literal)
+    } else {
+        foreach ($m in ($entry -split ',')) {
+            $trimmed = $m.Trim()
+            if ($trimmed) { $cliArgs += @("--maps", $trimmed) }
+        }
     }
 }
 if ($CorpusFile) { $cliArgs += @("--corpus", $CorpusFile) }

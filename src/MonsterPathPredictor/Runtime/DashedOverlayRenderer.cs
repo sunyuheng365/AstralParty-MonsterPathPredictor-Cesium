@@ -139,6 +139,13 @@ namespace MonsterPathPredictor.Runtime
             var camForward = TransformService.GetForward(camTr);
             float hOffset = settings.HeightOffset;
 
+            // Use the camera's actual near clip plane consistently for both unclipped projections
+            // and 3D near-plane segment clipping (with a strictly smaller numerical tolerance solely
+            // for endpoints already clipped onto the near plane so float rounding never drops them).
+            float nearClipDist = 0.01f;
+            try { if (camera.nearClipPlane > 0f) nearClipDist = Math.Max(0.01f, camera.nearClipPlane); } catch { }
+            float clippedMinDepth = Math.Max(0.001f, nearClipDist * 0.5f);
+
             // Smooth forward-marching dash phase (px)
             float phaseOffset = settings.DashSpeed > 0.01f
                 ? UnityTime.RealtimeSinceStartup * settings.DashSpeed
@@ -146,7 +153,7 @@ namespace MonsterPathPredictor.Runtime
 
             // 0. Selected monster header badge FIRST (always Pill #0 so its cached FairyGUI mesh never swaps)
             Vector3 headerWorld = GetStableHeaderAnchorWorld(selectedMonster);
-            if (TryProjectWorld(layer, camera, camPos, camForward, headerWorld, out var headerPt))
+            if (TryProjectWorld(layer, camera, camPos, camForward, headerWorld, out var headerPt, nearClipDist))
             {
                 string headerText = !string.IsNullOrEmpty(plan.HeadlineNote)
                     ? plan.MonsterName + " (" + plan.HeadlineNote + ")"
@@ -164,7 +171,7 @@ namespace MonsterPathPredictor.Runtime
                     return false;
                 }
                 var world = new Vector3(node.X, node.Y + hOffset, node.Z);
-                if (!TryProjectWorldUnclipped(layer, camera, camPos, camForward, world, out pt)) return false;
+                if (!TryProjectWorldUnclipped(layer, camera, camPos, camForward, world, out pt, nearClipDist)) return false;
                 _screenCache[landId] = pt;
                 return true;
             }
@@ -183,12 +190,9 @@ namespace MonsterPathPredictor.Runtime
 
             // 2. Animated forward-marching dashed lines for all predicted edges:
             //    first clip 3D segment against camera near plane (so edges partially behind the camera stay visible),
-            //    then project unclipped to screen space (using an inclusive depth floor strictly below nearClipDist
+            //    then project unclipped to screen space (using clippedMinDepth strictly below nearClipDist
             //    so near-plane-clipped endpoints are NEVER rejected), clip 2D against viewport, and preserve exact
             //    static dash phase in double precision.
-            const float MinProjectDepth = 0.01f;
-            float nearClipDist = 0.15f;
-            try { nearClipDist = Math.Max(0.12f, camera.nearClipPlane + 0.02f); } catch { }
             double dashPeriod = (double)settings.DashLength + Math.Max(0.0, settings.GapLength);
 
             for (int i = 0; i < plan.Edges.Count; i++)
@@ -216,7 +220,7 @@ namespace MonsterPathPredictor.Runtime
                 }
                 else
                 {
-                    if (!TryProjectWorldUnclipped(layer, camera, camPos, camForward, new Vector3(cax, cay, caz), out pFrom, MinProjectDepth)) continue;
+                    if (!TryProjectWorldUnclipped(layer, camera, camPos, camForward, new Vector3(cax, cay, caz), out pFrom, clippedMinDepth)) continue;
                 }
 
                 if (!clippedNearEnd)
@@ -225,7 +229,7 @@ namespace MonsterPathPredictor.Runtime
                 }
                 else
                 {
-                    if (!TryProjectWorldUnclipped(layer, camera, camPos, camForward, new Vector3(cbx, cby, cbz), out pTo, MinProjectDepth)) continue;
+                    if (!TryProjectWorldUnclipped(layer, camera, camPos, camForward, new Vector3(cbx, cby, cbz), out pTo, clippedMinDepth)) continue;
                 }
 
                 if (!DashGeometry.TryClipSegmentToRect(pFrom, pTo, -40f, -40f, layer.width + 40f, layer.height + 40f,
@@ -503,9 +507,10 @@ namespace MonsterPathPredictor.Runtime
             Vector3 camPos,
             Vector3 camForward,
             Vector3 world,
-            out Point2 pt)
+            out Point2 pt,
+            float minDepth = 0.01f)
         {
-            if (!TryProjectWorldUnclipped(layer, camera, camPos, camForward, world, out pt)) return false;
+            if (!TryProjectWorldUnclipped(layer, camera, camPos, camForward, world, out pt, minDepth)) return false;
             if (pt.X < -300f || pt.X > layer.width + 300f || pt.Y < -300f || pt.Y > layer.height + 300f)
                 return false;
             return true;

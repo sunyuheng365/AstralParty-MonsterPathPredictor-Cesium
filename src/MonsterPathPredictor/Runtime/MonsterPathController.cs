@@ -150,9 +150,11 @@ namespace MonsterPathPredictor.Runtime
 
                 // Keep authoritative turn-boundary tracking advancing even while FightWindow / settings popups
                 // or transient camera hiccups temporarily suspend visual overlay rendering (prevents A->B->A miss).
+                // On a detected match switch, immediately invalidate cached board/unit state and scan timers
+                // so stale previous-match monsters can never be picked or planned in this frame.
                 if (_tracker.ObserveTurnBoundary(battle))
                 {
-                    ClearSelectionAndOverlay();
+                    InvalidateMatchCache();
                 }
 
                 // Combat window or in-battle pause/settings popup: temporarily hide overlay AND popup
@@ -220,7 +222,10 @@ namespace MonsterPathPredictor.Runtime
                     _tracker.SyncAndSnapshot(_board, battle, camera, _settings, out _monsters, out _players, out bool matchChanged);
                     if (matchChanged)
                     {
-                        ClearSelectionAndOverlay();
+                        // Board/units just switched matches between ObserveTurnBoundary and SyncAndSnapshot:
+                        // drop stale board/selection immediately and wait for next frame's fresh capture before input.
+                        InvalidateMatchCache();
+                        return;
                     }
                     _planDirty = true;
                 }
@@ -406,6 +411,19 @@ namespace MonsterPathPredictor.Runtime
             _cachedPlan = null;
             _renderer.HideAll();
             _renderer.ClearStableHeaderCache();
+        }
+
+        private void InvalidateMatchCache()
+        {
+            ClearSelectionAndOverlay();
+            _picker.CancelPendingPointer();
+            _board = null;
+            _monsters.Clear();
+            _players.Clear();
+            _nextBoardScan = DateTime.MinValue;
+            _nextUnitSync = DateTime.MinValue;
+            _needsUnitSync = true;
+            _planDirty = true;
         }
 
         private void ResetBattleState()

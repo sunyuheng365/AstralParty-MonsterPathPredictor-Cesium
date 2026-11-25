@@ -926,9 +926,13 @@ namespace MonsterPathPredictor.Runtime
                     mem.SkillMovePushFromId = -1;
                 }
 
-                SkillMoveKind kind = IdentifyDisplacementSkill(rec.SkillId, rec.CasterPlayerId, allUnits);
+                // Exact 1040.Place records MUST specify an explicit active displacement SkillId;
+                // never infer Shirley/Trashcan/Lingling from caster HeroId when Cause is absent (SkillId == 0).
+                SkillMoveKind kind = IdentifyDisplacementSkill(rec.SkillId, rec.CasterPlayerId, allUnits, allowCasterHeroFallback: false);
                 if (kind != SkillMoveKind.None)
                 {
+                    ConsumeRecentSkillCastForMonster(monsterId, kind, rec.CasterPlayerId, allUnits);
+
                     bool duplicateSameTileLingling =
                         !hopChangedTile &&
                         kind == SkillMoveKind.LinglingPush &&
@@ -940,7 +944,7 @@ namespace MonsterPathPredictor.Runtime
                     {
                         int pushOrigin = hopChangedTile
                             ? simLand
-                            : (rec.BackLandId >= 0 && rec.BackLandId != nextLand ? rec.BackLandId : -1);
+                            : (rec.BackLandId >= 0 && rec.BackLandId != nextLand && board.Contains(rec.BackLandId) ? rec.BackLandId : -1);
                         ApplyDisplacementTag(board, mem, kind, pushOrigin, nextLand, rec.CasterPlayerId, playerPositions);
                     }
                 }
@@ -957,6 +961,28 @@ namespace MonsterPathPredictor.Runtime
             return (mem.SkillMoveKind != SkillMoveKind.None && mem.SkillMoveLandId == newLandId)
                 ? ExactPlaceLookup.TaggedDisplacement
                 : ExactPlaceLookup.KnownOtherCause;
+        }
+
+        private void ConsumeRecentSkillCastForMonster(
+            long monsterId,
+            SkillMoveKind kind,
+            long casterPlayerId,
+            IReadOnlyList<BattlePlayerData> allUnits)
+        {
+            if (_recentSkills.Count == 0 || kind == SkillMoveKind.None) return;
+
+            for (int i = _recentSkills.Count - 1; i >= 0; i--)
+            {
+                var sk = _recentSkills[i];
+                if (sk.AppliedMonsterIds.Contains(monsterId)) continue;
+                SkillMoveKind skKind = IdentifyDisplacementSkill(sk.SkillId, sk.CasterPlayerId, allUnits, allowCasterHeroFallback: true);
+                if (skKind != kind) continue;
+                if (casterPlayerId != 0 && sk.CasterPlayerId != 0 && sk.CasterPlayerId != casterPlayerId) continue;
+
+                // Mark matching cast(s) as consumed for this monster so a subsequent non-Place move
+                // within the 2.5s window cannot re-attribute the already-applied cast.
+                sk.AppliedMonsterIds.Add(monsterId);
+            }
         }
 
         private void TryTagSkillDisplacementFromWindow(
@@ -980,7 +1006,7 @@ namespace MonsterPathPredictor.Runtime
                 var sk = _recentSkills[i];
                 if (sk.AppliedMonsterIds.Contains(monsterId)) continue;
 
-                SkillMoveKind kind = IdentifyDisplacementSkill(sk.SkillId, sk.CasterPlayerId, allUnits);
+                SkillMoveKind kind = IdentifyDisplacementSkill(sk.SkillId, sk.CasterPlayerId, allUnits, allowCasterHeroFallback: true);
                 if (kind == SkillMoveKind.None) continue;
 
                 if (uniqueCast == null)
@@ -1025,7 +1051,11 @@ namespace MonsterPathPredictor.Runtime
             }
         }
 
-        private static SkillMoveKind IdentifyDisplacementSkill(int skillId, long casterPlayerId, IReadOnlyList<BattlePlayerData> allUnits)
+        private static SkillMoveKind IdentifyDisplacementSkill(
+            int skillId,
+            long casterPlayerId,
+            IReadOnlyList<BattlePlayerData> allUnits,
+            bool allowCasterHeroFallback)
         {
             // Match exact active displacement SkillIds first (language-independent, excludes passives >= xx10):
             //   - 10901..10909: Z3000 (垃圾箱, HeroId 109) active pull
@@ -1047,7 +1077,10 @@ namespace MonsterPathPredictor.Runtime
                 return SkillMoveKind.None;
             }
 
-            // Fallback when SDK SkillId is unavailable (0): match caster HeroId directly
+            if (!allowCasterHeroFallback || casterPlayerId == 0) return SkillMoveKind.None;
+
+            // Fallback ONLY on confirmed SkillUsed events where SDK SkillId is unavailable (0):
+            // match caster HeroId directly.
             for (int i = 0; i < allUnits.Count; i++)
             {
                 var pd = allUnits[i];

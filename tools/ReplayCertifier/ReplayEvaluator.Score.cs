@@ -8,7 +8,7 @@ namespace MonsterPathPredictor.ReplayCertifier
 {
     internal static partial class ReplayEvaluator
     {
-        private static void ConsumePendingMoveEffects(
+        private static bool ConsumePendingMoveEffects(
             long moverId,
             int tileId,
             BoardGraph board,
@@ -16,18 +16,19 @@ namespace MonsterPathPredictor.ReplayCertifier
             Dictionary<long, UnitSim> players,
             Dictionary<long, UnitSim> monsters,
             long curTurnActor,
-            ref bool thiefStoleOnTile)
+            CertificationSummary summary = null)
         {
-            if (pendingMoveEffects == null || !pendingMoveEffects.TryGetValue(moverId, out var byTile)) return;
-            if (!byTile.TryGetValue(tileId, out var attrs)) return;
+            if (pendingMoveEffects == null || !pendingMoveEffects.TryGetValue(moverId, out var byTile)) return false;
+            if (!byTile.TryGetValue(tileId, out var attrs)) return false;
             byTile.Remove(tileId);
             if (byTile.Count == 0) pendingMoveEffects.Remove(moverId);
             foreach (var attr in attrs)
             {
                 // 1096 HeroSkillMoveEffectS2C pass-by effects (e.g., Forest thief aura 10701102)
                 // do NOT trigger the fork-interrupting steal pause (only 1040 UpdateHeroAttrS2C does).
-                ApplyAttr(attr, board, players, monsters, true, curTurnActor);
+                ApplyAttr(attr, board, players, monsters, true, curTurnActor, summary);
             }
+            return true;
         }
 
         private static void ConsumeAndSkipInlineDisplacements(
@@ -40,40 +41,59 @@ namespace MonsterPathPredictor.ReplayCertifier
             Dictionary<long, UnitSim> players,
             Dictionary<long, UnitSim> monsters,
             long curTurnActor,
-            ref bool thiefStoleOnTile)
+            ref bool foughtOnTile,
+            ref bool thiefStoleOnTile,
+            CertificationSummary summary)
         {
             // Decouple landing-tile 1096 effect execution from optional MoveS2C echo stripping:
-            // whenever an effect moves u.NodeId (chained self-teleports 2->3->4), ALWAYS continue
-            // consuming pending 1096 effects on the new landing tile even if MoveS2C omitted echoes!
-            for (int hop = 0; hop < 32; hop++)
+            // whenever an effect moves u.NodeId (chained self-teleports 1->2->...->34+), ALWAYS continue
+            // consuming pending 1096 effects on the new landing tile without any arbitrary hop cap.
+            // Termination is guaranteed because ConsumePendingMoveEffects removes each tile bucket before applying it.
+            while (true)
             {
                 int beforeNode = u.NodeId;
                 int hopsBefore = u.PendingDisplacementHops.Count;
-                ConsumePendingMoveEffects(moverId, u.NodeId, board, pendingMoveEffects, players, monsters, curTurnActor, ref thiefStoleOnTile);
+                bool consumed = ConsumePendingMoveEffects(moverId, u.NodeId, board, pendingMoveEffects, players, monsters, curTurnActor, summary);
+                if (!consumed) break;
+
+                if (u.NodeId != beforeNode && moverId == curTurnActor)
+                {
+                    foughtOnTile = false;
+                    thiefStoleOnTile = false;
+                }
 
                 if (u.PendingDisplacementHops.Count > hopsBefore)
                 {
-                    bool anyEchoConsumed = false;
+                    int newCount = u.PendingDisplacementHops.Count - hopsBefore;
+                    int matchedInline = 0;
                     for (int h = hopsBefore; h < u.PendingDisplacementHops.Count; h++)
                     {
                         var (fromN, toN) = u.PendingDisplacementHops[h];
                         if (idx + 1 < nodeIds.Length && nodeIds[idx] == fromN && nodeIds[idx + 1] == toN)
                         {
                             idx += 2;
-                            anyEchoConsumed = true;
+                            matchedInline++;
                         }
                         else if (idx < nodeIds.Length && nodeIds[idx] == toN)
                         {
                             idx += 1;
-                            anyEchoConsumed = true;
+                            matchedInline++;
+                        }
+                        else
+                        {
+                            break;
                         }
                     }
 
-                    // Clear pending hops when consumed inline or when remaining steps exist in this frame;
-                    // preserve them only if we reached the end of this frame so a split follow-up 5028 can strip them.
-                    if (anyEchoConsumed || idx < nodeIds.Length)
+                    // Remove inline hops echoed in this frame (or all newly added inline hops if normal steps
+                    // still remain in this frame); preserve unmatched trailing hops if this frame ended mid-chain.
+                    if (idx < nodeIds.Length)
                     {
-                        u.PendingDisplacementHops.Clear();
+                        u.PendingDisplacementHops.RemoveRange(hopsBefore, newCount);
+                    }
+                    else if (matchedInline > 0)
+                    {
+                        u.PendingDisplacementHops.RemoveRange(hopsBefore, matchedInline);
                     }
                 }
 
@@ -128,21 +148,25 @@ namespace MonsterPathPredictor.ReplayCertifier
             bool isActiveTurnMonster = isKnownMonster && (moverId == curTurnActor);
 
             // Strip any MoveS2C prefix echoing one or more ordered (From -> To) skill displacements applied by 1040/1096.Place.
+            // StripSkillDisplacementPrefix removes ONLY confirmed matched hops so split echoes (e.g. [1,2] then [2,3])
+            // keep remaining unconsumed hops for the follow-up frame.
             int idx = StripSkillDisplacementPrefix(mover, nodeIds);
-            mover.PendingDisplacementHops.Clear();
 
             if (idx >= nodeIds.Length)
             {
-                ConsumeAndSkipInlineDisplacements(mover, moverId, nodeIds, ref idx, board, pendingMoveEffects, players, monsters, curTurnActor, ref thiefStoleOnTile);
+                ConsumeAndSkipInlineDisplacements(mover, moverId, nodeIds, ref idx, board, pendingMoveEffects, players, monsters, curTurnActor, ref foughtOnTile, ref thiefStoleOnTile, summary);
                 return true;
             }
+
+            // Normal walking resumes in this frame: any older omitted displacement echoes are now superseded.
+            mover.PendingDisplacementHops.Clear();
 
             // If MoveS2C echoed a displacement landing (idx > 0) or begins at mover.NodeId, consume deferred 1096
             // effects at mover.NodeId before advancing so split and merged frames execute identically.
             if (idx > 0 || nodeIds[idx] == mover.NodeId)
             {
                 if (nodeIds[idx] == mover.NodeId) idx++;
-                ConsumeAndSkipInlineDisplacements(mover, moverId, nodeIds, ref idx, board, pendingMoveEffects, players, monsters, curTurnActor, ref thiefStoleOnTile);
+                ConsumeAndSkipInlineDisplacements(mover, moverId, nodeIds, ref idx, board, pendingMoveEffects, players, monsters, curTurnActor, ref foughtOnTile, ref thiefStoleOnTile, summary);
             }
 
             while (idx < nodeIds.Length)
@@ -152,7 +176,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                 if (nextTile == curTile)
                 {
                     idx++;
-                    ConsumeAndSkipInlineDisplacements(mover, moverId, nodeIds, ref idx, board, pendingMoveEffects, players, monsters, curTurnActor, ref thiefStoleOnTile);
+                    ConsumeAndSkipInlineDisplacements(mover, moverId, nodeIds, ref idx, board, pendingMoveEffects, players, monsters, curTurnActor, ref foughtOnTile, ref thiefStoleOnTile, summary);
                     continue;
                 }
 
@@ -165,10 +189,14 @@ namespace MonsterPathPredictor.ReplayCertifier
                 }
                 else if (isKnownMonster && (isNormalAggro || isThief) && isActiveTurnMonster)
                 {
-                    // Directed 2-exit arrival forks remain forks even after combat/steal on that tile;
-                    // combat only changes the exit selection rule (Red > Blue), never whether the decision is scored.
-                    bool arrivedFromEdge = stepped || foughtOnTile;
-                    if (board.IsForkForContext(curTile, fromTile, arrivedFromEdge))
+                    // Directed 2-exit arrival forks remain forks on mid-walk, post-combat/steal, AND
+                    // Lingling directed pushes with a verified push predecessor (matching MonsterPathEngine.IsForkForFirstStep).
+                    bool hasLinglingPushFrom = m.PendingSkillMoveLandId == curTile &&
+                                               m.PendingSkillMoveKind == SkillMoveKind.LinglingPush &&
+                                               m.PendingSkillMovePushFromId >= 0;
+                    int forkContextFrom = hasLinglingPushFrom ? m.PendingSkillMovePushFromId : fromTile;
+                    bool arrivedFromEdge = stepped || foughtOnTile || hasLinglingPushFrom;
+                    if (board.IsForkForContext(curTile, forkContextFrom, arrivedFromEdge))
                     {
                         ScoreForkDecision(m, isNormalAggro, isThief, curTile, fromTile, nextTile,
                             replayId, mapId, curRound, fi, board, players, spawnedAtTile,
@@ -198,7 +226,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                 }
 
                 idx++;
-                ConsumeAndSkipInlineDisplacements(mover, moverId, nodeIds, ref idx, board, pendingMoveEffects, players, monsters, curTurnActor, ref thiefStoleOnTile);
+                ConsumeAndSkipInlineDisplacements(mover, moverId, nodeIds, ref idx, board, pendingMoveEffects, players, monsters, curTurnActor, ref foughtOnTile, ref thiefStoleOnTile, summary);
             }
 
             return true;
@@ -210,36 +238,61 @@ namespace MonsterPathPredictor.ReplayCertifier
             if (hops.Count == 0 || u.NodeId != hops[^1].To || nodeIds.Length == 0)
                 return 0;
 
-            // Match either full chained sequence (e.g. hops (1,2),(2,3) -> [1,2,3,...] or disconnected [1,2,5,6,...])
-            // or a single-node landing echo [To] when only 1 hop is pending.
-            int pos = 0;
-            for (int h = 0; h < hops.Count; h++)
+            // Match either from hop 0 (full echo [1,2,3], split prefix [1,2], or single-node [2])
+            // OR from a later hop startHop > 0 when an earlier hop echo was omitted (e.g. [2,3] when [(1,2),(2,3)] pending).
+            for (int startHop = 0; startHop < hops.Count; startHop++)
             {
-                var (fromN, toN) = hops[h];
-                if (pos == 0)
+                int pos = 0;
+                int lastMatchedHop = -1;
+                for (int h = startHop; h < hops.Count; h++)
                 {
-                    if (nodeIds.Length >= 2 && nodeIds[0] == fromN && nodeIds[1] == toN)
-                        pos = 2;
-                    else if (hops.Count == 1 && nodeIds.Length == 1 && nodeIds[0] == toN)
-                        pos = 1;
+                    var (fromN, toN) = hops[h];
+                    if (pos == 0)
+                    {
+                        if (nodeIds.Length >= 2 && nodeIds[0] == fromN && nodeIds[1] == toN)
+                        {
+                            pos = 2;
+                            lastMatchedHop = h;
+                        }
+                        else if (h == hops.Count - 1 && nodeIds.Length == 1 && nodeIds[0] == toN)
+                        {
+                            pos = 1;
+                            lastMatchedHop = h;
+                        }
+                        else
+                        {
+                            break;
+                        }
+                    }
+                    else if (pos >= nodeIds.Length)
+                    {
+                        // Frame ended cleanly mid-chain (split 5028 echo): keep remaining hops for the next frame.
+                        break;
+                    }
+                    else if (nodeIds[pos - 1] == fromN && nodeIds[pos] == toN)
+                    {
+                        pos += 1;
+                        lastMatchedHop = h;
+                    }
+                    else if (pos + 1 < nodeIds.Length && nodeIds[pos] == fromN && nodeIds[pos + 1] == toN)
+                    {
+                        pos += 2;
+                        lastMatchedHop = h;
+                    }
                     else
-                        return 0;
+                    {
+                        break;
+                    }
                 }
-                else if (nodeIds[pos - 1] == fromN && pos < nodeIds.Length && nodeIds[pos] == toN)
+
+                if (lastMatchedHop >= 0 && (pos == nodeIds.Length || lastMatchedHop == hops.Count - 1))
                 {
-                    pos += 1;
-                }
-                else if (pos + 1 < nodeIds.Length && nodeIds[pos] == fromN && nodeIds[pos + 1] == toN)
-                {
-                    pos += 2;
-                }
-                else
-                {
-                    return 0;
+                    hops.RemoveRange(0, lastMatchedHop + 1);
+                    return pos;
                 }
             }
 
-            return pos;
+            return 0;
         }
 
         private static void ScoreForkDecision(
@@ -388,7 +441,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                 bool inSupport;
                 if (isNormalAggro)
                 {
-                    inSupport = RecordMultiBranchCalibration(board, curTile, forkPred.Exits, nextTile, summary.ProbBins);
+                    inSupport = RecordMultiBranchCalibration(board, curTile, forkPred, nextTile, summary.ProbBins);
                 }
                 else
                 {
@@ -436,7 +489,29 @@ namespace MonsterPathPredictor.ReplayCertifier
         public static bool RecordMultiBranchCalibration(
             BoardGraph board,
             int forkLandId,
+            PredictedFork fork,
+            int actualNext,
+            Dictionary<string, ProbBin> probBins)
+        {
+            if (fork == null || fork.Exits == null || fork.Exits.Count < 2) return false;
+            return RecordMultiBranchCalibrationCore(board, forkLandId, fork.Exits, fork.IsExactUniformSplit, actualNext, probBins);
+        }
+
+        public static bool RecordMultiBranchCalibration(
+            BoardGraph board,
+            int forkLandId,
             IReadOnlyList<ForkExitPrediction> exits,
+            int actualNext,
+            Dictionary<string, ProbBin> probBins)
+        {
+            return RecordMultiBranchCalibrationCore(board, forkLandId, exits, isExactUniformOverride: null, actualNext, probBins);
+        }
+
+        private static bool RecordMultiBranchCalibrationCore(
+            BoardGraph board,
+            int forkLandId,
+            IReadOnlyList<ForkExitPrediction> exits,
+            bool? isExactUniformOverride,
             int actualNext,
             Dictionary<string, ProbBin> probBins)
         {
@@ -459,7 +534,7 @@ namespace MonsterPathPredictor.ReplayCertifier
 
             // Compute each exit's OWN context-independent canonical key (equivalence-class grouping — reflexive,
             // symmetric, transitive, order-independent) so no exit inherits a sibling's probability key and
-            // near-50/50 forks like [0.5000000004, 0.4999999996] NEVER contaminate the exact 2-way "50%" bin.
+            // near-50/50 forks like (0.5 + 2^-42, 0.5 - 2^-42) NEVER contaminate the exact 2-way "50%" bin.
             var keyedExits = new List<(ForkExitPrediction Exit, string CanonicalKey, double LogProb)>(positiveExits.Count);
             for (int i = 0; i < positiveExits.Count; i++)
             {
@@ -479,13 +554,16 @@ namespace MonsterPathPredictor.ReplayCertifier
                 return ia != ib ? ia.CompareTo(ib) : a.Exit.NextLandId.CompareTo(b.Exit.NextLandId);
             });
 
-            string shape = string.Join("/", keyedExits.Select(e => e.Exit.FormatConditionalPercent().TrimEnd('%')));
+            string shape = string.Join("/", keyedExits.Select(e => e.Exit.FormatConditionalPercent(positiveExits.Count).TrimEnd('%')));
 
-            // Exact 2-way uniform 50/50 ONLY: both exits must map to canonical "50%" AND agree to within 1e-12.
-            if (keyedExits.Count == 2 &&
-                string.Equals(keyedExits[0].CanonicalKey, "50%", StringComparison.Ordinal) &&
-                string.Equals(keyedExits[1].CanonicalKey, "50%", StringComparison.Ordinal) &&
-                Math.Abs(keyedExits[0].Exit.ConditionalProbability - keyedExits[1].Exit.ConditionalProbability) <= 1e-12)
+            // Exact 2-way uniform 50/50 ONLY: when called with a PredictedFork, honor the engine's mathematical
+            // IsExactUniformSplit proof; when called directly with raw probabilities, require EXACT IEEE-754 0.5
+            // (0.5 is exact in binary64, so 0.5 + 2^-42 is strictly excluded without any loose tolerance).
+            bool isExactTwoWayFifty = keyedExits.Count == 2 && (isExactUniformOverride.HasValue
+                ? isExactUniformOverride.Value
+                : (keyedExits[0].Exit.ConditionalProbability == 0.5 && keyedExits[1].Exit.ConditionalProbability == 0.5));
+
+            if (isExactTwoWayFifty)
             {
                 // Reference exit is the Red-most exit in raw board adjacency order.
                 var orderedPair = keyedExits
@@ -543,15 +621,21 @@ namespace MonsterPathPredictor.ReplayCertifier
 
         private static string FormatCanonicalBaseProbKey(double prob, double logProb)
         {
+            if (prob == 0.5) return "50%";
             if (prob < 1e-10)
             {
                 double roundedLog = Math.Round(logProb, 3, MidpointRounding.AwayFromZero);
                 return $"exp({roundedLog.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)})";
             }
 
-            // Context-independent canonical percent key quantized to 1e-8% (= 1e-10 probability) with trailing zeros trimmed:
-            // 0.25 -> "25%", 0.2000000002 -> "20.00000002%", 0.5000000004 -> "50.00000004%", 0.5 -> "50%".
+            // Context-independent canonical percent key quantized to 1e-8% (= 1e-10 probability) with trailing zeros trimmed;
+            // if a non-0.5 probability (e.g. 0.5 + 2^-42) rounds to 50%, preserve full G17 precision so it never
+            // collides with exact 50% or collapses opposite-signed near-50% exits into one bin.
             double pct = Math.Round(prob * 100.0, 8, MidpointRounding.AwayFromZero);
+            if (pct == 50.0)
+            {
+                return (prob * 100.0).ToString("G17", System.Globalization.CultureInfo.InvariantCulture) + "%";
+            }
             return pct.ToString("0.########", System.Globalization.CultureInfo.InvariantCulture) + "%";
         }
 

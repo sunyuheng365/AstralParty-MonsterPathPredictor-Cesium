@@ -392,16 +392,29 @@ namespace MonsterPathPredictor.Core
                 bool ClipDec(decimal p, decimal q, int edgeId)
                 {
                     if (p == 0m) return q >= 0m;
-                    decimal r = q / p;
+                    // Check half-plane inequality p*s <= q at current endpoints [s0, s1] via multiplication only
+                    // before dividing q/p, guaranteeing |q/p| <= 1 and eliminating OverflowException on near-axis segments.
+                    decimal f0 = q - p * s0;
+                    decimal f1 = q - p * s1;
                     if (p < 0m)
                     {
-                        if (r > s1) return false;
-                        if (r > s0) { s0 = r; hitStartEdge = edgeId; }
+                        if (f1 < 0m) return false;
+                        if (f0 >= 0m) return true;
+                        decimal r = q / p;
+                        if (r < s0) r = s0;
+                        if (r > s1) r = s1;
+                        s0 = r;
+                        hitStartEdge = edgeId;
                     }
                     else
                     {
-                        if (r < s0) return false;
-                        if (r < s1) { s1 = r; hitEndEdge = edgeId; }
+                        if (f0 < 0m) return false;
+                        if (f1 >= 0m) return true;
+                        decimal r = q / p;
+                        if (r < s0) r = s0;
+                        if (r > s1) r = s1;
+                        s1 = r;
+                        hitEndEdge = edgeId;
                     }
                     return true;
                 }
@@ -424,41 +437,97 @@ namespace MonsterPathPredictor.Core
                 return true;
             }
 
-            // Fallback for extreme coordinates > 1e26 using midpoint parameterization in double.
+            // Fallback for extreme coordinates > 1e26: anchor parameterization at a point on the segment
+            // closest to the viewport center so viewport bounds never suffer catastrophic cancellation
+            // against huge far-endpoint coordinates (e.g. (0,0)->(2^100,2^100) vs [0,800]x[0,100]).
+            double cx = (dMinX + dMaxX) * 0.5;
+            double cy = (dMinY + dMaxY) * 0.5;
             double mxD = (ax + bx) * 0.5;
             double myD = (ay + by) * 0.5;
-            double hxD = (bx - ax) * 0.5;
-            double hyD = (by - ay) * 0.5;
-            double ds0 = -1.0, ds1 = 1.0;
+
+            double ox = ax, oy = ay, tO = 0.0;
+            double bestDist = Math.Max(Math.Abs(ax - cx), Math.Abs(ay - cy));
+            double bDist = Math.Max(Math.Abs(bx - cx), Math.Abs(by - cy));
+            if (bDist < bestDist)
+            {
+                ox = bx; oy = by; tO = 1.0; bestDist = bDist;
+            }
+            double mDist = Math.Max(Math.Abs(mxD - cx), Math.Abs(myD - cy));
+            if (mDist < bestDist)
+            {
+                ox = mxD; oy = myD; tO = 0.5; bestDist = mDist;
+            }
+
+            double rectSpan = Math.Max(1.0, Math.Max(dMaxX - dMinX, dMaxY - dMinY));
+            double dirScale = Math.Max(Math.Abs(dx), Math.Abs(dy));
+            if (bestDist > rectSpan * 16.0 && dirScale > 0.0)
+            {
+                double sdx = dx / dirScale;
+                double sdy = dy / dirScale;
+                double denom = dirScale * (sdx * sdx + sdy * sdy);
+                if (denom > 0.0 && !double.IsInfinity(denom))
+                {
+                    double du = ((cx - ox) * sdx + (cy - oy) * sdy) / denom;
+                    double minDu = -tO;
+                    double maxDu = 1.0 - tO;
+                    if (du < minDu) du = minDu;
+                    if (du > maxDu) du = maxDu;
+                    double px = ox + du * dx;
+                    double py = oy + du * dy;
+                    double pDist = Math.Max(Math.Abs(px - cx), Math.Abs(py - cy));
+                    if (pDist < bestDist)
+                    {
+                        ox = px; oy = py; tO += du;
+                    }
+                }
+            }
+
+            double u0 = -tO;
+            double u1 = 1.0 - tO;
             int dHitStart = 0, dHitEnd = 0;
 
             bool ClipDbl(double p, double q, int edgeId)
             {
-                if (Math.Abs(p) < 1e-18) return q >= 0.0;
-                double r = q / p;
+                if (p == 0.0) return q >= 0.0;
+                double f0 = q - p * u0;
+                double f1 = q - p * u1;
                 if (p < 0.0)
                 {
-                    if (r > ds1) return false;
-                    if (r > ds0) { ds0 = r; dHitStart = edgeId; }
+                    if (f1 < 0.0) return false;
+                    if (f0 >= 0.0) return true;
+                    double r = q / p;
+                    if (r < u0) r = u0;
+                    if (r > u1) r = u1;
+                    u0 = r;
+                    dHitStart = edgeId;
                 }
                 else
                 {
-                    if (r < ds0) return false;
-                    if (r < ds1) { ds1 = r; dHitEnd = edgeId; }
+                    if (f0 < 0.0) return false;
+                    if (f1 >= 0.0) return true;
+                    double r = q / p;
+                    if (r < u0) r = u0;
+                    if (r > u1) r = u1;
+                    u1 = r;
+                    dHitEnd = edgeId;
                 }
                 return true;
             }
 
-            if (!ClipDbl(-hxD, mxD - dMinX, 1)) return false;
-            if (!ClipDbl(hxD, dMaxX - mxD, 2)) return false;
-            if (!ClipDbl(-hyD, myD - dMinY, 3)) return false;
-            if (!ClipDbl(hyD, dMaxY - myD, 4)) return false;
+            if (!ClipDbl(-dx, ox - dMinX, 1)) return false;
+            if (!ClipDbl(dx, dMaxX - ox, 2)) return false;
+            if (!ClipDbl(-dy, oy - dMinY, 3)) return false;
+            if (!ClipDbl(dy, dMaxY - oy, 4)) return false;
 
-            startTrimPx = ((ds0 + 1.0) * 0.5) * fullLen;
-            double dx0 = dHitStart == 1 ? dMinX : (dHitStart == 2 ? dMaxX : (mxD + ds0 * hxD));
-            double dy0 = dHitStart == 3 ? dMinY : (dHitStart == 4 ? dMaxY : (myD + ds0 * hyD));
-            double dx1 = dHitEnd == 1 ? dMinX : (dHitEnd == 2 ? dMaxX : (mxD + ds1 * hxD));
-            double dy1 = dHitEnd == 3 ? dMinY : (dHitEnd == 4 ? dMaxY : (myD + ds1 * hyD));
+            double tStart = tO + u0;
+            if (tStart < 0.0) tStart = 0.0;
+            if (tStart > 1.0) tStart = 1.0;
+            startTrimPx = tStart * fullLen;
+
+            double dx0 = dHitStart == 1 ? dMinX : (dHitStart == 2 ? dMaxX : (ox + u0 * dx));
+            double dy0 = dHitStart == 3 ? dMinY : (dHitStart == 4 ? dMaxY : (oy + u0 * dy));
+            double dx1 = dHitEnd == 1 ? dMinX : (dHitEnd == 2 ? dMaxX : (ox + u1 * dx));
+            double dy1 = dHitEnd == 3 ? dMinY : (dHitEnd == 4 ? dMaxY : (oy + u1 * dy));
 
             clippedA = new Point2((float)dx0, (float)dy0);
             clippedB = new Point2((float)dx1, (float)dy1);
@@ -527,14 +596,29 @@ namespace MonsterPathPredictor.Core
             double newTrimStart,
             double period = 0.0)
         {
-            double raw = phaseOffset + origTrimStart - clippedFromStartPx - newTrimStart;
-            if (double.IsNaN(raw) || double.IsInfinity(raw)) return 0f;
+            if (double.IsNaN(phaseOffset) || double.IsInfinity(phaseOffset) ||
+                double.IsNaN(origTrimStart) || double.IsInfinity(origTrimStart) ||
+                double.IsNaN(clippedFromStartPx) || double.IsInfinity(clippedFromStartPx) ||
+                double.IsNaN(newTrimStart) || double.IsInfinity(newTrimStart))
+            {
+                return 0f;
+            }
+
             if (period > 0.0 && !double.IsNaN(period) && !double.IsInfinity(period))
             {
-                double rem = raw % period;
+                // Reduce each signed term individually modulo period before combining so huge
+                // clip distances (e.g. 2^60 px) never swamp small offsets like 10 px during subtraction.
+                double a = phaseOffset % period;
+                double b = origTrimStart % period;
+                double c = clippedFromStartPx % period;
+                double d = newTrimStart % period;
+                double rem = ((a + b) - (c + d)) % period;
                 if (rem < 0.0) rem += period;
                 return (float)rem;
             }
+
+            double raw = phaseOffset + origTrimStart - clippedFromStartPx - newTrimStart;
+            if (double.IsNaN(raw) || double.IsInfinity(raw)) return 0f;
             return (float)raw;
         }
 

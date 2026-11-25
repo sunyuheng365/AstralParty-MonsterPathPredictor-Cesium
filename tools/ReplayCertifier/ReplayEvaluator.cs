@@ -64,6 +64,8 @@ namespace MonsterPathPredictor.ReplayCertifier
             int curRound = 0;
             int turnStartLandId = -1;
             bool startedOnFork = false, stepped = false, foughtOnTile = false, foughtTurn = false, thiefStoleOnTile = false;
+            int foughtTile = -1, foughtLayoutIdx = -1;
+            int thiefStoleTile = -1, thiefStoleLayoutIdx = -1;
 
             var players = new Dictionary<long, UnitSim>();
             var monsters = new Dictionary<long, UnitSim>();
@@ -76,28 +78,64 @@ namespace MonsterPathPredictor.ReplayCertifier
             bool decodeFailed = false;
             var lifecycle = StreamLifecycleState.Unstarted;
 
+            int GetActorTile(long actorId)
+            {
+                if (actorId == 0) return -1;
+                if (monsters.TryGetValue(actorId, out var m)) return m.NodeId;
+                if (players.TryGetValue(actorId, out var p)) return p.NodeId;
+                return -1;
+            }
+
+            void SyncTileScopedTurnFlags()
+            {
+                int actorTile = GetActorTile(curTurnActor);
+                if (foughtOnTile && (actorTile < 0 || actorTile != foughtTile || mapIndex != foughtLayoutIdx))
+                {
+                    foughtOnTile = false;
+                    foughtTile = -1;
+                    foughtLayoutIdx = -1;
+                }
+                if (thiefStoleOnTile && (actorTile < 0 || actorTile != thiefStoleTile || mapIndex != thiefStoleLayoutIdx))
+                {
+                    thiefStoleOnTile = false;
+                    thiefStoleTile = -1;
+                    thiefStoleLayoutIdx = -1;
+                }
+            }
+
             void SyncRoom(dynamic room, bool preservePendingEffects = false)
             {
+                int snapMapId = (int)room.MapId;
+                if (mapId != 0 && snapMapId != 0 && snapMapId != mapId)
+                {
+                    decodeFailed = true;
+                    return;
+                }
                 int newIdx = (int)room.MapIndex;
-                if (board == null || newIdx != mapIndex)
+                bool layoutChanged = (board == null || newIdx != mapIndex);
+                if (layoutChanged)
                 {
                     if (catalog.TryGetGraph(mapId, newIdx, out var nb)) { mapIndex = newIdx; board = nb; }
                     else { unknownLayout = true; return; }
                 }
-                if (!preservePendingEffects) pendingMoveEffects.Clear();
+                bool preserveSameLayout = preservePendingEffects && !layoutChanged;
+                if (!preserveSameLayout) pendingMoveEffects.Clear();
                 var prevPlayerDisp = new Dictionary<long, List<(int From, int To)>>();
-                foreach (var kv in players)
-                {
-                    if (kv.Value.PendingDisplacementHops.Count > 0)
-                        prevPlayerDisp[kv.Key] = new List<(int, int)>(kv.Value.PendingDisplacementHops);
-                }
                 var prevMonsterState = new Dictionary<long, (List<(int From, int To)> Hops, SkillMoveKind Kind, int Land, int PushDir, int PushFrom)>();
-                foreach (var kv in monsters)
+                if (!layoutChanged)
                 {
-                    if (kv.Value.PendingDisplacementHops.Count > 0 || kv.Value.PendingSkillMoveKind != SkillMoveKind.None)
-                        prevMonsterState[kv.Key] = (new List<(int, int)>(kv.Value.PendingDisplacementHops),
-                            kv.Value.PendingSkillMoveKind, kv.Value.PendingSkillMoveLandId,
-                            kv.Value.PendingSkillMovePushDirId, kv.Value.PendingSkillMovePushFromId);
+                    foreach (var kv in players)
+                    {
+                        if (kv.Value.PendingDisplacementHops.Count > 0)
+                            prevPlayerDisp[kv.Key] = new List<(int, int)>(kv.Value.PendingDisplacementHops);
+                    }
+                    foreach (var kv in monsters)
+                    {
+                        if (kv.Value.PendingDisplacementHops.Count > 0 || kv.Value.PendingSkillMoveKind != SkillMoveKind.None)
+                            prevMonsterState[kv.Key] = (new List<(int, int)>(kv.Value.PendingDisplacementHops),
+                                kv.Value.PendingSkillMoveKind, kv.Value.PendingSkillMoveLandId,
+                                kv.Value.PendingSkillMovePushDirId, kv.Value.PendingSkillMovePushFromId);
+                    }
                 }
                 players.Clear();
                 monsters.Clear();
@@ -236,14 +274,19 @@ namespace MonsterPathPredictor.ReplayCertifier
                     long snapActor = (long)snap.PlayerId;
                     bool sameOngoingTurn = (curTurnActor != 0 && snapActor == curTurnActor && snapRound == curRound);
                     SyncRoom(snap.Room, preservePendingEffects: sameOngoingTurn);
-                    if (unknownLayout) break;
+                    if (unknownLayout || decodeFailed) break;
                     curRound = snapRound;
                     curTurnActor = snapActor;
                     if (!sameOngoingTurn)
                     {
                         stepped = foughtOnTile = foughtTurn = thiefStoleOnTile = false;
+                        foughtTile = foughtLayoutIdx = thiefStoleTile = thiefStoleLayoutIdx = -1;
                         turnStartLandId = monsters.TryGetValue(curTurnActor, out var am) ? am.NodeId : -1;
                         startedOnFork = am != null && board.IsFork(am.NodeId);
+                    }
+                    else
+                    {
+                        SyncTileScopedTurnFlags();
                     }
                 }
                 else if (cmd == 1018)
@@ -264,11 +307,15 @@ namespace MonsterPathPredictor.ReplayCertifier
                     if (td == null) { decodeFailed = true; break; }
                     long actorId = (long)td.PlayerId;
                     // Discard ALL unreached deferred 1096 tile effects from the previous turn (for any actor)
-                    // so off-turn queued effects can never bleed across turn boundaries.
+                    // and any un-echoed pre-dice displacement hops on the rolling actor so they cannot collide
+                    // with post-dice normal walking steps.
                     pendingMoveEffects.Clear();
+                    if (players.TryGetValue(actorId, out var dicePlayer)) dicePlayer.PendingDisplacementHops.Clear();
+                    if (monsters.TryGetValue(actorId, out var diceMonster)) diceMonster.PendingDisplacementHops.Clear();
                     // Always advance active turn context even when a player (non-monster) rolls dice.
                     curTurnActor = actorId;
                     stepped = foughtOnTile = foughtTurn = thiefStoleOnTile = false;
+                    foughtTile = foughtLayoutIdx = thiefStoleTile = thiefStoleLayoutIdx = -1;
                     if (monsters.TryGetValue(actorId, out var ma))
                     {
                         turnStartLandId = ma.NodeId;
@@ -284,8 +331,13 @@ namespace MonsterPathPredictor.ReplayCertifier
                 {
                     dynamic attr = decoder.TryDecode("party.protocol.UpdateHeroAttrS2C", payload);
                     if (attr == null) { decodeFailed = true; break; }
-                    if (ApplyAttr(attr, board, players, monsters, false, curTurnActor))
+                    if (ApplyAttr(attr, board, players, monsters, false, curTurnActor, summary))
+                    {
                         thiefStoleOnTile = true;
+                        thiefStoleTile = GetActorTile(curTurnActor);
+                        thiefStoleLayoutIdx = mapIndex;
+                    }
+                    SyncTileScopedTurnFlags();
                 }
                 else if (cmd == 1096)
                 {
@@ -298,16 +350,20 @@ namespace MonsterPathPredictor.ReplayCertifier
 
                     if (sm.EffectData != null)
                     {
+                        // Register ALL tile-keyed effects first so execution is 100% independent of
+                        // protobuf map key enumeration order, then consume chained landing-tile triggers
+                        // from moverUnit.NodeId using the exact same trigger logic as walking arrivals.
+                        var immediateAttrs = new List<dynamic>();
                         foreach (dynamic kv in (IEnumerable)sm.EffectData)
                         {
                             if (kv?.Value?.Effects == null) continue;
                             int triggerTile = Convert.ToInt32(kv.Key);
-                            bool applyNow = moverUnit == null || triggerTile < 0 || moverUnit.NodeId == triggerTile;
+                            bool isUnkeyed = moverUnit == null || triggerTile < 0;
                             foreach (dynamic attr in (IEnumerable)kv.Value.Effects)
                             {
-                                if (applyNow)
+                                if (isUnkeyed)
                                 {
-                                    ApplyAttr(attr, board, players, monsters, true, curTurnActor);
+                                    immediateAttrs.Add(attr);
                                 }
                                 else
                                 {
@@ -319,6 +375,22 @@ namespace MonsterPathPredictor.ReplayCertifier
                                 }
                             }
                         }
+
+                        for (int i = 0; i < immediateAttrs.Count; i++)
+                        {
+                            ApplyAttr(immediateAttrs[i], board, players, monsters, true, curTurnActor, summary);
+                        }
+
+                        if (moverUnit != null)
+                        {
+                            while (true)
+                            {
+                                int beforeNode = moverUnit.NodeId;
+                                bool consumed = ConsumePendingMoveEffects(moverId, moverUnit.NodeId, board, pendingMoveEffects, players, monsters, curTurnActor, summary);
+                                if (!consumed || moverUnit.NodeId == beforeNode) break;
+                            }
+                        }
+                        SyncTileScopedTurnFlags();
                     }
                 }
                 else if (cmd == 5214)
@@ -334,6 +406,11 @@ namespace MonsterPathPredictor.ReplayCertifier
                     if (targetUnit != null)
                     {
                         int nid = (int)mp.NodeId;
+                        if (nid >= 0 && board != null && !board.Contains(nid))
+                        {
+                            summary.IllegalMoveEdges++;
+                            continue;
+                        }
                         if (nid >= 0 && nid != targetUnit.NodeId)
                         {
                             targetUnit.NodeId = nid;
@@ -348,6 +425,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                         }
                         targetUnit.BackNodeId = (int)mp.BackId;
                         targetUnit.FrontNodeIds = ToIntArray((IEnumerable)mp.FrontIds);
+                        SyncTileScopedTurnFlags();
                     }
                 }
                 else if (cmd == 1007)
@@ -358,7 +436,17 @@ namespace MonsterPathPredictor.ReplayCertifier
                     {
                         long atk = b.Battle.Attacker != null ? (long)b.Battle.Attacker.PlayerId : 0;
                         long def = b.Battle.Defender != null ? (long)b.Battle.Defender.PlayerId : 0;
-                        if (atk == curTurnActor || def == curTurnActor) foughtOnTile = foughtTurn = true;
+                        if (atk == curTurnActor || def == curTurnActor)
+                        {
+                            foughtTurn = true;
+                            int actorTile = GetActorTile(curTurnActor);
+                            if (actorTile >= 0)
+                            {
+                                foughtOnTile = true;
+                                foughtTile = actorTile;
+                                foughtLayoutIdx = mapIndex;
+                            }
+                        }
                     }
                 }
                 else if (cmd == 1115)
@@ -379,6 +467,9 @@ namespace MonsterPathPredictor.ReplayCertifier
                         decodeFailed = true;
                         break;
                     }
+                    if (!foughtOnTile) { foughtTile = -1; foughtLayoutIdx = -1; }
+                    if (!thiefStoleOnTile) { thiefStoleTile = -1; thiefStoleLayoutIdx = -1; }
+                    SyncTileScopedTurnFlags();
                 }
             }
 

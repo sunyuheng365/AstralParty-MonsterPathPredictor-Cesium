@@ -249,28 +249,61 @@ namespace MonsterPathPredictor.Runtime
             hitBox = null;
             if (!bounds.HasCorners) return false;
 
-            float depth = Vector3.Dot(bounds.CenterWorld - camPos, camForward);
-            if (depth <= 0.1f) return false;
+            // Use the camera's actual near clip plane consistently with DashedOverlayRenderer,
+            // clipping the 4 sprite perimeter edges so sprites completely behind nearClipPlane
+            // can never be clicked while sprites straddling nearClipPlane project their visible portion.
+            float nearClip = 0.01f;
+            try { if (camera.nearClipPlane > 0f) nearClip = Math.Max(0.01f, camera.nearClipPlane); } catch { }
+            float clippedMinDepth = Math.Max(0.001f, nearClip * 0.5f);
 
             float minX = float.MaxValue, minY = float.MaxValue;
             float maxX = float.MinValue, maxY = float.MinValue;
             int valid = 0;
+            float depthSum = 0f;
 
-            for (int i = 0; i < 4; i++)
+            void AcceptPoint(Vector3 w)
             {
-                Vector3 c = i == 0 ? bounds.BL : i == 1 ? bounds.BR : i == 2 ? bounds.TL : bounds.TR;
-                if (Vector3.Dot(c - camPos, camForward) <= 0.05f) continue;
-                Vector2 p = layer.WorldToLocal(c, camera);
+                float d = Vector3.Dot(w - camPos, camForward);
+                if (d < clippedMinDepth) return;
+                Vector2 p = layer.WorldToLocal(w, camera);
                 if (float.IsNaN(p.x) || float.IsInfinity(p.x) || float.IsNaN(p.y) || float.IsInfinity(p.y))
-                    continue;
+                    return;
                 if (p.x < minX) minX = p.x;
                 if (p.y < minY) minY = p.y;
                 if (p.x > maxX) maxX = p.x;
                 if (p.y > maxY) maxY = p.y;
+                depthSum += d;
                 valid++;
             }
 
+            Vector3 e0a = bounds.BL, e0b = bounds.BR;
+            Vector3 e1a = bounds.BR, e1b = bounds.TR;
+            Vector3 e2a = bounds.TR, e2b = bounds.TL;
+            Vector3 e3a = bounds.TL, e3b = bounds.BL;
+
+            for (int e = 0; e < 4; e++)
+            {
+                Vector3 a = e == 0 ? e0a : e == 1 ? e1a : e == 2 ? e2a : e3a;
+                Vector3 b = e == 0 ? e0b : e == 1 ? e1b : e == 2 ? e2b : e3b;
+                if (!DashGeometry.TryClipSegmentToNearPlane(
+                        a.x, a.y, a.z, b.x, b.y, b.z,
+                        camPos.x, camPos.y, camPos.z,
+                        camForward.x, camForward.y, camForward.z,
+                        nearClip,
+                        out float ax, out float ay, out float az,
+                        out float bx, out float by, out float bz,
+                        out _, out _))
+                {
+                    continue;
+                }
+                AcceptPoint(new Vector3(ax, ay, az));
+                AcceptPoint(new Vector3(bx, by, bz));
+            }
+
             if (valid < 2) return false;
+
+            float centerDepth = Vector3.Dot(bounds.CenterWorld - camPos, camForward);
+            float effectiveDepth = centerDepth >= nearClip ? centerDepth : (depthSum / valid);
 
             // Keep the raw projected sprite bounds uninflated so MonsterHitTester directHits only matches
             // clicks truly inside a monster's sprite; zoomed-out small sprites remain easy to pick via nearMissRadius.
@@ -278,7 +311,7 @@ namespace MonsterPathPredictor.Runtime
             {
                 MonsterId = monsterId,
                 Rect = new HitRect2D(minX, minY, maxX, maxY),
-                CameraDepth = depth
+                CameraDepth = effectiveDepth
             };
             return true;
         }

@@ -38,9 +38,16 @@ namespace MonsterPathPredictor.Runtime
         private GGraph _panelBg;
         private GGraph _headerBg;
         private GTextField _titleText;
+        private GComponent _closeBtn;
         private GComponent _listHost;
         private GComponent _footerHost;
+        private GGraph _footerBg;
+        private GComponent _minusBtn;
+        private GComponent _plusBtn;
+        private GComponent _clearBtn;
         private GComponent _pagerHost;
+        private GComponent _prevBtn;
+        private GComponent _nextBtn;
         private GTextField _pageLabel;
         private GTextField _stepsLabel;
         private GTextField _emptyText;
@@ -134,8 +141,8 @@ namespace MonsterPathPredictor.Runtime
                 }
             }
 
-            // Dynamically fit rows per page to current GRoot viewport height so pager and footer controls
-            // remain completely reachable even on short windows (e.g. height = 480).
+            // Dynamically fit rows per page and compact chrome to current GRoot viewport height so
+            // header, list, pager, and footer controls remain reachable even on ultra-short windows (e.g. height = 120).
             float stageHeight = GRoot.inst != null && GRoot.inst.height > 0f ? GRoot.inst.height : 720f;
             int rowsPerPage = ComputeRowsPerPage(stageHeight);
             int totalPages = Math.Max(1, (visible.Count + rowsPerPage - 1) / rowsPerPage);
@@ -146,68 +153,82 @@ namespace MonsterPathPredictor.Runtime
             // game window immediately brings the popup back inside the visible viewport.
             if (_positioned) ClampToStage();
 
-            string sig = BuildSignature(visible, selectedMonsterId, settings, _pageIndex, totalPages, rowsPerPage);
+            string sig = BuildSignature(visible, selectedMonsterId, settings, _pageIndex, totalPages, rowsPerPage, stageHeight);
             if (sig == _lastSignature) return;
             _lastSignature = sig;
 
+            bool showPager = totalPages > 1;
+            var layout = ComputeCompactLayout(stageHeight, showPager);
+
             _titleText.text = "怪物寻路选择 [" + settings.PickerHotkey + "]";
             _stepsLabel.text = "延伸 " + settings.PreviewSteps + " 格";
+            ApplyChromeLayout(layout);
 
             _listHost.RemoveChildren(0, -1, true);
 
             float listHeight;
             if (visible.Count == 0)
             {
-                listHeight = 42f;
-                _emptyText.visible = true;
-                _emptyText.SetXY(Padding, HeaderHeight + 12f);
+                listHeight = Math.Min(42f, layout.MaxListHeight);
+                _emptyText.visible = listHeight >= 18f;
+                _emptyText.SetXY(Padding, layout.HeaderH + Math.Max(2f, (listHeight - 18f) * 0.5f));
             }
             else
             {
                 _emptyText.visible = false;
                 int start = _pageIndex * rowsPerPage;
                 int count = Math.Min(rowsPerPage, visible.Count - start);
-                listHeight = count * (RowHeight + 4f) + 4f;
-                for (int i = 0; i < count; i++)
+                float rowStep = layout.RowH + layout.RowGap;
+                listHeight = Math.Min(layout.MaxListHeight, count * rowStep + layout.RowGap);
+                bool showRows = layout.RowH >= 18f && listHeight >= layout.RowH;
+                _listHost.visible = showRows;
+                if (showRows)
                 {
-                    var row = BuildMonsterRow(visible[start + i], selectedMonsterId);
-                    row.SetXY(0f, i * (RowHeight + 4f));
-                    _listHost.AddChild(row);
+                    int fitRows = Math.Max(1, Math.Min(count, (int)((listHeight + layout.RowGap) / rowStep)));
+                    for (int i = 0; i < fitRows; i++)
+                    {
+                        var row = BuildMonsterRow(visible[start + i], selectedMonsterId, layout.RowH);
+                        row.SetXY(0f, i * rowStep);
+                        _listHost.AddChild(row);
+                    }
+                    listHeight = Math.Min(layout.MaxListHeight, fitRows * rowStep + layout.RowGap);
                 }
             }
 
-            bool showPager = totalPages > 1;
-            float pagerHeight = showPager ? 28f : 0f;
             if (_pagerHost != null)
             {
-                _pagerHost.visible = showPager;
-                if (showPager)
+                _pagerHost.visible = showPager && layout.PagerH > 0f;
+                if (_pagerHost.visible)
                 {
                     _pageLabel.text = (_pageIndex + 1) + " / " + totalPages + " (" + visible.Count + "只)";
-                    _pagerHost.SetXY(0f, HeaderHeight + Padding + listHeight);
+                    _pagerHost.SetXY(0f, layout.HeaderH + layout.Pad + listHeight);
                 }
             }
 
-            float totalHeight = HeaderHeight + Padding + listHeight + pagerHeight + Padding + FooterHeight;
+            float totalHeight = layout.HeaderH + layout.Pad + listHeight + (showPager ? layout.PagerH : 0f) + layout.Pad + layout.FooterH;
+            if (stageHeight > 0f && totalHeight > stageHeight)
+            {
+                totalHeight = stageHeight;
+            }
             _root.SetSize(PanelWidth, totalHeight);
             _panelBg.SetSize(PanelWidth, totalHeight);
             _panelBg.DrawRect(PanelWidth, totalHeight, 2, PanelBorder, PanelBg);
 
-            _listHost.SetXY(Padding, HeaderHeight + Padding);
-            _listHost.SetSize(PanelWidth - Padding * 2f, listHeight);
-            _footerHost.SetXY(0f, totalHeight - FooterHeight);
+            _listHost.SetXY(Padding, layout.HeaderH + layout.Pad);
+            _listHost.SetSize(PanelWidth - Padding * 2f, Math.Max(0f, listHeight));
+            _footerHost.SetXY(0f, Math.Max(layout.HeaderH, totalHeight - layout.FooterH));
 
             if (!_positioned && GRoot.inst != null)
             {
                 _positioned = true;
                 float x = Math.Max(20f, GRoot.inst.width - PanelWidth - 28f);
-                float y = Math.Max(80f, (GRoot.inst.height - totalHeight) * 0.35f);
+                float y = Math.Max(0f, Math.Min(GRoot.inst.height - totalHeight, Math.Max(80f, (GRoot.inst.height - totalHeight) * 0.35f)));
                 _root.SetXY(x, y);
             }
             ClampToStage();
         }
 
-        private GComponent BuildMonsterRow(LiveMonsterInfo info, long selectedMonsterId)
+        private GComponent BuildMonsterRow(LiveMonsterInfo info, long selectedMonsterId, float rowHeight)
         {
             var st = info.State;
             bool isSelected = st.MonsterId == selectedMonsterId;
@@ -218,13 +239,15 @@ namespace MonsterPathPredictor.Runtime
                 touchable = true,
                 opaque = true
             };
-            row.SetSize(rowW, RowHeight);
+            row.SetSize(rowW, rowHeight);
 
             var bg = new GGraph { touchable = false };
-            bg.SetSize(rowW, RowHeight);
-            DrawRowBg(bg, rowW, isSelected, hovered: false);
+            bg.SetSize(rowW, rowHeight);
+            DrawRowBg(bg, rowW, rowHeight, isSelected, hovered: false);
             row.AddChild(bg);
 
+            int nameFontSize = rowHeight < 30f ? 13 : 15;
+            float nameY = Math.Max(1f, (rowHeight - 20f) * 0.5f);
             var nameTf = new GTextField
             {
                 touchable = false,
@@ -232,17 +255,19 @@ namespace MonsterPathPredictor.Runtime
                 singleLine = true,
                 textFormat = new TextFormat
                 {
-                    size = 15,
+                    size = nameFontSize,
                     bold = isSelected,
                     color = isSelected ? AccentGold : TextPrimary
                 }
             };
-            nameTf.SetXY(8f, 7f);
-            nameTf.SetSize(145f, 22f);
+            nameTf.SetXY(8f, nameY);
+            nameTf.SetSize(145f, Math.Min(22f, rowHeight - 2f));
             string prefix = isSelected ? "▶ " : "• ";
             nameTf.text = prefix + (!string.IsNullOrEmpty(st.DisplayName) ? st.DisplayName : st.Name);
             row.AddChild(nameTf);
 
+            int metaFontSize = rowHeight < 30f ? 12 : 13;
+            float metaY = Math.Max(1f, (rowHeight - 18f) * 0.5f);
             var metaTf = new GTextField
             {
                 touchable = false,
@@ -251,12 +276,12 @@ namespace MonsterPathPredictor.Runtime
                 align = AlignType.Right,
                 textFormat = new TextFormat
                 {
-                    size = 13,
+                    size = metaFontSize,
                     color = st.IsNormalAggressive ? TextMuted : AccentCyan
                 }
             };
-            metaTf.SetXY(152f, 8f);
-            metaTf.SetSize(rowW - 160f, 20f);
+            metaTf.SetXY(152f, metaY);
+            metaTf.SetSize(rowW - 160f, Math.Min(20f, rowHeight - 2f));
             string hpPart = st.MaxHp > 0 ? ("HP " + st.Hp + "/" + st.MaxHp) : "";
             string tilePart = "#" + st.CurrentLandId;
             string notePart = !st.IsNormalAggressive ? " 非主动" : (st.ActionWeight > 0 ? (" 序" + st.ActionWeight) : "");
@@ -264,8 +289,8 @@ namespace MonsterPathPredictor.Runtime
             row.AddChild(metaTf);
 
             long capturedId = st.MonsterId;
-            row.onRollOver.Add(() => DrawRowBg(bg, rowW, isSelected, hovered: true));
-            row.onRollOut.Add(() => DrawRowBg(bg, rowW, isSelected, hovered: false));
+            row.onRollOver.Add(() => DrawRowBg(bg, rowW, rowHeight, isSelected, hovered: true));
+            row.onRollOut.Add(() => DrawRowBg(bg, rowW, rowHeight, isSelected, hovered: false));
             row.onClick.Add(() =>
             {
                 MonsterSelected?.Invoke(capturedId);
@@ -275,13 +300,13 @@ namespace MonsterPathPredictor.Runtime
             return row;
         }
 
-        private static void DrawRowBg(GGraph bg, float w, bool selected, bool hovered)
+        private static void DrawRowBg(GGraph bg, float w, float h, bool selected, bool hovered)
         {
             if (bg == null || bg.isDisposed) return;
             if (selected)
-                bg.DrawRect(w, RowHeight, 2, RowSelectedBorder, hovered ? RowHoverBg : RowSelectedBg);
+                bg.DrawRect(w, h, 2, RowSelectedBorder, hovered ? RowHoverBg : RowSelectedBg);
             else
-                bg.DrawRect(w, RowHeight, 1, new Color(0.24f, 0.30f, 0.40f, 0.65f), hovered ? RowHoverBg : RowNormalBg);
+                bg.DrawRect(w, h, 1, new Color(0.24f, 0.30f, 0.40f, 0.65f), hovered ? RowHoverBg : RowNormalBg);
         }
 
         private void EnsureCreated()
@@ -318,18 +343,18 @@ namespace MonsterPathPredictor.Runtime
             _titleText.SetXY(10f, 8f);
             _root.AddChild(_titleText);
 
-            var closeBtn = CreateMiniButton("×", 28f, 24f, () => Hide());
-            closeBtn.SetXY(PanelWidth - 36f, 6f);
-            _root.AddChild(closeBtn);
+            _closeBtn = CreateMiniButton("×", 28f, 24f, () => Hide());
+            _closeBtn.SetXY(PanelWidth - 36f, 6f);
+            _root.AddChild(_closeBtn);
 
             _listHost = new GComponent { touchable = true };
             _root.AddChild(_listHost);
 
             _pagerHost = new GComponent { touchable = true, visible = false };
             _pagerHost.SetSize(PanelWidth, 28f);
-            var prevBtn = CreateMiniButton("◀", 28f, 22f, () => { _pageIndex = Math.Max(0, _pageIndex - 1); _lastSignature = string.Empty; });
-            prevBtn.SetXY(Padding, 3f);
-            _pagerHost.AddChild(prevBtn);
+            _prevBtn = CreateMiniButton("◀", 28f, 22f, () => { _pageIndex = Math.Max(0, _pageIndex - 1); _lastSignature = string.Empty; });
+            _prevBtn.SetXY(Padding, 3f);
+            _pagerHost.AddChild(_prevBtn);
             _pageLabel = new GTextField
             {
                 touchable = false,
@@ -340,9 +365,9 @@ namespace MonsterPathPredictor.Runtime
             _pageLabel.SetXY(44f, 5f);
             _pageLabel.SetSize(PanelWidth - 88f, 18f);
             _pagerHost.AddChild(_pageLabel);
-            var nextBtn = CreateMiniButton("▶", 28f, 22f, () => { _pageIndex++; _lastSignature = string.Empty; });
-            nextBtn.SetXY(PanelWidth - Padding - 28f, 3f);
-            _pagerHost.AddChild(nextBtn);
+            _nextBtn = CreateMiniButton("▶", 28f, 22f, () => { _pageIndex++; _lastSignature = string.Empty; });
+            _nextBtn.SetXY(PanelWidth - Padding - 28f, 3f);
+            _pagerHost.AddChild(_nextBtn);
             _root.AddChild(_pagerHost);
 
             _emptyText = new GTextField
@@ -356,14 +381,14 @@ namespace MonsterPathPredictor.Runtime
 
             _footerHost = new GComponent { touchable = true, opaque = true };
             _footerHost.SetSize(PanelWidth, FooterHeight);
-            var footerBg = new GGraph { touchable = false };
-            footerBg.SetSize(PanelWidth, FooterHeight);
-            footerBg.DrawRect(PanelWidth, FooterHeight, 0, Color.clear, HeaderBg);
-            _footerHost.AddChild(footerBg);
+            _footerBg = new GGraph { touchable = false };
+            _footerBg.SetSize(PanelWidth, FooterHeight);
+            _footerBg.DrawRect(PanelWidth, FooterHeight, 0, Color.clear, HeaderBg);
+            _footerHost.AddChild(_footerBg);
 
-            var minusBtn = CreateMiniButton("-", 26f, 24f, () => StepsDeltaRequested?.Invoke(-1));
-            minusBtn.SetXY(10f, 6f);
-            _footerHost.AddChild(minusBtn);
+            _minusBtn = CreateMiniButton("-", 26f, 24f, () => StepsDeltaRequested?.Invoke(-1));
+            _minusBtn.SetXY(10f, 6f);
+            _footerHost.AddChild(_minusBtn);
 
             _stepsLabel = new GTextField
             {
@@ -376,13 +401,13 @@ namespace MonsterPathPredictor.Runtime
             _stepsLabel.SetSize(82f, 22f);
             _footerHost.AddChild(_stepsLabel);
 
-            var plusBtn = CreateMiniButton("+", 26f, 24f, () => StepsDeltaRequested?.Invoke(1));
-            plusBtn.SetXY(126f, 6f);
-            _footerHost.AddChild(plusBtn);
+            _plusBtn = CreateMiniButton("+", 26f, 24f, () => StepsDeltaRequested?.Invoke(1));
+            _plusBtn.SetXY(126f, 6f);
+            _footerHost.AddChild(_plusBtn);
 
-            var clearBtn = CreateMiniButton("清除预览", 76f, 24f, () => ClearRequested?.Invoke());
-            clearBtn.SetXY(PanelWidth - 86f, 6f);
-            _footerHost.AddChild(clearBtn);
+            _clearBtn = CreateMiniButton("清除预览", 76f, 24f, () => ClearRequested?.Invoke());
+            _clearBtn.SetXY(PanelWidth - 86f, 6f);
+            _footerHost.AddChild(_clearBtn);
 
             _root.AddChild(_footerHost);
         }
@@ -409,10 +434,25 @@ namespace MonsterPathPredictor.Runtime
             tf.SetSize(w, h);
             btn.AddChild(tf);
 
-            btn.onRollOver.Add(() => bg.DrawRect(w, h, 1, PanelBorder, BtnHoverBg));
-            btn.onRollOut.Add(() => bg.DrawRect(w, h, 1, new Color(0.35f, 0.45f, 0.60f, 0.8f), BtnBg));
+            btn.onRollOver.Add(() => bg.DrawRect(btn.width, btn.height, 1, PanelBorder, BtnHoverBg));
+            btn.onRollOut.Add(() => bg.DrawRect(btn.width, btn.height, 1, new Color(0.35f, 0.45f, 0.60f, 0.8f), BtnBg));
             btn.onClick.Add(() => onClick?.Invoke());
             return btn;
+        }
+
+        private static void ResizeMiniButton(GComponent btn, float w, float h)
+        {
+            if (btn == null || btn.isDisposed) return;
+            btn.SetSize(w, h);
+            if (btn.numChildren >= 1 && btn.GetChildAt(0) is GGraph bg)
+            {
+                bg.SetSize(w, h);
+                bg.DrawRect(w, h, 1, new Color(0.35f, 0.45f, 0.60f, 0.8f), BtnBg);
+            }
+            if (btn.numChildren >= 2 && btn.GetChildAt(1) is GTextField tf)
+            {
+                tf.SetSize(w, h);
+            }
         }
 
         private void ClampToStage()
@@ -423,6 +463,111 @@ namespace MonsterPathPredictor.Runtime
             float x = Math.Max(0f, Math.Min(maxX, _root.x));
             float y = Math.Max(0f, Math.Min(maxY, _root.y));
             _root.SetXY(x, y);
+        }
+
+        private readonly struct CompactLayout
+        {
+            public readonly float HeaderH;
+            public readonly float FooterH;
+            public readonly float PagerH;
+            public readonly float Pad;
+            public readonly float RowH;
+            public readonly float RowGap;
+            public readonly float MaxListHeight;
+
+            public CompactLayout(float headerH, float footerH, float pagerH, float pad, float rowH, float rowGap, float maxListHeight)
+            {
+                HeaderH = headerH;
+                FooterH = footerH;
+                PagerH = pagerH;
+                Pad = pad;
+                RowH = rowH;
+                RowGap = rowGap;
+                MaxListHeight = maxListHeight;
+            }
+        }
+
+        private static CompactLayout ComputeCompactLayout(float stageHeight, bool showPager)
+        {
+            const float NormalPagerH = 28f;
+            float normalPager = showPager ? NormalPagerH : 0f;
+            float normalMinTotal = HeaderHeight + Padding + (RowHeight + 4f + 4f) + normalPager + Padding + FooterHeight;
+            if (stageHeight >= normalMinTotal)
+            {
+                float maxList = Math.Max(RowHeight + 8f, stageHeight - (HeaderHeight + Padding * 2f + normalPager + FooterHeight));
+                return new CompactLayout(HeaderHeight, FooterHeight, normalPager, Padding, RowHeight, 4f, maxList);
+            }
+
+            // Ultra-short viewport compact layout (e.g. GRoot.height = 120):
+            // compress header/pager/footer/padding so 1 row + pager + footer ALWAYS stay inside [0, stageHeight].
+            float headerH = 24f;
+            float footerH = 26f;
+            float pagerH = showPager ? 22f : 0f;
+            float pad = 2f;
+            float rowGap = 2f;
+            float avail = stageHeight - (headerH + footerH + pagerH + pad * 2f);
+
+            if (avail < 24f)
+            {
+                headerH = 20f;
+                footerH = 22f;
+                pagerH = showPager ? 18f : 0f;
+                pad = 1f;
+                rowGap = 1f;
+                avail = stageHeight - (headerH + footerH + pagerH + pad * 2f);
+            }
+
+            float chromeTotal = headerH + footerH + pagerH + pad * 2f;
+            if (chromeTotal > stageHeight && stageHeight > 0f)
+            {
+                float scale = stageHeight / chromeTotal;
+                headerH *= scale;
+                footerH *= scale;
+                pagerH *= scale;
+                pad *= scale;
+                avail = 0f;
+            }
+
+            float maxListHeight = Math.Max(0f, avail);
+            float rowH = Math.Min(28f, Math.Max(18f, maxListHeight - rowGap));
+            return new CompactLayout(headerH, footerH, pagerH, pad, rowH, rowGap, maxListHeight);
+        }
+
+        private void ApplyChromeLayout(CompactLayout layout)
+        {
+            _headerBg.SetSize(PanelWidth, layout.HeaderH);
+            _headerBg.DrawRect(PanelWidth, layout.HeaderH, 0, Color.clear, HeaderBg);
+            _titleText.SetXY(10f, Math.Max(1f, (layout.HeaderH - 20f) * 0.5f));
+            float closeH = Math.Min(24f, Math.Max(16f, layout.HeaderH - 4f));
+            ResizeMiniButton(_closeBtn, 28f, closeH);
+            _closeBtn.SetXY(PanelWidth - 36f, Math.Max(1f, (layout.HeaderH - closeH) * 0.5f));
+
+            if (layout.PagerH > 0f)
+            {
+                _pagerHost.SetSize(PanelWidth, layout.PagerH);
+                float pBtnH = Math.Min(22f, Math.Max(14f, layout.PagerH - 4f));
+                float pBtnY = Math.Max(1f, (layout.PagerH - pBtnH) * 0.5f);
+                ResizeMiniButton(_prevBtn, 28f, pBtnH);
+                _prevBtn.SetXY(Padding, pBtnY);
+                ResizeMiniButton(_nextBtn, 28f, pBtnH);
+                _nextBtn.SetXY(PanelWidth - Padding - 28f, pBtnY);
+                _pageLabel.SetXY(44f, Math.Max(1f, (layout.PagerH - 18f) * 0.5f));
+                _pageLabel.SetSize(PanelWidth - 88f, Math.Min(18f, layout.PagerH - 2f));
+            }
+
+            _footerHost.SetSize(PanelWidth, layout.FooterH);
+            _footerBg.SetSize(PanelWidth, layout.FooterH);
+            _footerBg.DrawRect(PanelWidth, layout.FooterH, 0, Color.clear, HeaderBg);
+            float fBtnH = Math.Min(24f, Math.Max(16f, layout.FooterH - 4f));
+            float fBtnY = Math.Max(1f, (layout.FooterH - fBtnH) * 0.5f);
+            ResizeMiniButton(_minusBtn, 26f, fBtnH);
+            _minusBtn.SetXY(10f, fBtnY);
+            _stepsLabel.SetXY(40f, Math.Max(1f, (layout.FooterH - 20f) * 0.5f));
+            _stepsLabel.SetSize(82f, Math.Min(22f, layout.FooterH - 2f));
+            ResizeMiniButton(_plusBtn, 26f, fBtnH);
+            _plusBtn.SetXY(126f, fBtnY);
+            ResizeMiniButton(_clearBtn, 76f, fBtnH);
+            _clearBtn.SetXY(PanelWidth - 86f, fBtnY);
         }
 
         private static int ComputeRowsPerPage(float stageHeight)
@@ -442,7 +587,8 @@ namespace MonsterPathPredictor.Runtime
             PredictorSettings settings,
             int pageIndex,
             int totalPages,
-            int rowsPerPage)
+            int rowsPerPage,
+            float stageHeight)
         {
             var sb = new System.Text.StringBuilder(160);
             sb.Append(selectedId).Append('|')
@@ -450,7 +596,8 @@ namespace MonsterPathPredictor.Runtime
               .Append(settings.PickerHotkey).Append('|')
               .Append(settings.AllowNonAggressiveMonsters ? '1' : '0')
               .Append(settings.ClosePickerOnSelect ? '1' : '0').Append('|')
-              .Append(pageIndex).Append('/').Append(totalPages).Append(':').Append(rowsPerPage).Append('|');
+              .Append(pageIndex).Append('/').Append(totalPages).Append(':').Append(rowsPerPage)
+              .Append('@').Append((int)Math.Round(stageHeight)).Append('|');
             if (visibleMonsters != null)
             {
                 for (int i = 0; i < visibleMonsters.Count; i++)
@@ -481,10 +628,17 @@ namespace MonsterPathPredictor.Runtime
             _panelBg = null;
             _headerBg = null;
             _titleText = null;
+            _closeBtn = null;
             _listHost = null;
             _pagerHost = null;
+            _prevBtn = null;
+            _nextBtn = null;
             _pageLabel = null;
             _footerHost = null;
+            _footerBg = null;
+            _minusBtn = null;
+            _plusBtn = null;
+            _clearBtn = null;
             _stepsLabel = null;
             _emptyText = null;
         }

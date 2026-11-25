@@ -350,7 +350,7 @@ namespace MonsterPathPredictor.ReplayCertifier
             if (limit > 0 && replayIds.Count > limit) replayIds = replayIds.Take(limit).ToList();
 
             if (!string.IsNullOrWhiteSpace(cacheDir) &&
-                HasCacheInputPathConflict(replayIds, cacheDir, corpusFile, mapFiles, out string cacheConflictErr))
+                HasCachePathConflict(replayIds, cacheDir, corpusFile, mapFiles, jsonOut, mdOut, out string cacheConflictErr))
             {
                 Console.Error.WriteLine(cacheConflictErr);
                 return 1;
@@ -367,6 +367,12 @@ namespace MonsterPathPredictor.ReplayCertifier
             var perReplay = new ConcurrentBag<CertificationSummary>();
             var cacheSeenSha = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
             var cacheSeenVerifiedId = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
+            if (saveCache && !string.IsNullOrWhiteSpace(cacheDir) && Directory.Exists(cacheDir))
+            {
+                // Pre-register identity of all healthy existing cache files outside the active --corpus/--limit
+                // subset so --save-cache never publishes a duplicate copy of an already-cached replay on disk.
+                PreregisterExternalCacheIdentity(cacheDir, replayIds, decoder, cacheSeenSha, cacheSeenVerifiedId);
+            }
             var recoveryQueue = new ConcurrentBag<(string Id, string SavePath, CertificationSummary CorruptLocal)>();
             int processed = 0, cacheHits = 0, streamed = 0;
 
@@ -519,44 +525,122 @@ namespace MonsterPathPredictor.ReplayCertifier
             IReadOnlyList<string> mapFiles,
             out string error)
         {
+            return HasCachePathConflict(replayIds, cacheDir, corpusFile, mapFiles, null, null, out error);
+        }
+
+        public static bool HasCachePathConflict(
+            IEnumerable<string> replayIds,
+            string cacheDir,
+            string corpusFile,
+            IReadOnlyList<string> mapFiles,
+            string jsonOut,
+            string mdOut,
+            out string error)
+        {
             error = null;
             if (string.IsNullOrWhiteSpace(cacheDir) || replayIds == null) return false;
-
-            var inputPaths = new List<string>();
-            if (!string.IsNullOrWhiteSpace(corpusFile)) inputPaths.Add(corpusFile);
-            if (mapFiles != null)
-            {
-                for (int i = 0; i < mapFiles.Count; i++)
-                {
-                    if (!string.IsNullOrWhiteSpace(mapFiles[i])) inputPaths.Add(mapFiles[i]);
-                }
-            }
-            if (inputPaths.Count == 0) return false;
 
             var cmp = (OperatingSystem.IsWindows() || OperatingSystem.IsMacOS())
                 ? StringComparer.OrdinalIgnoreCase
                 : StringComparer.Ordinal;
+
             var inputCanon = new HashSet<string>(cmp);
-            for (int i = 0; i < inputPaths.Count; i++)
+            if (!string.IsNullOrWhiteSpace(corpusFile))
             {
-                string canon = ReportWriter.ResolveCanonicalPath(inputPaths[i]);
+                string canon = ReportWriter.ResolveCanonicalPath(corpusFile);
                 if (!string.IsNullOrEmpty(canon)) inputCanon.Add(canon);
             }
+            if (mapFiles != null)
+            {
+                for (int i = 0; i < mapFiles.Count; i++)
+                {
+                    if (string.IsNullOrWhiteSpace(mapFiles[i])) continue;
+                    string canon = ReportWriter.ResolveCanonicalPath(mapFiles[i]);
+                    if (!string.IsNullOrEmpty(canon)) inputCanon.Add(canon);
+                }
+            }
 
-            foreach (string id in replayIds)
+            var outputCanon = new HashSet<string>(cmp);
+            if (!string.IsNullOrWhiteSpace(jsonOut))
+            {
+                string canon = ReportWriter.ResolveCanonicalPath(jsonOut);
+                if (!string.IsNullOrEmpty(canon)) outputCanon.Add(canon);
+            }
+            if (!string.IsNullOrWhiteSpace(mdOut))
+            {
+                string canon = ReportWriter.ResolveCanonicalPath(mdOut);
+                if (!string.IsNullOrEmpty(canon)) outputCanon.Add(canon);
+            }
+
+            if (inputCanon.Count == 0 && outputCanon.Count == 0) return false;
+
+            var allIds = new HashSet<string>(replayIds, StringComparer.Ordinal);
+            if (outputCanon.Count > 0 && Directory.Exists(cacheDir))
+            {
+                foreach (string extId in DiscoverCachedReplayIds(cacheDir))
+                {
+                    allIds.Add(extId);
+                }
+            }
+            var activeSet = new HashSet<string>(replayIds, StringComparer.Ordinal);
+
+            foreach (string id in allIds)
             {
                 string existing = ResolveCachedReplayPath(cacheDir, id);
                 string savePath = ResolveSaveCachePath(cacheDir, id, existing);
                 string canonExisting = ReportWriter.ResolveCanonicalPath(existing);
                 string canonSave = ReportWriter.ResolveCanonicalPath(savePath);
-                if ((!string.IsNullOrEmpty(canonExisting) && inputCanon.Contains(canonExisting)) ||
-                    (!string.IsNullOrEmpty(canonSave) && inputCanon.Contains(canonSave)))
+                if (activeSet.Contains(id) &&
+                    ((!string.IsNullOrEmpty(canonExisting) && inputCanon.Contains(canonExisting)) ||
+                     (!string.IsNullOrEmpty(canonSave) && inputCanon.Contains(canonSave))))
                 {
                     error = $"ERROR: Replay cache path for ID \"{id}\" conflicts with an input file (--corpus / --maps).";
                     return true;
                 }
+                if ((!string.IsNullOrEmpty(canonExisting) && outputCanon.Contains(canonExisting)) ||
+                    (!string.IsNullOrEmpty(canonSave) && outputCanon.Contains(canonSave)))
+                {
+                    error = $"ERROR: Report output (--json-out / --md-out) conflicts with replay cache path for ID \"{id}\".";
+                    return true;
+                }
             }
             return false;
+        }
+
+        public static void PreregisterExternalCacheIdentity(
+            string cacheDir,
+            IEnumerable<string> activeReplayIds,
+            IProtocolDecoder decoder,
+            ConcurrentDictionary<string, byte> cacheSeenSha,
+            ConcurrentDictionary<string, byte> cacheSeenVerifiedId)
+        {
+            if (string.IsNullOrWhiteSpace(cacheDir) || !Directory.Exists(cacheDir)) return;
+            var activeSet = activeReplayIds != null
+                ? new HashSet<string>(activeReplayIds, StringComparer.Ordinal)
+                : new HashSet<string>(StringComparer.Ordinal);
+
+            var existingIds = DiscoverCachedReplayIds(cacheDir);
+            for (int i = 0; i < existingIds.Count; i++)
+            {
+                string extId = existingIds[i];
+                if (activeSet.Contains(extId)) continue;
+                string extPath = ResolveCachedReplayPath(cacheDir, extId);
+                if (extPath == null) continue;
+                try
+                {
+                    byte[] bytes = File.ReadAllBytes(extPath);
+                    if (bytes == null || bytes.Length == 0) continue;
+                    if (!ReplayEvaluator.HasValidFrameStream(bytes, decoder, extId, out string extVerifiedId))
+                        continue;
+                    string sha = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes));
+                    cacheSeenSha.TryAdd(sha, 0);
+                    if (!string.IsNullOrEmpty(extVerifiedId))
+                    {
+                        cacheSeenVerifiedId.TryAdd(extVerifiedId, 0);
+                    }
+                }
+                catch { }
+            }
         }
 
         public static bool NeedsCacheRecovery(CertificationSummary s)
@@ -597,6 +681,8 @@ namespace MonsterPathPredictor.ReplayCertifier
         {
             bool receivedCorrupt = false;
             CertificationSummary lastCorruptEval = null;
+            byte[] bestMissingMapBytes = null;
+            CertificationSummary bestMissingMapEval = null;
 
             for (int u = 0; u < urls.Count; u++)
             {
@@ -613,10 +699,21 @@ namespace MonsterPathPredictor.ReplayCertifier
                         resp.EnsureSuccessStatusCode();
                         byte[] fetched = await resp.Content.ReadAsByteArrayAsync(ct);
                         var eval = evaluatePayload(fetched);
-                        if (ShouldAdoptRecoveryResult(eval))
+                        if (IsCacheableAndClean(eval))
                         {
                             onStreamedSuccess?.Invoke();
                             return (fetched, eval, false);
+                        }
+                        if (ShouldAdoptRecoveryResult(eval))
+                        {
+                            // Clean MissingMap diagnostic: retain as fallback diagnostic, but continue
+                            // trying remaining backup CDNs in case another mirror serves a certifiable layout.
+                            if (bestMissingMapEval == null)
+                            {
+                                bestMissingMapBytes = fetched;
+                                bestMissingMapEval = eval;
+                            }
+                            break;
                         }
                         receivedCorrupt = true;
                         lastCorruptEval = eval;
@@ -632,6 +729,13 @@ namespace MonsterPathPredictor.ReplayCertifier
                     }
                 }
             }
+
+            if (bestMissingMapEval != null)
+            {
+                onStreamedSuccess?.Invoke();
+                return (bestMissingMapBytes, bestMissingMapEval, false);
+            }
+
             return (null, lastCorruptEval, receivedCorrupt);
         }
 
@@ -689,13 +793,15 @@ namespace MonsterPathPredictor.ReplayCertifier
             var ordered = items
                 .Select((item, idx) => (item, idx))
                 .OrderBy(t => t.item?.RequestedReplayId ?? string.Empty, StringComparer.Ordinal)
-                .ThenBy(t => t.idx);
+                .ThenBy(t => t.idx)
+                .ToList();
 
+            // Pass 1: Process all verified PVE & SkippedNonPve items first to establish canonical
+            // SHA-256 and 1016.ReplayId identity sets independent of requested replay ID sort order.
+            var remaining = new List<CertificationSummary>();
             foreach (var (item, _) in ordered)
             {
                 if (item == null) continue;
-                // Deduplicate BOTH verified PVE AND SkippedNonPve replays by content SHA-256 and canonical 1016.ReplayId
-                // so repeated non-PVE payloads can never inflate ReplaysAttempted or dilute DownloadFailRatio.
                 if (item.ReplaysVerified > 0 || item.SkippedNonPve > 0)
                 {
                     bool dupSha = !string.IsNullOrEmpty(item.ContentSha256) && !seenSha.Add(item.ContentSha256);
@@ -710,9 +816,44 @@ namespace MonsterPathPredictor.ReplayCertifier
                         });
                         continue;
                     }
+                    total.MergeFrom(item);
                 }
-                total.MergeFrom(item);
+                else
+                {
+                    remaining.Add(item);
+                }
             }
+
+            // Pass 2: Merge remaining items (corrupt, download failed, missing map, parse error).
+            // If a corrupt/ID-mismatch item carries the exact SHA-256 or verified ReplayId of an already
+            // verified/non-PVE replay, preserve its TruncatedOrCorrupt defect AND record DuplicateReplays=1
+            // so the duplicate request cannot dilute DownloadFailRatio's unique denominator.
+            for (int i = 0; i < remaining.Count; i++)
+            {
+                var item = remaining[i];
+                bool matchesVerifiedIdentity =
+                    item.TruncatedOrCorrupt > 0 &&
+                    ((!string.IsNullOrEmpty(item.ContentSha256) && seenSha.Contains(item.ContentSha256)) ||
+                     (!string.IsNullOrEmpty(item.VerifiedReplayId) && seenVerifiedId.Contains(item.VerifiedReplayId)));
+
+                if (matchesVerifiedIdentity && item.DuplicateReplays == 0)
+                {
+                    total.MergeFrom(new CertificationSummary
+                    {
+                        ReplaysAttempted = item.ReplaysAttempted > 0 ? item.ReplaysAttempted : 1,
+                        TruncatedOrCorrupt = item.TruncatedOrCorrupt,
+                        DuplicateReplays = 1,
+                        MissingPredictions = item.MissingPredictions,
+                        OutOfSupportPredictions = item.OutOfSupportPredictions,
+                        IllegalMoveEdges = item.IllegalMoveEdges
+                    });
+                }
+                else
+                {
+                    total.MergeFrom(item);
+                }
+            }
+
             return total;
         }
 

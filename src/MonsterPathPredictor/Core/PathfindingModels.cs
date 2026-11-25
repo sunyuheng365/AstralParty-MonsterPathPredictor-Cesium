@@ -164,10 +164,21 @@ namespace MonsterPathPredictor.Core
 
         public bool IsPositiveSupport => ConditionalProbability > 0.0 || !double.IsNegativeInfinity(LogConditionalProbability);
 
-        public string FormatConditionalPercent()
+        /// <summary>
+        /// True when the parent fork has at least one other positive-support exit.
+        /// Prevents a dominant branch that rounds to 1.0 in IEEE-754 double (e.g. 2^54/(2^54+1))
+        /// from displaying "100%" alongside a sibling "&lt;0.1%" branch.
+        /// </summary>
+        public bool HasOtherPositiveExits { get; set; }
+
+        public string FormatConditionalPercent() => FormatConditionalPercent(HasOtherPositiveExits ? 2 : 1);
+
+        public string FormatConditionalPercent(int positiveExitCount)
         {
             if (ConditionalProbability <= 0.0 && !double.IsNegativeInfinity(LogConditionalProbability))
                 return "<0.1%";
+            if (ConditionalProbability >= 1.0 && positiveExitCount > 1)
+                return ">99.9%";
             return ProbabilityFormat.Percent(ConditionalProbability);
         }
 
@@ -183,6 +194,11 @@ namespace MonsterPathPredictor.Core
         public bool IsAfterCombat { get; set; }
         public ForkReasonKind ReasonKind { get; set; }
         public string SummaryLabel { get; set; } = string.Empty;
+        /// <summary>
+        /// True only when the engine mathematically proves all positive exits share exact equal weight
+        /// (e.g. exact 1/k uniform split or exact equal rational path-lot weights, never rounded near-ties).
+        /// </summary>
+        public bool IsExactUniformSplit { get; set; }
         public List<ForkExitPrediction> Exits { get; } = new List<ForkExitPrediction>();
 
         public bool HasMultipleBranches => Exits.Count > 1;

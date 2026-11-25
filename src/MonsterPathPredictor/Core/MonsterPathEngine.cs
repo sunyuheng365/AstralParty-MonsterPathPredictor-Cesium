@@ -42,6 +42,7 @@ namespace MonsterPathPredictor.Core
             public bool IsForkDecision;
             public ForkReasonKind Reason;
             public string SummaryLabel;
+            public bool IsExactUniformSplit;
         }
 
         private struct WalkStateKey : IEquatable<WalkStateKey>
@@ -436,6 +437,22 @@ namespace MonsterPathPredictor.Core
             return plan;
         }
 
+        /// <summary>
+        /// Context-aware fork check for a monster's first step, shared by the planner and ReplayCertifier.
+        /// Treats Lingling skill pushes with a verified incoming predecessor (<see cref="MonsterState.SkillMovePushFromLandId"/>)
+        /// as arriving along that directed edge so 2-exit directed splits deterministically follow Red &gt; Blue.
+        /// </summary>
+        public static bool IsForkForFirstStep(BoardGraph board, MonsterState monster)
+        {
+            if (board == null || monster == null) return false;
+            int cur = monster.CurrentLandId;
+            bool hasLinglingPushFrom = monster.SkillMoveKind == SkillMoveKind.LinglingPush &&
+                                       monster.SkillMovePushFromLandId >= 0;
+            int contextFrom = hasLinglingPushFrom ? monster.SkillMovePushFromLandId : monster.FromLandId;
+            bool arrivedFromEdge = monster.IsCurrentlyMovingMidTurn || monster.JustFoughtOnCurrentFork || hasLinglingPushFrom;
+            return board.IsForkForContext(cur, contextFrom, arrivedFromEdge);
+        }
+
         private static StepOutcome DecideFirstStep(
             BoardGraph board,
             MonsterState monster,
@@ -446,8 +463,7 @@ namespace MonsterPathPredictor.Core
             int cur = monster.CurrentLandId;
             int from = monster.FromLandId;
             var forward = board.GetForwardNeighbors(cur, from);
-            bool arrivedFromEdge = monster.IsCurrentlyMovingMidTurn || monster.JustFoughtOnCurrentFork;
-            bool isFork = board.IsForkForContext(cur, from, arrivedFromEdge);
+            bool isFork = IsForkForFirstStep(board, monster);
 
             // 0. Taunt override (嘲讽 — allows overriding facing / U-turning before combat at turn start or forks;
             //    matches DecideMidWalkStep so straight-road continuation past an unattackable taunter never diverges).
@@ -790,6 +806,12 @@ namespace MonsterPathPredictor.Core
             bool restrictToTopTargetOnly = monster != null && monster.RequiresCrimeTarget;
 
             double logRemainingProb = 0.0; // ln(1.0) = 0; stays finite even when Exp underflows < 4.9e-324
+            bool exactOk = true;
+            long remNum = 1, remDen = 1;
+            var exactNums = new long[forward.Count];
+            var exactDens = new long[forward.Count];
+            for (int i = 0; i < forward.Count; i++) exactDens[i] = 1;
+
             TrackedPlayer primaryTarget = null;
             int primaryDist = 0;
             bool usedMultiShortestPath = false;
@@ -803,6 +825,8 @@ namespace MonsterPathPredictor.Core
 
                 double logTotalLots = double.NegativeInfinity;
                 double logUTurnLots = double.NegativeInfinity;
+                long exactTotalLots = 0;
+                long exactUTurnLots = 0;
                 int forwardLotExits = 0;
 
                 for (int j = 0; j < allNeighbors.Count; j++)
@@ -817,6 +841,22 @@ namespace MonsterPathPredictor.Core
                         logUTurnLots = BoardGraph.LogAddExp(logUTurnLots, logC);
                     else
                         forwardLotExits++;
+
+                    if (exactOk)
+                    {
+                        if (!TryExactLongFromDouble(field.GetPathCount(nb), out long cL) || cL <= 0 || exactTotalLots > long.MaxValue - cL)
+                        {
+                            exactOk = false;
+                        }
+                        else
+                        {
+                            exactTotalLots += cL;
+                            if (incomingIsNeighbor && nb == incomingLandId)
+                            {
+                                exactUTurnLots += cL;
+                            }
+                        }
+                    }
                 }
 
                 if (double.IsNegativeInfinity(logTotalLots)) continue;
@@ -841,12 +881,35 @@ namespace MonsterPathPredictor.Core
                         if (double.IsNegativeInfinity(logC)) continue;
                         double logContrib = logRemainingProb + (logC - logTotalLots);
                         exitLogProbs[fwd] = BoardGraph.LogAddExp(exitLogProbs[fwd], logContrib);
+
+                        if (exactOk)
+                        {
+                            if (!TryExactLongFromDouble(field.GetPathCount(fwd), out long cL) || cL <= 0 ||
+                                !TryMulRational(remNum, remDen, cL, exactTotalLots, out long addN, out long addD) ||
+                                !TryAddRational(exactNums[j], exactDens[j], addN, addD, out exactNums[j], out exactDens[j]))
+                            {
+                                exactOk = false;
+                            }
+                        }
                     }
                 }
 
                 logRemainingProb = double.IsNegativeInfinity(logUTurnLots)
                     ? double.NegativeInfinity
                     : logRemainingProb + (logUTurnLots - logTotalLots);
+
+                if (exactOk)
+                {
+                    if (exactUTurnLots == 0)
+                    {
+                        remNum = 0;
+                        remDen = 1;
+                    }
+                    else if (!TryMulRational(remNum, remDen, exactUTurnLots, exactTotalLots, out remNum, out remDen))
+                    {
+                        exactOk = false;
+                    }
+                }
             }
 
             bool usedUTurnFallback = false;
@@ -858,6 +921,14 @@ namespace MonsterPathPredictor.Core
                 {
                     int fwd = forward[i];
                     exitLogProbs[fwd] = BoardGraph.LogAddExp(exitLogProbs[fwd], logShare);
+                    if (exactOk && remNum > 0)
+                    {
+                        if (!TryMulRational(remNum, remDen, 1, forward.Count, out long shareN, out long shareD) ||
+                            !TryAddRational(exactNums[i], exactDens[i], shareN, shareD, out exactNums[i], out exactDens[i]))
+                        {
+                            exactOk = false;
+                        }
+                    }
                 }
             }
 
@@ -868,7 +939,35 @@ namespace MonsterPathPredictor.Core
                 double logP = exitLogProbs[fwd];
                 if (!double.IsNegativeInfinity(logP))
                 {
-                    transitions.Add(new StepTransition(fwd, Math.Min(1.0, Math.Exp(logP)), logP));
+                    double prob = exactOk && exactNums[i] > 0 && exactDens[i] > 0
+                        ? Math.Min(1.0, (double)exactNums[i] / exactDens[i])
+                        : Math.Min(1.0, Math.Exp(logP));
+                    transitions.Add(new StepTransition(fwd, prob, logP));
+                }
+            }
+
+            bool isExactUniform = false;
+            if (transitions.Count >= 2)
+            {
+                if (primaryTarget == null && usedUTurnFallback)
+                {
+                    isExactUniform = true;
+                }
+                else if (exactOk)
+                {
+                    int exactPosCount = 0;
+                    bool allExactEqual = true;
+                    for (int i = 0; i < forward.Count; i++)
+                    {
+                        if (exactNums[i] <= 0) continue;
+                        exactPosCount++;
+                        if (exactNums[i] != 1 || exactDens[i] != transitions.Count)
+                        {
+                            allExactEqual = false;
+                            break;
+                        }
+                    }
+                    isExactUniform = allExactEqual && exactPosCount == transitions.Count;
                 }
             }
 
@@ -903,7 +1002,8 @@ namespace MonsterPathPredictor.Core
                 Transitions = transitions,
                 IsForkDecision = true,
                 Reason = reason,
-                SummaryLabel = label
+                SummaryLabel = label,
+                IsExactUniformSplit = isExactUniform
             };
         }
 
@@ -933,7 +1033,8 @@ namespace MonsterPathPredictor.Core
                     ArrivalProbability = arrivalProb,
                     IsAfterCombat = isAfterCombat,
                     ReasonKind = outcome.Reason,
-                    SummaryLabel = outcome.SummaryLabel
+                    SummaryLabel = outcome.SummaryLabel,
+                    IsExactUniformSplit = outcome.IsExactUniformSplit
                 };
 
                 for (int i = 0; i < outcome.Transitions.Count; i++)
@@ -949,6 +1050,7 @@ namespace MonsterPathPredictor.Core
                     });
                 }
 
+                UpdateExitPositiveFlags(pf.Exits);
                 forkMap[key] = pf;
                 return;
             }
@@ -1021,6 +1123,12 @@ namespace MonsterPathPredictor.Core
                 });
             }
 
+            pf.IsExactUniformSplit = pf.IsExactUniformSplit &&
+                                     outcome.IsExactUniformSplit &&
+                                     updatedExitIds.Count == pf.Exits.Count &&
+                                     outcome.Transitions.Count == pf.Exits.Count;
+            UpdateExitPositiveFlags(pf.Exits);
+
             if (outcome.Reason != pf.ReasonKind || !string.Equals(outcome.SummaryLabel, pf.SummaryLabel, StringComparison.Ordinal))
             {
                 if (outcome.Reason != pf.ReasonKind)
@@ -1087,24 +1195,39 @@ namespace MonsterPathPredictor.Core
             if (dist == int.MaxValue || dist <= 0) return false;
 
             var all = board.GetValidNeighbors(curLandId);
-            var bestExits = new List<(int NextLandId, double LogC)>();
+            var bestExits = new List<(int NextLandId, double LogC, long ExactC)>();
             double logTotal = double.NegativeInfinity;
+            bool exactAllEqual = true;
+            long firstExactC = -1;
             for (int i = 0; i < all.Count; i++)
             {
                 int nb = all[i];
                 if (field.GetDistance(nb) != dist - 1) continue;
                 double logC = field.GetLogPathCount(nb);
                 if (double.IsNegativeInfinity(logC)) continue;
-                bestExits.Add((nb, logC));
+                long exactC = -1;
+                if (TryExactLongFromDouble(field.GetPathCount(nb), out long cL) && cL > 0)
+                {
+                    exactC = cL;
+                    if (firstExactC < 0) firstExactC = cL;
+                    else if (cL != firstExactC) exactAllEqual = false;
+                }
+                else
+                {
+                    exactAllEqual = false;
+                }
+                bestExits.Add((nb, logC, exactC));
                 logTotal = BoardGraph.LogAddExp(logTotal, logC);
             }
             if (bestExits.Count == 0 || double.IsNegativeInfinity(logTotal)) return false;
 
+            bool isExactUniform = bestExits.Count >= 2 && exactAllEqual && firstExactC > 0;
             var transitions = new List<StepTransition>(bestExits.Count);
             for (int i = 0; i < bestExits.Count; i++)
             {
                 double logP = bestExits[i].LogC - logTotal;
-                transitions.Add(new StepTransition(bestExits[i].NextLandId, Math.Min(1.0, Math.Exp(logP)), logP));
+                double prob = isExactUniform ? (1.0 / bestExits.Count) : Math.Min(1.0, Math.Exp(logP));
+                transitions.Add(new StepTransition(bestExits[i].NextLandId, prob, logP));
             }
             transitions.Sort((a, b) => b.LogProb.CompareTo(a.LogProb));
 
@@ -1113,7 +1236,8 @@ namespace MonsterPathPredictor.Core
                 Transitions = transitions,
                 IsForkDecision = isForkDecision,
                 Reason = ForkReasonKind.TauntChase,
-                SummaryLabel = "嘲讽·追" + target.SeatTag + "·距" + dist
+                SummaryLabel = "嘲讽·追" + target.SeatTag + "·距" + dist,
+                IsExactUniformSplit = isExactUniform
             };
             return true;
         }
@@ -1221,24 +1345,39 @@ namespace MonsterPathPredictor.Core
             if (bestTarget == null || bestField == null) return false;
 
             var all = board.GetValidNeighbors(curLandId);
-            var bestExits = new List<(int NextLandId, double LogC)>();
+            var bestExits = new List<(int NextLandId, double LogC, long ExactC)>();
             double logTotal = double.NegativeInfinity;
+            bool exactAllEqual = true;
+            long firstExactC = -1;
             for (int i = 0; i < all.Count; i++)
             {
                 int nb = all[i];
                 if (bestField.GetDistance(nb) != bestDist - 1) continue;
                 double logC = bestField.GetLogPathCount(nb);
                 if (double.IsNegativeInfinity(logC)) continue;
-                bestExits.Add((nb, logC));
+                long exactC = -1;
+                if (TryExactLongFromDouble(bestField.GetPathCount(nb), out long cL) && cL > 0)
+                {
+                    exactC = cL;
+                    if (firstExactC < 0) firstExactC = cL;
+                    else if (cL != firstExactC) exactAllEqual = false;
+                }
+                else
+                {
+                    exactAllEqual = false;
+                }
+                bestExits.Add((nb, logC, exactC));
                 logTotal = BoardGraph.LogAddExp(logTotal, logC);
             }
             if (bestExits.Count == 0 || double.IsNegativeInfinity(logTotal)) return false;
 
+            bool isExactUniform = bestExits.Count >= 2 && exactAllEqual && firstExactC > 0;
             var transitions = new List<StepTransition>(bestExits.Count);
             for (int i = 0; i < bestExits.Count; i++)
             {
                 double logP = bestExits[i].LogC - logTotal;
-                transitions.Add(new StepTransition(bestExits[i].NextLandId, Math.Min(1.0, Math.Exp(logP)), logP));
+                double prob = isExactUniform ? (1.0 / bestExits.Count) : Math.Min(1.0, Math.Exp(logP));
+                transitions.Add(new StepTransition(bestExits[i].NextLandId, prob, logP));
             }
             transitions.Sort((a, b) => b.LogProb.CompareTo(a.LogProb));
 
@@ -1247,7 +1386,8 @@ namespace MonsterPathPredictor.Core
                 Transitions = transitions,
                 IsForkDecision = isForkDecision,
                 Reason = ForkReasonKind.MarkedTargetChase,
-                SummaryLabel = labelPrefix + "·" + bestTarget.SeatTag + "·距" + bestDist
+                SummaryLabel = labelPrefix + "·" + bestTarget.SeatTag + "·距" + bestDist,
+                IsExactUniformSplit = isExactUniform
             };
             return true;
         }
@@ -1437,8 +1577,90 @@ namespace MonsterPathPredictor.Core
                 Transitions = list,
                 IsForkDecision = true,
                 Reason = reason,
-                SummaryLabel = label
+                SummaryLabel = label,
+                IsExactUniformSplit = exits.Count >= 2
             };
+        }
+
+        private static void UpdateExitPositiveFlags(List<ForkExitPrediction> exits)
+        {
+            int positiveCount = 0;
+            for (int i = 0; i < exits.Count; i++)
+            {
+                if (exits[i].IsPositiveSupport) positiveCount++;
+            }
+            bool hasOthers = positiveCount > 1;
+            for (int i = 0; i < exits.Count; i++)
+            {
+                exits[i].HasOtherPositiveExits = hasOthers;
+            }
+        }
+
+        private const double MaxExactIntDouble = 9007199254740992.0; // 2^53
+
+        private static long Gcd(long a, long b)
+        {
+            if (a < 0) a = -a;
+            if (b < 0) b = -b;
+            while (b != 0)
+            {
+                long t = a % b;
+                a = b;
+                b = t;
+            }
+            return a == 0 ? 1 : a;
+        }
+
+        private static bool TryExactLongFromDouble(double value, out long exact)
+        {
+            exact = 0;
+            if (double.IsNaN(value) || double.IsInfinity(value) || value < 0.0 || value > MaxExactIntDouble)
+                return false;
+            double rounded = Math.Floor(value);
+            if (rounded != value) return false;
+            exact = (long)rounded;
+            return true;
+        }
+
+        private static bool TryMulChecked(long a, long b, out long prod)
+        {
+            prod = 0;
+            if (a == 0 || b == 0) return true;
+            if (a > long.MaxValue / b) return false;
+            prod = a * b;
+            return true;
+        }
+
+        private static bool TryMulRational(long n1, long d1, long n2, long d2, out long rn, out long rd)
+        {
+            rn = 0;
+            rd = 1;
+            if (n1 == 0 || n2 == 0) return true;
+            long g1 = Gcd(n1, d2);
+            long g2 = Gcd(n2, d1);
+            if (!TryMulChecked(n1 / g1, n2 / g2, out rn)) return false;
+            if (!TryMulChecked(d1 / g2, d2 / g1, out rd)) return false;
+            return true;
+        }
+
+        private static bool TryAddRational(long n1, long d1, long n2, long d2, out long rn, out long rd)
+        {
+            rn = 0;
+            rd = 1;
+            if (n1 == 0) { rn = n2; rd = d2; return true; }
+            if (n2 == 0) { rn = n1; rd = d1; return true; }
+            long g = Gcd(d1, d2);
+            long s1 = d1 / g;
+            long s2 = d2 / g;
+            if (!TryMulChecked(n1, s2, out long term1)) return false;
+            if (!TryMulChecked(n2, s1, out long term2)) return false;
+            if (term1 > long.MaxValue - term2) return false;
+            long sum = term1 + term2;
+            if (!TryMulChecked(s1, d2, out long den)) return false;
+            long gOut = Gcd(sum, den);
+            rn = sum / gOut;
+            rd = den / gOut;
+            return true;
         }
     }
 }

@@ -16,8 +16,10 @@ namespace MonsterPathPredictor.ReplayCertifier
             Dictionary<long, UnitSim> players,
             Dictionary<long, UnitSim> monsters,
             long curTurnActor,
-            CertificationSummary summary = null)
+            CertificationSummary summary,
+            out bool curActorLeftTile)
         {
+            curActorLeftTile = false;
             if (pendingMoveEffects == null || !pendingMoveEffects.TryGetValue(moverId, out var byTile)) return false;
             if (!byTile.TryGetValue(tileId, out var attrs)) return false;
             byTile.Remove(tileId);
@@ -26,7 +28,8 @@ namespace MonsterPathPredictor.ReplayCertifier
             {
                 // 1096 HeroSkillMoveEffectS2C pass-by effects (e.g., Forest thief aura 10701102)
                 // do NOT trigger the fork-interrupting steal pause (only 1040 UpdateHeroAttrS2C does).
-                ApplyAttr(attr, board, players, monsters, true, curTurnActor, summary);
+                ApplyAttr(attr, board, players, monsters, true, curTurnActor, summary, out bool left);
+                if (left) curActorLeftTile = true;
             }
             return true;
         }
@@ -53,10 +56,10 @@ namespace MonsterPathPredictor.ReplayCertifier
             {
                 int beforeNode = u.NodeId;
                 int hopsBefore = u.PendingDisplacementHops.Count;
-                bool consumed = ConsumePendingMoveEffects(moverId, u.NodeId, board, pendingMoveEffects, players, monsters, curTurnActor, summary);
+                bool consumed = ConsumePendingMoveEffects(moverId, u.NodeId, board, pendingMoveEffects, players, monsters, curTurnActor, summary, out bool curActorLeft);
                 if (!consumed) break;
 
-                if (u.NodeId != beforeNode && moverId == curTurnActor)
+                if ((curActorLeft || (u.NodeId != beforeNode && moverId == curTurnActor)))
                 {
                     foughtOnTile = false;
                     thiefStoleOnTile = false;
@@ -161,13 +164,11 @@ namespace MonsterPathPredictor.ReplayCertifier
             // Normal walking resumes in this frame: any older omitted displacement echoes are now superseded.
             mover.PendingDisplacementHops.Clear();
 
-            // If MoveS2C echoed a displacement landing (idx > 0) or begins at mover.NodeId, consume deferred 1096
-            // effects at mover.NodeId before advancing so split and merged frames execute identically.
-            if (idx > 0 || nodeIds[idx] == mover.NodeId)
-            {
-                if (nodeIds[idx] == mover.NodeId) idx++;
-                ConsumeAndSkipInlineDisplacements(mover, moverId, nodeIds, ref idx, board, pendingMoveEffects, players, monsters, curTurnActor, ref foughtOnTile, ref thiefStoleOnTile, summary);
-            }
+            // Skip optional start-tile repetition if MoveS2C begins at mover.NodeId, then UNCONDITIONALLY
+            // consume any deferred 1096 effects queued for mover.NodeId before walking so 1113 landing
+            // confirmations execute identically whether MoveS2C repeats the start tile ([2,4]) or omits it ([4]).
+            if (nodeIds[idx] == mover.NodeId) idx++;
+            ConsumeAndSkipInlineDisplacements(mover, moverId, nodeIds, ref idx, board, pendingMoveEffects, players, monsters, curTurnActor, ref foughtOnTile, ref thiefStoleOnTile, summary);
 
             while (idx < nodeIds.Length)
             {
@@ -254,7 +255,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                             pos = 2;
                             lastMatchedHop = h;
                         }
-                        else if (h == hops.Count - 1 && nodeIds.Length == 1 && nodeIds[0] == toN)
+                        else if (nodeIds.Length == 1 && nodeIds[0] == toN)
                         {
                             pos = 1;
                             lastMatchedHop = h;

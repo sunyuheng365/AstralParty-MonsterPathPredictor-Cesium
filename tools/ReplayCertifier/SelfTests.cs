@@ -62,6 +62,7 @@ namespace MonsterPathPredictor.ReplayCertifier
         public sealed class StubBuffSource { public int Id { get; set; } }
         public sealed class StubBuffInfo { public int BuffId { get; set; } public int Progress { get; set; } public StubBuffSource Source { get; set; } }
         public sealed class StubSnap { public long PlayerId { get; set; } public StubRoom Room { get; set; } }
+        public sealed class StubMonsterRefresh { public StubUnit Monster { get; set; } }
         public sealed class StubBattleUnit { public long PlayerId { get; set; } }
         public sealed class StubBattleInner { public StubBattleUnit Attacker { get; set; } public StubBattleUnit Defender { get; set; } }
         public sealed class StubBattle { public StubBattleInner Battle { get; set; } }
@@ -1421,10 +1422,11 @@ namespace MonsterPathPredictor.ReplayCertifier
             }
             var r47Full = RunDisp47a(new[] { new[] { 1, 2, 3 } });
             var r47Split = RunDisp47a(new[] { new[] { 1, 2 }, new[] { 2, 3 } });
+            var r47SingleNodeSplit = RunDisp47a(new[] { new[] { 2 }, new[] { 3 } });
             var r47Omit = RunDisp47a(new[] { new[] { 2, 3 } });
-            if (r47Full.IllegalMoveEdges != 0 || r47Split.IllegalMoveEdges != 0 || r47Omit.IllegalMoveEdges != 0)
+            if (r47Full.IllegalMoveEdges != 0 || r47Split.IllegalMoveEdges != 0 || r47SingleNodeSplit.IllegalMoveEdges != 0 || r47Omit.IllegalMoveEdges != 0)
             {
-                Console.Error.WriteLine($"SELF-TEST FAILED (Test 47a): Split/omitted displacement echoes flagged illegal edges (full={r47Full.IllegalMoveEdges}, split={r47Split.IllegalMoveEdges}, omit={r47Omit.IllegalMoveEdges}).");
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 47a): Split/single-node/omitted displacement echoes flagged illegal edges (full={r47Full.IllegalMoveEdges}, split={r47Split.IllegalMoveEdges}, single={r47SingleNodeSplit.IllegalMoveEdges}, omit={r47Omit.IllegalMoveEdges}).");
                 return 1;
             }
             var nodes47c = new List<string> { "{\"id\":0,\"neighbors\":[1]}", "{\"id\":1,\"neighbors\":[0]}" };
@@ -1611,6 +1613,7 @@ namespace MonsterPathPredictor.ReplayCertifier
 
             byte[] missingMapPayload50c = ConcatFrames(MakeFrame(1003, tokRun43c), MakeFrame(1113, tokSnapMiss43c), MakeFrame(1016, tokFin43c));
             int backupHits50c = 0;
+            CertificationSummary primaryEval50c = null;
             using (var c50c = new HttpClient(new StubHttpHandler(url =>
             {
                 if (url.Contains("cdn1")) return new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(missingMapPayload50c) };
@@ -1621,12 +1624,19 @@ namespace MonsterPathPredictor.ReplayCertifier
                 var (b50c, ev50c, corrupt50c) = Program.DownloadAndEvaluateFromUrlsAsync(
                     c50c,
                     new[] { "http://cdn1/1", "http://cdn2/1" },
-                    b => Program.SafeEvaluateReplay("1", b, b == missingMapPayload50c ? dec43c : dec37, forkCatalog),
+                    b =>
+                    {
+                        bool isPrimary = b.SequenceEqual(missingMapPayload50c);
+                        var ev = Program.SafeEvaluateReplay("1", b, isPrimary ? dec43c : dec37, forkCatalog);
+                        if (isPrimary) primaryEval50c = ev;
+                        return ev;
+                    },
                     null,
                     CancellationToken.None).GetAwaiter().GetResult();
-                if (backupHits50c == 0 || b50c == null || ev50c == null || ev50c.ReplaysVerified != 1 || ev50c.MissingMap != 0 || corrupt50c)
+                if (primaryEval50c == null || primaryEval50c.MissingMap != 1 || primaryEval50c.ParseErrors != 0 || primaryEval50c.TruncatedOrCorrupt != 0 ||
+                    backupHits50c == 0 || b50c == null || ev50c == null || ev50c.ReplaysVerified != 1 || ev50c.MissingMap != 0 || corrupt50c)
                 {
-                    Console.Error.WriteLine($"SELF-TEST FAILED (Test 50c): MissingMap on primary CDN blocked healthy backup CDN (backupHits={backupHits50c}, verified={ev50c?.ReplaysVerified}, miss={ev50c?.MissingMap}).");
+                    Console.Error.WriteLine($"SELF-TEST FAILED (Test 50c): MissingMap primary CDN check failed (primaryMiss={primaryEval50c?.MissingMap}, primaryErr={primaryEval50c?.ParseErrors}, backupHits={backupHits50c}, verified={ev50c?.ReplaysVerified}).");
                     return 1;
                 }
             }
@@ -1665,7 +1675,210 @@ namespace MonsterPathPredictor.ReplayCertifier
                 return 1;
             }
 
-            Console.WriteLine("ReplayCertifier self-tests PASSED (50/50).");
+            // Test 51 (Round 9 #1 & #5):
+            //   51a (#1): Out-of-board non-negative unit placement in 1003, 1113, and 1018 MUST increment IllegalMoveEdges!
+            //   51b (#5): Unregistered 5022 dice roller (PlayerId=999) MUST fail verification as TruncatedOrCorrupt!
+            var dec51a = new StubDecoder();
+            int run51a = dec51a.Register(new StubRunning { Room = new StubRoom { MapId = 82016, Players = new List<StubUnit> { new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 101, NodeId = 1 } } } } });
+            int snap51a = dec51a.Register(new StubSnap { PlayerId = 1, Room = new StubRoom { MapId = 82016, Players = new List<StubUnit> { new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 101, NodeId = 999 } } } } });
+            int fin51a = dec51a.Register(new StubFinish());
+            var r51Snap = ReplayEvaluator.EvaluateBytes("oob-1113", ConcatFrames(MakeFrame(1003, run51a), MakeFrame(1113, snap51a), MakeFrame(1016, fin51a)), dec51a, cat48b);
+            int run51Init = dec51a.Register(new StubRunning { Room = new StubRoom { MapId = 82016, Players = new List<StubUnit> { new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 101, NodeId = 999 } } } } });
+            var r51Init = ReplayEvaluator.EvaluateBytes("oob-1003", ConcatFrames(MakeFrame(1003, run51Init), MakeFrame(1016, fin51a)), dec51a, cat48b);
+            int ref51 = dec51a.Register(new StubMonsterRefresh { Monster = new StubUnit { Id = 888, Hero = new StubHero { HeroId = 1002, MonsterType = 11, NodeId = 999 } } });
+            var r51Ref = ReplayEvaluator.EvaluateBytes("oob-1018", ConcatFrames(MakeFrame(1003, run51a), MakeFrame(1018, ref51), MakeFrame(1016, fin51a)), dec51a, cat48b);
+            if (r51Snap.IllegalMoveEdges == 0 || r51Init.IllegalMoveEdges == 0 || r51Ref.IllegalMoveEdges == 0)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 51a): Out-of-board unit in 1003/1113/1018 bypassed IllegalMoveEdges ({r51Init.IllegalMoveEdges},{r51Snap.IllegalMoveEdges},{r51Ref.IllegalMoveEdges}).");
+                return 1;
+            }
+            var dec51b = new StubDecoder();
+            int run51b = dec51b.Register(new StubRunning { Room = new StubRoom { MapId = 82016, Monsters = new List<StubUnit> { new StubUnit { Id = 800, Hero = new StubHero { HeroId = 1002, MonsterType = 11, NodeId = 1 } } } } });
+            int roll51b = dec51b.Register(new StubThrowDice { PlayerId = 999 });
+            int mv51b = dec51b.Register(new StubMove { PlayerId = 800, NodeIds = new[] { 1, 2 } });
+            int fin51b = dec51b.Register(new StubFinish());
+            var r51b = ReplayEvaluator.EvaluateBytes("unk-dice", ConcatFrames(MakeFrame(1003, run51b), MakeFrame(5022, roll51b), MakeFrame(5028, mv51b), MakeFrame(1016, fin51b)), dec51b, cat50e);
+            if (r51b.TruncatedOrCorrupt != 1 || r51b.ReplaysVerified != 0)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 51b): Unregistered 5022 dice roller was accepted (corrupt={r51b.TruncatedOrCorrupt}, verified={r51b.ReplaysVerified}).");
+                return 1;
+            }
+
+            // Test 52 (Round 9 #4 & #6):
+            //   52a (#4): Deferred 1096 2->3 registered while at 1, confirmed at 2 by same-turn 1113, followed by 5028[2,4] OR 5028[4] (edge 3->4) -> BOTH Illegal=0!
+            //   52b (#6): Round 1 Place 1->2->3 (no echo), Round 2 1113 confirms unit at 3, then legal walk 3->1->2->4 via [1,2] + [4] -> Illegal=0!
+            CertificationSummary RunSnapDeferred52a(int[] moveNodes)
+            {
+                var d = new StubDecoder();
+                int r = d.Register(new StubRunning { Room = new StubRoom { MapId = 82016, Round = 1, Players = new List<StubUnit> { new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 101, NodeId = 1 } } } } });
+                int roll = d.Register(new StubThrowDice { PlayerId = 1 });
+                int sm = d.Register(new StubSkillMoveEffect { PlayerId = 1, EffectData = new Dictionary<int, StubMoveEffectBucket> { [2] = new StubMoveEffectBucket { Effects = new List<StubAttr> { new StubAttr { PlayerId = 1, EffectDatas = new List<StubEffect> { new StubEffect { PlayerId = 1, Place = new StubPlace { Place = new StubPlaceInner { NodeId = 3, BackNodeId = -1 } } } } } } } } });
+                int sn = d.Register(new StubSnap { PlayerId = 1, Room = new StubRoom { MapId = 82016, Round = 1, Players = new List<StubUnit> { new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 101, NodeId = 2 } } } } });
+                int mv = d.Register(new StubMove { PlayerId = 1, NodeIds = moveNodes });
+                int fin = d.Register(new StubFinish());
+                return ReplayEvaluator.EvaluateBytes("snap1096", ConcatFrames(MakeFrame(1003, r), MakeFrame(5022, roll), MakeFrame(1096, sm), MakeFrame(1113, sn), MakeFrame(5028, mv), MakeFrame(1016, fin)), d, cat48a);
+            }
+            var r52WithStart = RunSnapDeferred52a(new[] { 2, 4 });
+            var r52OmitStart = RunSnapDeferred52a(new[] { 4 });
+            if (r52WithStart.IllegalMoveEdges != 0 || r52OmitStart.IllegalMoveEdges != 0)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 52a): 1113-confirmed deferred 1096 diverged between [2,4] and [4] ({r52WithStart.IllegalMoveEdges},{r52OmitStart.IllegalMoveEdges}).");
+                return 1;
+            }
+            var cat52b = BuildTestCatalog(82016, "{\"id\":1,\"neighbors\":[2,3]},{\"id\":2,\"neighbors\":[1,4]},{\"id\":3,\"neighbors\":[1]},{\"id\":4,\"neighbors\":[2]}");
+            var dec52b = new StubDecoder();
+            int run52b = dec52b.Register(new StubRunning { Room = new StubRoom { MapId = 82016, Round = 1, Players = new List<StubUnit> { new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 101, NodeId = 1 } } } } });
+            int roll52b = dec52b.Register(new StubThrowDice { PlayerId = 1 });
+            int pl52_1 = dec52b.Register(new StubAttr { PlayerId = 1, EffectDatas = new List<StubEffect> { new StubEffect { PlayerId = 1, Place = new StubPlace { Place = new StubPlaceInner { NodeId = 2, BackNodeId = -1 } } } } });
+            int pl52_2 = dec52b.Register(new StubAttr { PlayerId = 1, EffectDatas = new List<StubEffect> { new StubEffect { PlayerId = 1, Place = new StubPlace { Place = new StubPlaceInner { NodeId = 3, BackNodeId = -1 } } } } });
+            int snap52b = dec52b.Register(new StubSnap { PlayerId = 1, Room = new StubRoom { MapId = 82016, Round = 2, Players = new List<StubUnit> { new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 101, NodeId = 3 } } } } });
+            int mv52_1 = dec52b.Register(new StubMove { PlayerId = 1, NodeIds = new[] { 1, 2 } });
+            int mv52_2 = dec52b.Register(new StubMove { PlayerId = 1, NodeIds = new[] { 4 } });
+            int fin52b = dec52b.Register(new StubFinish());
+            var r52b = ReplayEvaluator.EvaluateBytes("snap-newturn-hops",
+                ConcatFrames(MakeFrame(1003, run52b), MakeFrame(5022, roll52b), MakeFrame(1040, pl52_1), MakeFrame(1040, pl52_2), MakeFrame(1113, snap52b), MakeFrame(5028, mv52_1), MakeFrame(5028, mv52_2), MakeFrame(1016, fin52b)),
+                dec52b, cat52b);
+            if (r52b.ReplaysVerified != 1 || r52b.IllegalMoveEdges != 0)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 52b): Stale prior-turn hops leaked across new-round 1113 (illegal={r52b.IllegalMoveEdges}).");
+                return 1;
+            }
+
+            // Test 53 (Round 9 #7 & #8):
+            //   53a (#7): Single 1040 containing two ordinary Places (F->G then G->F) after combat on F MUST clear foughtOnTile!
+            //   53b (#8): 1047 starting on layout 0 tile 0, then switching to layout 1 via 1113 MUST NOT exclude marked P2 standing on layout 1 tile 0!
+            var dec53a = new StubDecoder();
+            var p1_53a = new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 101, NodeId = 3 } };
+            var p2_53a = new StubUnit { Id = 2, Slot = 1, Hero = new StubHero { HeroId = 102, NodeId = 1 } };
+            var m53a = new StubUnit { Id = 810, Hero = new StubHero { HeroId = 1002, MonsterType = 11, NodeId = 0, BackNodeId = -1, FrontNodeIds = new[] { 1 } } };
+            int run53a = dec53a.Register(new StubRunning { Room = new StubRoom { MapId = 82016, Round = 1, Players = new List<StubUnit> { p1_53a, p2_53a }, Monsters = new List<StubUnit> { m53a } } });
+            int roll53a = dec53a.Register(new StubThrowDice { PlayerId = 810 });
+            int mv1_53a = dec53a.Register(new StubMove { PlayerId = 810, NodeIds = new[] { 0, 1 } });
+            int btl53a = dec53a.Register(new StubBattle { Battle = new StubBattleInner { Attacker = new StubBattleUnit { PlayerId = 810 }, Defender = new StubBattleUnit { PlayerId = 2 } } });
+            int bounce53a = dec53a.Register(new StubAttr
+            {
+                PlayerId = 1,
+                EffectDatas = new List<StubEffect>
+                {
+                    new StubEffect { PlayerId = 810, Place = new StubPlace { Place = new StubPlaceInner { NodeId = 2, BackNodeId = -1 } } },
+                    new StubEffect { PlayerId = 810, Place = new StubPlace { Place = new StubPlaceInner { NodeId = 1, BackNodeId = 0, FrontNodeIds = new[] { 2, 3 } } } }
+                }
+            });
+            int mv2_53a = dec53a.Register(new StubMove { PlayerId = 810, NodeIds = new[] { 1, 3 } });
+            int fin53a = dec53a.Register(new StubFinish());
+            var r53a = ReplayEvaluator.EvaluateBytes("bounce-f-g-f",
+                ConcatFrames(MakeFrame(1003, run53a), MakeFrame(5022, roll53a), MakeFrame(5028, mv1_53a), MakeFrame(1007, btl53a), MakeFrame(1040, bounce53a), MakeFrame(5028, mv2_53a), MakeFrame(1016, fin53a)),
+                dec53a, cat49a);
+            if (r53a.Buckets["PostNormalCombatMidFork"].DetHits != 1 || r53a.Buckets["PostCombatFork"].Total != 0)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 53a): Single-frame F->G->F Place resurrected PostCombatFork (post={r53a.Buckets["PostCombatFork"].Total}, mid={r53a.Buckets["PostNormalCombatMidFork"].DetHits}).");
+                return 1;
+            }
+            var cat53b = new BoardCatalog();
+            string json53b = "{\"maps\":[{\"id\":82016,\"name\":\"DuckLayout\",\"layouts\":{" +
+                "\"0\":{\"nodes\":[{\"id\":0,\"neighbors\":[1]},{\"id\":1,\"neighbors\":[0]}]}," +
+                "\"1\":{\"nodes\":[{\"id\":1,\"neighbors\":[2]},{\"id\":2,\"neighbors\":[3,0,1]},{\"id\":3,\"neighbors\":[2]},{\"id\":0,\"neighbors\":[2]}]}" +
+                "}}]}";
+            string tmpMap53b = Path.Combine(Path.GetTempPath(), "certifier-map53b-" + Guid.NewGuid().ToString("N") + ".json");
+            try { File.WriteAllText(tmpMap53b, json53b); cat53b.LoadJsonFile(tmpMap53b); }
+            finally { try { if (File.Exists(tmpMap53b)) File.Delete(tmpMap53b); } catch { } }
+            var dec53b = new StubDecoder();
+            var m53b0 = new StubUnit { Id = 811, Hero = new StubHero { HeroId = 1047, MonsterType = 11, NodeId = 0, BackNodeId = -1, FrontNodeIds = new[] { 1 } } };
+            int run53b = dec53b.Register(new StubRunning { Room = new StubRoom { MapId = 82016, MapIndex = 0, Round = 1, Monsters = new List<StubUnit> { m53b0 } } });
+            int roll53b = dec53b.Register(new StubThrowDice { PlayerId = 811 });
+            int mv1_53b = dec53b.Register(new StubMove { PlayerId = 811, NodeIds = new[] { 0, 1 } });
+            var p1_53b = new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 101, NodeId = 3 } };
+            var p2_53b = new StubUnit { Id = 2, Slot = 1, Hero = new StubHero { HeroId = 102, NodeId = 0, Buffs = new Dictionary<int, object> { [10470101] = new StubBuffInfo { BuffId = 10470101 } } } };
+            var m53b1 = new StubUnit { Id = 811, Hero = new StubHero { HeroId = 1047, MonsterType = 11, NodeId = 1, BackNodeId = -1, FrontNodeIds = new[] { 2 } } };
+            int snap53b = dec53b.Register(new StubSnap { PlayerId = 811, Room = new StubRoom { MapId = 82016, MapIndex = 1, Round = 1, Players = new List<StubUnit> { p1_53b, p2_53b }, Monsters = new List<StubUnit> { m53b1 } } });
+            int mv2_53b = dec53b.Register(new StubMove { PlayerId = 811, NodeIds = new[] { 1, 2, 0 } });
+            int fin53b = dec53b.Register(new StubFinish());
+            var r53b = ReplayEvaluator.EvaluateBytes("layout-switch-turnstart",
+                ConcatFrames(MakeFrame(1003, run53b), MakeFrame(5022, roll53b), MakeFrame(5028, mv1_53b), MakeFrame(1113, snap53b), MakeFrame(5028, mv2_53b), MakeFrame(1016, fin53b)),
+                dec53b, cat53b);
+            if (r53b.Buckets["MidWalkFork"].DetTotal != 1 || r53b.Buckets["MidWalkFork"].DetHits != 1)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 53b): Old-layout turnStartLandId=0 excluded marked target on new layout tile 0 (hits={r53b.Buckets["MidWalkFork"].DetHits}/{r53b.Buckets["MidWalkFork"].DetTotal}).");
+                return 1;
+            }
+
+            // Test 54 (Round 9 #11 & #12):
+            //   54a (#11): Non-PVE ID mismatch preserves VerifiedReplayId so Pass 2 deduplication excludes it from DownloadFailRatio!
+            //   54b (#12): Failed cache publish on target A (blocked by directory) does NOT lock dedup identity; target B succeeds!
+            var dec54a = new StubDecoder();
+            int npRun54a = dec54a.Register(new StubRunning { Room = new StubRoom { MapId = 10001 } });
+            int npFin54a = dec54a.Register(new StubFinish { ReplayId = "1000000010" });
+            int npAttr54a = dec54a.Register(new StubAttr { PlayerId = 1 });
+            byte[] npBytesA = ConcatFrames(MakeFrame(1003, npRun54a), MakeFrame(1016, npFin54a));
+            byte[] npBytesB = ConcatFrames(MakeFrame(1003, npRun54a), MakeFrame(1016, npFin54a), MakeFrame(1040, npAttr54a));
+            var sum54A = ReplayEvaluator.EvaluateBytes("1000000010", npBytesA, dec54a, forkCatalog);
+            var sum54B = ReplayEvaluator.EvaluateBytes("1000000011", npBytesB, dec54a, forkCatalog);
+            var sum54C = new CertificationSummary { ReplaysAttempted = 1, RequestedReplayId = "1000000012", DownloadFailed = 1 };
+            var merged54a = Program.DeduplicateAndMerge(new[] { sum54C, sum54B, sum54A });
+            var eval54a = ReportWriter.EvaluateGates(merged54a, t);
+            if (sum54B.VerifiedReplayId != "1000000010" || merged54a.DuplicateReplays != 1 || eval54a.UniqueAttempted != 2 || Math.Abs(eval54a.DownloadFailRatio - 0.5) > 1e-9)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 54a): Non-PVE ID mismatch lost VerifiedReplayId ({sum54B.VerifiedReplayId}, dup={merged54a.DuplicateReplays}, ratio={eval54a.DownloadFailRatio}).");
+                return 1;
+            }
+            string tmpRoot54 = Path.Combine(Path.GetTempPath(), "certifier-r54-" + Guid.NewGuid().ToString("N"));
+            try
+            {
+                Directory.CreateDirectory(tmpRoot54);
+                string blockedPath = Path.Combine(tmpRoot54, "1000000020");
+                Directory.CreateDirectory(blockedPath); // occupies target path as directory so atomic write to blockedPath fails
+                string goodPath = Path.Combine(tmpRoot54, "1000000021");
+                var seenSha54 = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
+                var seenId54 = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
+                var pubLock54 = new object();
+                var cleanLegacy54 = new CertificationSummary { ReplaysAttempted = 1, ReplaysVerified = 1, ContentSha256 = "LEGACY_SHA_54" };
+                bool pubA = Program.TryPublishCacheIfUnique(blockedPath, tmpRoot54, true, valid37, cleanLegacy54, seenSha54, seenId54, pubLock54);
+                bool pubB = Program.TryPublishCacheIfUnique(goodPath, tmpRoot54, true, valid37, cleanLegacy54, seenSha54, seenId54, pubLock54);
+                if (pubA || !pubB || !File.Exists(goodPath))
+                {
+                    Console.Error.WriteLine($"SELF-TEST FAILED (Test 54b): Failed cache write locked dedup identity (pubA={pubA}, pubB={pubB}, exists={File.Exists(goodPath)}).");
+                    return 1;
+                }
+            }
+            finally { try { if (Directory.Exists(tmpRoot54)) Directory.Delete(tmpRoot54, true); } catch { } }
+
+            // Test 55 (Round 9 #3 & #21):
+            //   55a (#3): TryWriteCacheAtomic / IsCacheTargetInsideCacheRoot refuse escaping cache root!
+            //   55b (#21): Parent/child --json-out="report" & --md-out="report/result.md" MUST be rejected BEFORE creating either file!
+            string tmpRoot55 = Path.Combine(Path.GetTempPath(), "certifier-r55-" + Guid.NewGuid().ToString("N"));
+            try
+            {
+                string cache55 = Path.Combine(tmpRoot55, "cache");
+                string outside55 = Path.Combine(tmpRoot55, "outside.bin");
+                Directory.CreateDirectory(cache55);
+                File.WriteAllText(outside55, "KEEP_ME");
+                if (Program.IsCacheTargetInsideCacheRoot(outside55, cache55) ||
+                    Program.TryWriteCacheAtomic(outside55, valid37, cache55) ||
+                    File.ReadAllText(outside55) != "KEEP_ME")
+                {
+                    Console.Error.WriteLine("SELF-TEST FAILED (Test 55a): Cache atomic write escaped cache root.");
+                    return 1;
+                }
+                string parentOut55 = Path.Combine(tmpRoot55, "report");
+                string childOut55 = Path.Combine(parentOut55, "result.md");
+                if (!ReportWriter.HaveConflictingOutputPaths(parentOut55, childOut55) ||
+                    Program.TryParseArgs(new[] { "--protocol-dir", "p", "--maps", "m.json", "--cache-dir", "c", "--json-out", parentOut55, "--md-out", childOut55 }, out _, out _))
+                {
+                    Console.Error.WriteLine("SELF-TEST FAILED (Test 55b): Parent/child JSON and MD output paths were accepted.");
+                    return 1;
+                }
+                bool threw55b = false;
+                try { ReportWriter.PrintAndExport(infSum44, forkCatalog, 0.1, t, parentOut55, childOut55); }
+                catch (ArgumentException) { threw55b = true; }
+                if (!threw55b || File.Exists(parentOut55) || File.Exists(childOut55))
+                {
+                    Console.Error.WriteLine("SELF-TEST FAILED (Test 55b): PrintAndExport partially wrote conflicting parent/child report paths.");
+                    return 1;
+                }
+            }
+            finally { try { if (Directory.Exists(tmpRoot55)) Directory.Delete(tmpRoot55, true); } catch { } }
+
+            Console.WriteLine("ReplayCertifier self-tests PASSED (55/55).");
             return 0;
         }
     }

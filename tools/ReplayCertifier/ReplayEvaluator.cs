@@ -86,6 +86,16 @@ namespace MonsterPathPredictor.ReplayCertifier
                 return -1;
             }
 
+            void ClearTileScopedTurnFlags()
+            {
+                foughtOnTile = false;
+                foughtTile = -1;
+                foughtLayoutIdx = -1;
+                thiefStoleOnTile = false;
+                thiefStoleTile = -1;
+                thiefStoleLayoutIdx = -1;
+            }
+
             void SyncTileScopedTurnFlags()
             {
                 int actorTile = GetActorTile(curTurnActor);
@@ -103,7 +113,15 @@ namespace MonsterPathPredictor.ReplayCertifier
                 }
             }
 
-            void SyncRoom(dynamic room, bool preservePendingEffects = false)
+            void ValidateUnitPlacement(UnitSim u)
+            {
+                if (u != null && u.NodeId >= 0 && board != null && !board.Contains(u.NodeId))
+                {
+                    summary.IllegalMoveEdges++;
+                }
+            }
+
+            void SyncRoom(dynamic room, bool preservePendingEffects = false, bool preserveDisplacementHops = false)
             {
                 int snapMapId = (int)room.MapId;
                 if (mapId != 0 && snapMapId != 0 && snapMapId != mapId)
@@ -117,22 +135,35 @@ namespace MonsterPathPredictor.ReplayCertifier
                 {
                     if (catalog.TryGetGraph(mapId, newIdx, out var nb)) { mapIndex = newIdx; board = nb; }
                     else { unknownLayout = true; return; }
+                    // Invalidate old-layout turnStartLandId/startedOnFork immediately on layout switch
+                    // so a same-numbered tile on the new layout is never excluded as the old turn start.
+                    turnStartLandId = -1;
+                    startedOnFork = false;
                 }
-                bool preserveSameLayout = preservePendingEffects && !layoutChanged;
-                if (!preserveSameLayout) pendingMoveEffects.Clear();
+                bool preserveSameLayoutEffects = preservePendingEffects && !layoutChanged;
+                bool preserveSameLayoutHops = preserveDisplacementHops && !layoutChanged;
+                if (!preserveSameLayoutEffects) pendingMoveEffects.Clear();
                 var prevPlayerDisp = new Dictionary<long, List<(int From, int To)>>();
                 var prevMonsterState = new Dictionary<long, (List<(int From, int To)> Hops, SkillMoveKind Kind, int Land, int PushDir, int PushFrom)>();
                 if (!layoutChanged)
                 {
-                    foreach (var kv in players)
+                    // PendingDisplacementHops is turn-scoped (discarded on turn/round switches or layout switches),
+                    // whereas PendingSkillMove* persists into a pushed monster's upcoming turn on the same layout.
+                    if (preserveSameLayoutHops)
                     {
-                        if (kv.Value.PendingDisplacementHops.Count > 0)
-                            prevPlayerDisp[kv.Key] = new List<(int, int)>(kv.Value.PendingDisplacementHops);
+                        foreach (var kv in players)
+                        {
+                            if (kv.Value.PendingDisplacementHops.Count > 0)
+                                prevPlayerDisp[kv.Key] = new List<(int, int)>(kv.Value.PendingDisplacementHops);
+                        }
                     }
                     foreach (var kv in monsters)
                     {
-                        if (kv.Value.PendingDisplacementHops.Count > 0 || kv.Value.PendingSkillMoveKind != SkillMoveKind.None)
-                            prevMonsterState[kv.Key] = (new List<(int, int)>(kv.Value.PendingDisplacementHops),
+                        var savedHops = (preserveSameLayoutHops && kv.Value.PendingDisplacementHops.Count > 0)
+                            ? new List<(int, int)>(kv.Value.PendingDisplacementHops)
+                            : new List<(int, int)>();
+                        if (savedHops.Count > 0 || kv.Value.PendingSkillMoveKind != SkillMoveKind.None)
+                            prevMonsterState[kv.Key] = (savedHops,
                                 kv.Value.PendingSkillMoveKind, kv.Value.PendingSkillMoveLandId,
                                 kv.Value.PendingSkillMovePushDirId, kv.Value.PendingSkillMovePushFromId);
                     }
@@ -144,6 +175,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                         if (p?.Hero != null)
                         {
                             UnitSim u = BuildUnit(p, false);
+                            ValidateUnitPlacement(u);
                             if (prevPlayerDisp.TryGetValue(u.Id, out var hops) && hops.Count > 0 && u.NodeId == hops[^1].To)
                             {
                                 u.PendingDisplacementHops.AddRange(hops);
@@ -155,6 +187,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                         if (m?.Hero != null)
                         {
                             UnitSim u = BuildUnit(m, true);
+                            ValidateUnitPlacement(u);
                             if (prevMonsterState.TryGetValue(u.Id, out var ms))
                             {
                                 if (ms.Hops.Count > 0 && u.NodeId == ms.Hops[^1].To)
@@ -198,6 +231,9 @@ namespace MonsterPathPredictor.ReplayCertifier
                     {
                         if (!HasValidFrameStream(bytes, decoder, replayId, out string nonPveReplayId))
                         {
+                            // Preserve parsed canonical 1016.ReplayId even on ID mismatch so Pass 2
+                            // deduplication can exclude duplicate requests from DownloadFailRatio denominator.
+                            summary.VerifiedReplayId = nonPveReplayId;
                             decodeFailed = true;
                             break;
                         }
@@ -273,7 +309,11 @@ namespace MonsterPathPredictor.ReplayCertifier
                     int snapRound = (int)snap.Room.Round;
                     long snapActor = (long)snap.PlayerId;
                     bool sameOngoingTurn = (curTurnActor != 0 && snapActor == curTurnActor && snapRound == curRound);
-                    SyncRoom(snap.Room, preservePendingEffects: sameOngoingTurn);
+                    // Preserve displacement hops only if we have NOT switched to a different turn/round
+                    // (allows an initial 1113 snapshot in the same round when curTurnActor was still unset after 1003,
+                    // while clearing stale prior-turn hops whenever actor or round advances).
+                    bool isTurnSwitch = (curTurnActor != 0 && snapActor != curTurnActor) || (snapRound != curRound);
+                    SyncRoom(snap.Room, preservePendingEffects: sameOngoingTurn, preserveDisplacementHops: !isTurnSwitch);
                     if (unknownLayout || decodeFailed) break;
                     curRound = snapRound;
                     curTurnActor = snapActor;
@@ -296,6 +336,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                     if (mr.Monster?.Hero != null)
                     {
                         UnitSim u = BuildUnit(mr.Monster, true);
+                        ValidateUnitPlacement(u);
                         monsters[u.Id] = u;
                         seenMonsters.Add(u.Id);
                         spawnedAtTile[u.Id] = u.NodeId;
@@ -306,6 +347,13 @@ namespace MonsterPathPredictor.ReplayCertifier
                     dynamic td = decoder.TryDecode("party.protocol.ThrowDiceS2C", payload);
                     if (td == null) { decodeFailed = true; break; }
                     long actorId = (long)td.PlayerId;
+                    // Reject unregistered dice rollers so a bogus 5022 cannot hijack curTurnActor
+                    // and suppress fork scoring on subsequent valid monster moves.
+                    if (actorId == 0 || (!players.ContainsKey(actorId) && !monsters.ContainsKey(actorId)))
+                    {
+                        decodeFailed = true;
+                        break;
+                    }
                     // Discard ALL unreached deferred 1096 tile effects from the previous turn (for any actor)
                     // and any un-echoed pre-dice displacement hops on the rolling actor so they cannot collide
                     // with post-dice normal walking steps.
@@ -314,8 +362,8 @@ namespace MonsterPathPredictor.ReplayCertifier
                     if (monsters.TryGetValue(actorId, out var diceMonster)) diceMonster.PendingDisplacementHops.Clear();
                     // Always advance active turn context even when a player (non-monster) rolls dice.
                     curTurnActor = actorId;
-                    stepped = foughtOnTile = foughtTurn = thiefStoleOnTile = false;
-                    foughtTile = foughtLayoutIdx = thiefStoleTile = thiefStoleLayoutIdx = -1;
+                    stepped = foughtTurn = false;
+                    ClearTileScopedTurnFlags();
                     if (monsters.TryGetValue(actorId, out var ma))
                     {
                         turnStartLandId = ma.NodeId;
@@ -331,7 +379,9 @@ namespace MonsterPathPredictor.ReplayCertifier
                 {
                     dynamic attr = decoder.TryDecode("party.protocol.UpdateHeroAttrS2C", payload);
                     if (attr == null) { decodeFailed = true; break; }
-                    if (ApplyAttr(attr, board, players, monsters, false, curTurnActor, summary))
+                    bool stole = ApplyAttr(attr, board, players, monsters, false, curTurnActor, summary, out bool curActorLeftTile);
+                    if (curActorLeftTile) ClearTileScopedTurnFlags();
+                    if (stole)
                     {
                         thiefStoleOnTile = true;
                         thiefStoleTile = GetActorTile(curTurnActor);
@@ -378,7 +428,8 @@ namespace MonsterPathPredictor.ReplayCertifier
 
                         for (int i = 0; i < immediateAttrs.Count; i++)
                         {
-                            ApplyAttr(immediateAttrs[i], board, players, monsters, true, curTurnActor, summary);
+                            ApplyAttr(immediateAttrs[i], board, players, monsters, true, curTurnActor, summary, out bool immLeft);
+                            if (immLeft) ClearTileScopedTurnFlags();
                         }
 
                         if (moverUnit != null)
@@ -386,7 +437,8 @@ namespace MonsterPathPredictor.ReplayCertifier
                             while (true)
                             {
                                 int beforeNode = moverUnit.NodeId;
-                                bool consumed = ConsumePendingMoveEffects(moverId, moverUnit.NodeId, board, pendingMoveEffects, players, monsters, curTurnActor, summary);
+                                bool consumed = ConsumePendingMoveEffects(moverId, moverUnit.NodeId, board, pendingMoveEffects, players, monsters, curTurnActor, summary, out bool chainedLeft);
+                                if (chainedLeft) ClearTileScopedTurnFlags();
                                 if (!consumed || moverUnit.NodeId == beforeNode) break;
                             }
                         }

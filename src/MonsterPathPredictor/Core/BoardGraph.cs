@@ -36,6 +36,7 @@ namespace MonsterPathPredictor.Core
     {
         private readonly Dictionary<int, int> _distances;
         private readonly Dictionary<int, double> _exactPathCounts;
+        private readonly Dictionary<int, long> _exactIntPathCounts;
         private readonly Dictionary<int, double> _logPathCounts;
 
         public int TargetLandId { get; }
@@ -44,11 +45,13 @@ namespace MonsterPathPredictor.Core
             int targetLandId,
             Dictionary<int, int> distances,
             Dictionary<int, double> exactPathCounts,
+            Dictionary<int, long> exactIntPathCounts,
             Dictionary<int, double> logPathCounts)
         {
             TargetLandId = targetLandId;
             _distances = distances;
             _exactPathCounts = exactPathCounts;
+            _exactIntPathCounts = exactIntPathCounts;
             _logPathCounts = logPathCounts;
         }
 
@@ -76,6 +79,24 @@ namespace MonsterPathPredictor.Core
         public double GetPathCount(int fromLandId)
         {
             return _exactPathCounts.TryGetValue(fromLandId, out double count) ? count : 0.0;
+        }
+
+        /// <summary>
+        /// Returns true and outputs the mathematically exact integer shortest-path count ONLY when
+        /// BFS integer accumulation did not overflow <see cref="long.MaxValue"/> (never converts a
+        /// potentially rounded <see cref="double"/> count back to integer, preventing 2^53 vs 2^53+1 ties).
+        /// </summary>
+        public bool TryGetExactPathCount(int fromLandId, out long exactCount)
+        {
+            if (_exactIntPathCounts != null &&
+                _exactIntPathCounts.TryGetValue(fromLandId, out long val) &&
+                val > 0)
+            {
+                exactCount = val;
+                return true;
+            }
+            exactCount = 0;
+            return false;
         }
     }
 
@@ -331,16 +352,18 @@ namespace MonsterPathPredictor.Core
         {
             var distances = new Dictionary<int, int>();
             var exactCounts = new Dictionary<int, double>();
+            var exactIntCounts = new Dictionary<int, long>();
             var logCounts = new Dictionary<int, double>();
 
             if (!Contains(targetLandId))
             {
-                return new ShortestPathField(targetLandId, distances, exactCounts, logCounts);
+                return new ShortestPathField(targetLandId, distances, exactCounts, exactIntCounts, logCounts);
             }
 
             var queue = new Queue<int>();
             distances[targetLandId] = 0;
             exactCounts[targetLandId] = 1.0;
+            exactIntCounts[targetLandId] = 1L;
             logCounts[targetLandId] = 0.0; // ln(1) = 0
             queue.Enqueue(targetLandId);
 
@@ -349,6 +372,7 @@ namespace MonsterPathPredictor.Core
                 int cur = queue.Dequeue();
                 int curDist = distances[cur];
                 double curExact = exactCounts[cur];
+                long curExactInt = exactIntCounts[cur];
                 double curLogCount = logCounts[cur];
 
                 if (!_reverseAdjacency.TryGetValue(cur, out var predecessors)) continue;
@@ -359,18 +383,28 @@ namespace MonsterPathPredictor.Core
                     {
                         distances[prev] = curDist + 1;
                         exactCounts[prev] = curExact;
+                        exactIntCounts[prev] = curExactInt;
                         logCounts[prev] = curLogCount;
                         queue.Enqueue(prev);
                     }
                     else if (prevDist == curDist + 1)
                     {
                         exactCounts[prev] += curExact;
+                        long existingInt = exactIntCounts[prev];
+                        if (existingInt < 0 || curExactInt < 0 || existingInt > long.MaxValue - curExactInt)
+                        {
+                            exactIntCounts[prev] = -1L; // overflowed exact long; precision no longer guaranteed
+                        }
+                        else
+                        {
+                            exactIntCounts[prev] = existingInt + curExactInt;
+                        }
                         logCounts[prev] = LogAddExp(logCounts[prev], curLogCount);
                     }
                 }
             }
 
-            return new ShortestPathField(targetLandId, distances, exactCounts, logCounts);
+            return new ShortestPathField(targetLandId, distances, exactCounts, exactIntCounts, logCounts);
         }
 
         public bool SameTopology(BoardGraph other)

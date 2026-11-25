@@ -239,7 +239,13 @@ namespace MonsterPathPredictor.ReplayCertifier
 
         private static bool ApplyAttr(dynamic attr, BoardGraph board, Dictionary<long, UnitSim> players, Dictionary<long, UnitSim> monsters, bool fromSkillMove, long curTurnActor, CertificationSummary summary = null)
         {
+            return ApplyAttr(attr, board, players, monsters, fromSkillMove, curTurnActor, summary, out bool _);
+        }
+
+        private static bool ApplyAttr(dynamic attr, BoardGraph board, Dictionary<long, UnitSim> players, Dictionary<long, UnitSim> monsters, bool fromSkillMove, long curTurnActor, CertificationSummary summary, out bool curActorLeftTile)
+        {
             bool thiefStole = false;
+            curActorLeftTile = false;
             if (attr?.EffectDatas == null) return false;
             long attrOwner = (long)attr.PlayerId;
             int causeSkillId = 0;
@@ -358,6 +364,13 @@ namespace MonsterPathPredictor.ReplayCertifier
                         target.PendingSkillMoveLandId = -1;
                         target.PendingSkillMovePushDirId = -1;
                         target.PendingSkillMovePushFromId = -1;
+                        if (curTurnActor != 0 && target.Id == curTurnActor)
+                        {
+                            // Leaving the current tile invalidates tile-scoped combat/steal flags IMMEDIATELY
+                            // even if a subsequent effect in the same 1040 moves the actor back (F->G->F).
+                            curActorLeftTile = true;
+                            thiefStole = false;
+                        }
                     }
 
                     if (target.IsMonster && displacementKind != SkillMoveKind.None && newNode >= 0)

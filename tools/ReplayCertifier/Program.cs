@@ -209,9 +209,9 @@ namespace MonsterPathPredictor.ReplayCertifier
                 return false;
             }
 
-            if (!opts.SelfTest && ReportWriter.AreSameOutputPath(opts.JsonOut, opts.MdOut))
+            if (!opts.SelfTest && ReportWriter.HaveConflictingOutputPaths(opts.JsonOut, opts.MdOut))
             {
-                error = "ERROR: --json-out and --md-out must not resolve to the same file path.";
+                error = "ERROR: --json-out and --md-out must not resolve to the same path or ancestor/descendant paths.";
                 return false;
             }
 
@@ -367,6 +367,7 @@ namespace MonsterPathPredictor.ReplayCertifier
             var perReplay = new ConcurrentBag<CertificationSummary>();
             var cacheSeenSha = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
             var cacheSeenVerifiedId = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
+            var cachePublishLock = new object();
             if (saveCache && !string.IsNullOrWhiteSpace(cacheDir) && Directory.Exists(cacheDir))
             {
                 // Pre-register identity of all healthy existing cache files outside the active --corpus/--limit
@@ -396,18 +397,9 @@ namespace MonsterPathPredictor.ReplayCertifier
                     Console.WriteLine($"  progress: {done:N0}/{replayIds.Count:N0} ({sw.Elapsed.TotalSeconds:F1}s | cached={cacheHits:N0}, streamed={streamed:N0})");
             }
 
-            void TryPublishCacheIfUnique(string savePath, byte[] bytes, CertificationSummary local)
+            void PublishCacheIfUnique(string savePath, byte[] bytes, CertificationSummary local)
             {
-                if (!IsCacheableAndClean(local)) return;
-                bool unique = true;
-                if (!string.IsNullOrEmpty(local.ContentSha256) && !cacheSeenSha.TryAdd(local.ContentSha256, 0))
-                    unique = false;
-                if (unique && !string.IsNullOrEmpty(local.VerifiedReplayId) && !cacheSeenVerifiedId.TryAdd(local.VerifiedReplayId, 0))
-                    unique = false;
-                if (saveCache && savePath != null && unique)
-                {
-                    TryWriteCacheAtomic(savePath, bytes);
-                }
+                TryPublishCacheIfUnique(savePath, cacheDir, saveCache, bytes, local, cacheSeenSha, cacheSeenVerifiedId, cachePublishLock);
             }
 
             // Phase 1: Read and register ALL existing local cached files first (no recovery writes yet),
@@ -476,7 +468,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                 if (bytes != null && eval != null && ShouldAdoptRecoveryResult(eval))
                 {
                     finalLocal = eval;
-                    TryPublishCacheIfUnique(item.SavePath, bytes, finalLocal);
+                    PublishCacheIfUnique(item.SavePath, bytes, finalLocal);
                 }
                 else if (item.CorruptLocal != null)
                 {
@@ -586,22 +578,26 @@ namespace MonsterPathPredictor.ReplayCertifier
 
             foreach (string id in allIds)
             {
+                string rawFlat = Path.Combine(cacheDir, id);
+                string rawNested = Path.Combine(cacheDir, id, id);
                 string existing = ResolveCachedReplayPath(cacheDir, id);
                 string savePath = ResolveSaveCachePath(cacheDir, id, existing);
-                string canonExisting = ReportWriter.ResolveCanonicalPath(existing);
-                string canonSave = ReportWriter.ResolveCanonicalPath(savePath);
-                if (activeSet.Contains(id) &&
-                    ((!string.IsNullOrEmpty(canonExisting) && inputCanon.Contains(canonExisting)) ||
-                     (!string.IsNullOrEmpty(canonSave) && inputCanon.Contains(canonSave))))
+                string[] candidates = { rawFlat, rawNested, existing, savePath };
+                for (int c = 0; c < candidates.Length; c++)
                 {
-                    error = $"ERROR: Replay cache path for ID \"{id}\" conflicts with an input file (--corpus / --maps).";
-                    return true;
-                }
-                if ((!string.IsNullOrEmpty(canonExisting) && outputCanon.Contains(canonExisting)) ||
-                    (!string.IsNullOrEmpty(canonSave) && outputCanon.Contains(canonSave)))
-                {
-                    error = $"ERROR: Report output (--json-out / --md-out) conflicts with replay cache path for ID \"{id}\".";
-                    return true;
+                    if (string.IsNullOrEmpty(candidates[c])) continue;
+                    string canon = ReportWriter.ResolveCanonicalPath(candidates[c]);
+                    if (string.IsNullOrEmpty(canon)) continue;
+                    if (activeSet.Contains(id) && inputCanon.Contains(canon))
+                    {
+                        error = $"ERROR: Replay cache path for ID \"{id}\" conflicts with an input file (--corpus / --maps).";
+                        return true;
+                    }
+                    if (outputCanon.Contains(canon))
+                    {
+                        error = $"ERROR: Report output (--json-out / --md-out) conflicts with replay cache path for ID \"{id}\".";
+                        return true;
+                    }
                 }
             }
             return false;
@@ -885,23 +881,80 @@ namespace MonsterPathPredictor.ReplayCertifier
             return ids.Distinct(StringComparer.Ordinal).ToList();
         }
 
+        public static bool IsCacheTargetInsideCacheRoot(string targetPath, string cacheRootDir)
+        {
+            if (string.IsNullOrWhiteSpace(targetPath) || string.IsNullOrWhiteSpace(cacheRootDir)) return false;
+            try
+            {
+                string fullTarget = Path.GetFullPath(targetPath);
+                string parentDir = Path.GetDirectoryName(fullTarget);
+                if (string.IsNullOrEmpty(parentDir)) return false;
+                return ReportWriter.IsPathInsideDirectory(parentDir, cacheRootDir) &&
+                       ReportWriter.IsPathInsideDirectory(fullTarget, cacheRootDir);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public static bool TryPublishCacheIfUnique(
+            string savePath,
+            string cacheRootDir,
+            bool saveCache,
+            byte[] bytes,
+            CertificationSummary local,
+            ConcurrentDictionary<string, byte> cacheSeenSha,
+            ConcurrentDictionary<string, byte> cacheSeenVerifiedId,
+            object publishLock)
+        {
+            if (!IsCacheableAndClean(local)) return false;
+            lock (publishLock)
+            {
+                bool alreadySeen =
+                    (!string.IsNullOrEmpty(local.ContentSha256) && cacheSeenSha.ContainsKey(local.ContentSha256)) ||
+                    (!string.IsNullOrEmpty(local.VerifiedReplayId) && cacheSeenVerifiedId.ContainsKey(local.VerifiedReplayId));
+                if (alreadySeen) return false;
+
+                if (saveCache && savePath != null)
+                {
+                    // Commit dedup identity ONLY after atomic write succeeds inside cacheRootDir;
+                    // if publishing fails (e.g. target blocked by directory or symlink escaping cacheRootDir),
+                    // release identity so another valid target with the same replay can still publish.
+                    if (!TryWriteCacheAtomic(savePath, bytes, cacheRootDir))
+                        return false;
+                }
+
+                if (!string.IsNullOrEmpty(local.ContentSha256)) cacheSeenSha.TryAdd(local.ContentSha256, 0);
+                if (!string.IsNullOrEmpty(local.VerifiedReplayId)) cacheSeenVerifiedId.TryAdd(local.VerifiedReplayId, 0);
+                return true;
+            }
+        }
+
         public static string ResolveCachedReplayPath(string cacheDir, string replayId)
         {
             if (string.IsNullOrWhiteSpace(cacheDir) || string.IsNullOrWhiteSpace(replayId)) return null;
             string flat = Path.Combine(cacheDir, replayId);
-            if (File.Exists(flat)) return flat;
+            if (File.Exists(flat) && IsCacheTargetInsideCacheRoot(flat, cacheDir)) return flat;
             string nested = Path.Combine(cacheDir, replayId, replayId);
-            if (File.Exists(nested)) return nested;
+            if (File.Exists(nested) && IsCacheTargetInsideCacheRoot(nested, cacheDir)) return nested;
             return null;
         }
 
         public static string ResolveSaveCachePath(string cacheDir, string replayId, string existingCachedPath)
         {
             if (string.IsNullOrWhiteSpace(cacheDir) || string.IsNullOrWhiteSpace(replayId)) return null;
-            if (!string.IsNullOrWhiteSpace(existingCachedPath)) return existingCachedPath;
-            string flat = Path.Combine(cacheDir, replayId);
-            if (Directory.Exists(flat)) return Path.Combine(flat, replayId);
-            return flat;
+            string candidate;
+            if (!string.IsNullOrWhiteSpace(existingCachedPath))
+            {
+                candidate = existingCachedPath;
+            }
+            else
+            {
+                string flat = Path.Combine(cacheDir, replayId);
+                candidate = Directory.Exists(flat) ? Path.Combine(flat, replayId) : flat;
+            }
+            return IsCacheTargetInsideCacheRoot(candidate, cacheDir) ? candidate : null;
         }
 
         public static CertificationSummary SafeEvaluateReplay(string replayId, byte[] bytes, IProtocolDecoder decoder, BoardCatalog catalog)
@@ -910,9 +963,14 @@ namespace MonsterPathPredictor.ReplayCertifier
             catch { return new CertificationSummary { ReplaysAttempted = 1, ParseErrors = 1 }; }
         }
 
-        public static bool TryWriteCacheAtomic(string savePath, byte[] bytes)
+        public static bool TryWriteCacheAtomic(string savePath, byte[] bytes, string cacheRootDir = null)
         {
             if (string.IsNullOrWhiteSpace(savePath) || bytes == null) return false;
+            if (!string.IsNullOrWhiteSpace(cacheRootDir) && !IsCacheTargetInsideCacheRoot(savePath, cacheRootDir))
+            {
+                Console.Error.WriteLine($"WARN: Refusing to write cache file outside cache root: {savePath}");
+                return false;
+            }
             string tmpPath = null;
             try
             {

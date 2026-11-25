@@ -254,17 +254,15 @@ namespace MonsterPathPredictor.Runtime
             // can never be clicked while sprites straddling nearClipPlane project their visible portion.
             float nearClip = 0.01f;
             try { if (camera.nearClipPlane > 0f) nearClip = Math.Max(0.01f, camera.nearClipPlane); } catch { }
-            float clippedMinDepth = Math.Max(0.001f, nearClip * 0.5f);
 
             float minX = float.MaxValue, minY = float.MaxValue;
             float maxX = float.MinValue, maxY = float.MinValue;
             int valid = 0;
-            float depthSum = 0f;
+            double depthSum = 0.0;
 
             void AcceptPoint(Vector3 w)
             {
-                float d = Vector3.Dot(w - camPos, camForward);
-                if (d < clippedMinDepth) return;
+                double d = DashGeometry.ComputeCameraDepth(w.x, w.y, w.z, camPos.x, camPos.y, camPos.z, camForward.x, camForward.y, camForward.z);
                 Vector2 p = layer.WorldToLocal(w, camera);
                 if (float.IsNaN(p.x) || float.IsInfinity(p.x) || float.IsNaN(p.y) || float.IsInfinity(p.y))
                     return;
@@ -272,7 +270,7 @@ namespace MonsterPathPredictor.Runtime
                 if (p.y < minY) minY = p.y;
                 if (p.x > maxX) maxX = p.x;
                 if (p.y > maxY) maxY = p.y;
-                depthSum += d;
+                depthSum += Math.Max(nearClip, d);
                 valid++;
             }
 
@@ -302,8 +300,11 @@ namespace MonsterPathPredictor.Runtime
 
             if (valid < 2) return false;
 
-            float centerDepth = Vector3.Dot(bounds.CenterWorld - camPos, camForward);
-            float effectiveDepth = centerDepth >= nearClip ? centerDepth : (depthSum / valid);
+            double centerDepth = DashGeometry.ComputeCameraDepth(
+                bounds.CenterWorld.x, bounds.CenterWorld.y, bounds.CenterWorld.z,
+                camPos.x, camPos.y, camPos.z,
+                camForward.x, camForward.y, camForward.z);
+            float effectiveDepth = (float)(centerDepth >= nearClip ? centerDepth : (depthSum / valid));
 
             // Keep the raw projected sprite bounds uninflated so MonsterHitTester directHits only matches
             // clicks truly inside a monster's sprite; zoomed-out small sprites remain easy to pick via nearMissRadius.

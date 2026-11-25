@@ -47,6 +47,8 @@ namespace MonsterPathPredictor.Runtime
         {
             public long CasterPlayerId;
             public int SkillId;
+            public long MatchRoomId;
+            public long MatchStartTime;
             public DateTime TimestampUtc;
             public HashSet<long> AppliedMonsterIds = new HashSet<long>();
         }
@@ -58,6 +60,8 @@ namespace MonsterPathPredictor.Runtime
             public int SkillId;
             public int NewLandId;
             public int BackLandId;
+            public long MatchRoomId;
+            public long MatchStartTime;
             public DateTime TimestampUtc;
         }
 
@@ -70,6 +74,8 @@ namespace MonsterPathPredictor.Runtime
             public long ActiveActorAtEvent;
             public int TurnEpoch;
             public int Round;
+            public long MatchRoomId;
+            public long MatchStartTime;
         }
 
         private struct ThiefStealRecord
@@ -78,6 +84,8 @@ namespace MonsterPathPredictor.Runtime
             public int LandId;
             public int TurnEpoch;
             public int Round;
+            public long MatchRoomId;
+            public long MatchStartTime;
         }
 
         private const int MaxQueuedEvents = 256;
@@ -270,6 +278,21 @@ namespace MonsterPathPredictor.Runtime
             Interlocked.Increment(ref _eventTurnEpoch);
         }
 
+        private static void TryStampCurrentMatch(out long roomId, out long startTime)
+        {
+            roomId = 0;
+            startTime = 0;
+            try
+            {
+                if (Players.TryGetMatch(out var info))
+                {
+                    roomId = info.RoomId;
+                    startTime = info.StartTime;
+                }
+            }
+            catch { }
+        }
+
         private void OnHeroAttrUpdated(UpdateHeroAttrS2C attr)
         {
             if (!_acceptEvents || attr == null || attr.EffectDatas == null || attr.EffectDatas.Count == 0) return;
@@ -279,6 +302,7 @@ namespace MonsterPathPredictor.Runtime
             int curEpoch = Volatile.Read(ref _eventTurnEpoch);
             int curRound = TryReadCurrentRound();
             int causeId = attr.Cause != null ? (int)attr.Cause.Id : 0;
+            TryStampCurrentMatch(out long matchRoomId, out long matchStartTime);
 
             for (int i = 0; i < attr.EffectDatas.Count; i++)
             {
@@ -294,12 +318,15 @@ namespace MonsterPathPredictor.Runtime
                         ThiefId = ownerId,
                         LandId = TryReadLiveUnitLandId(ownerId),
                         TurnEpoch = curEpoch,
-                        Round = curRound
+                        Round = curRound,
+                        MatchRoomId = matchRoomId,
+                        MatchStartTime = matchStartTime
                     });
                 }
 
-                // Target-bound skill displacement (cmd 1040 Place effect carries exact victim MonsterId + caster + Cause)
-                if (eff.Place != null && eff.Place.Place != null && eff.PlayerId != 0 && !TryIsUnitHero(eff.PlayerId))
+                // Target-bound skill displacement (cmd 1040 Place effect carries exact victim MonsterId + caster + Cause).
+                // Negative NodeId (< 0) is a protocol sentinel (no destination tile): never enqueue as a wildcard tile match.
+                if (eff.Place != null && eff.Place.Place != null && eff.Place.Place.NodeId >= 0 && eff.PlayerId != 0 && !TryIsUnitHero(eff.PlayerId))
                 {
                     if (_placeQueue.Count >= MaxQueuedEvents) _placeQueue.TryDequeue(out _);
                     _placeQueue.Enqueue(new SkillDisplacementRecord
@@ -309,6 +336,8 @@ namespace MonsterPathPredictor.Runtime
                         SkillId = causeId,
                         NewLandId = eff.Place.Place.NodeId,
                         BackLandId = eff.Place.Place.BackNodeId,
+                        MatchRoomId = matchRoomId,
+                        MatchStartTime = matchStartTime,
                         TimestampUtc = DateTime.UtcNow
                     });
                 }
@@ -319,6 +348,7 @@ namespace MonsterPathPredictor.Runtime
         {
             if (!_acceptEvents) return;
             if (snap.AttackerPlayerId == 0 && snap.DefenderPlayerId == 0) return;
+            TryStampCurrentMatch(out long matchRoomId, out long matchStartTime);
             if (_combatQueue.Count >= MaxQueuedEvents) _combatQueue.TryDequeue(out _);
             _combatQueue.Enqueue(new CombatRecord
             {
@@ -328,7 +358,9 @@ namespace MonsterPathPredictor.Runtime
                 DefenderLandId = TryReadLiveUnitLandId(snap.DefenderPlayerId),
                 ActiveActorAtEvent = TryReadCurrentActorId(),
                 TurnEpoch = Volatile.Read(ref _eventTurnEpoch),
-                Round = TryReadCurrentRound()
+                Round = TryReadCurrentRound(),
+                MatchRoomId = matchRoomId,
+                MatchStartTime = matchStartTime
             });
         }
 
@@ -339,6 +371,7 @@ namespace MonsterPathPredictor.Runtime
             long def = b.Defender != null ? b.Defender.PlayerId : 0;
             if (atk != 0 || def != 0)
             {
+                TryStampCurrentMatch(out long matchRoomId, out long matchStartTime);
                 if (_combatQueue.Count >= MaxQueuedEvents) _combatQueue.TryDequeue(out _);
                 _combatQueue.Enqueue(new CombatRecord
                 {
@@ -348,7 +381,9 @@ namespace MonsterPathPredictor.Runtime
                     DefenderLandId = TryReadLiveUnitLandId(def),
                     ActiveActorAtEvent = TryReadCurrentActorId(),
                     TurnEpoch = Volatile.Read(ref _eventTurnEpoch),
-                    Round = TryReadCurrentRound()
+                    Round = TryReadCurrentRound(),
+                    MatchRoomId = matchRoomId,
+                    MatchStartTime = matchStartTime
                 });
             }
         }
@@ -408,11 +443,14 @@ namespace MonsterPathPredictor.Runtime
         private void OnSkillUsed(long playerId, int skillId)
         {
             if (!_acceptEvents) return;
+            TryStampCurrentMatch(out long matchRoomId, out long matchStartTime);
             if (_skillQueue.Count >= MaxQueuedEvents) _skillQueue.TryDequeue(out _);
             _skillQueue.Enqueue(new SkillCastRecord
             {
                 CasterPlayerId = playerId,
                 SkillId = skillId,
+                MatchRoomId = matchRoomId,
+                MatchStartTime = matchStartTime,
                 TimestampUtc = DateTime.UtcNow
             });
         }
@@ -557,14 +595,11 @@ namespace MonsterPathPredictor.Runtime
                         bool isMonsterOwnTurn = (curActorId == mid);
                         bool movedNonAdjacently = prevLandId >= 0 && !board.IsValidNeighbor(prevLandId, landId);
 
-                        // Leaving a tile ALWAYS clears prior tile-bound spawn/combat/skill tags immediately
-                        // so returning to that tile later can NEVER reactivate an expired skill displacement tag.
+                        // Leaving a tile ALWAYS clears prior tile-bound spawn/combat/skill tags unconditionally
+                        // so revisiting the same fork later in the turn can NEVER reactivate an expired post-combat tag.
                         mem.JustSpawnedOnFork = false;
-                        if (mem.CombatForkLandId != landId)
-                        {
-                            mem.JustFoughtOnFork = false;
-                            mem.CombatForkLandId = -1;
-                        }
+                        mem.JustFoughtOnFork = false;
+                        mem.CombatForkLandId = -1;
                         mem.SkillMoveKind = SkillMoveKind.None;
                         mem.SkillMoveLandId = -1;
                         mem.SkillMovePushDirId = -1;
@@ -588,8 +623,9 @@ namespace MonsterPathPredictor.Runtime
                     }
                 }
 
-                // Stamp queued combat events ONLY onto the verified tile where combat occurred (matching current turn epoch/round).
-                // When event tile could not be captured (-1), only accept current landId if the monster has NOT moved since last snapshot.
+                // Stamp queued combat events ONLY when the monster is CURRENTLY still standing on the combat tile
+                // (matching current turn epoch/round). If the monster already moved past the combat tile before this
+                // snapshot, never write a stale CombatForkLandId that could fire on a later revisit to that fork.
                 if (pendingCombatTiles.TryGetValue(mid, out var combatEvt) &&
                     combatEvt.TurnEpoch == currentEpoch &&
                     (combatEvt.Round < 0 || currentRound < 0 || combatEvt.Round == currentRound) &&
@@ -599,10 +635,10 @@ namespace MonsterPathPredictor.Runtime
                     int actualCombatTile = combatEvt.LandId >= 0
                         ? combatEvt.LandId
                         : ((!isNew && !movedSinceLastSnapshot) ? landId : -1);
-                    if (actualCombatTile >= 0 && board.IsForkForContext(actualCombatTile, fromLandId, arrivedFromIncomingEdge: true))
+                    if (actualCombatTile == landId && board.IsForkForContext(landId, fromLandId, arrivedFromIncomingEdge: true))
                     {
                         mem.JustFoughtOnFork = true;
-                        mem.CombatForkLandId = actualCombatTile;
+                        mem.CombatForkLandId = landId;
                         mem.CombatTurnSequence = _turnSequence;
                     }
                 }
@@ -613,15 +649,15 @@ namespace MonsterPathPredictor.Runtime
                 {
                     // Record turn-level steal occurrence regardless of tile type so RedBlueAfterCombat
                     // matches MonsterPathEngine's long forecast after normal-tile steals, while setting
-                    // JustFoughtOnFork ONLY when the steal occurred right on a fork tile.
+                    // JustFoughtOnFork ONLY when the thief is still standing on that fork tile.
                     mem.StolenTurnSequence = _turnSequence;
                     int actualStealTile = stealEvt.LandId >= 0
                         ? stealEvt.LandId
                         : ((!isNew && !movedSinceLastSnapshot) ? landId : -1);
-                    if (actualStealTile >= 0 && board.IsForkForContext(actualStealTile, fromLandId, arrivedFromIncomingEdge: true))
+                    if (actualStealTile == landId && board.IsForkForContext(landId, fromLandId, arrivedFromIncomingEdge: true))
                     {
                         mem.JustFoughtOnFork = true;
-                        mem.CombatForkLandId = actualStealTile;
+                        mem.CombatForkLandId = landId;
                         mem.CombatTurnSequence = _turnSequence;
                     }
                 }
@@ -762,6 +798,81 @@ namespace MonsterPathPredictor.Runtime
             }
         }
 
+        private bool IsMatchingEventStamp(long eventRoomId, long eventStartTime)
+        {
+            if (_matchRoomId == 0 && _matchStartTime == 0) return true;
+            if (eventRoomId == 0 && eventStartTime == 0) return true;
+            return eventRoomId == _matchRoomId && eventStartTime == _matchStartTime;
+        }
+
+        private void ResetForNewMatch(long newRoomId, long newStartTime)
+        {
+            _memories.Clear();
+            _rosterAliveMonsterIds.Clear();
+            _activeActorId = 0;
+            _activeActorStartLandId = -1;
+            _activeActorSteppedThisTurn = false;
+            _turnSequence = 0;
+            Interlocked.Exchange(ref _eventTurnEpoch, 0);
+            _lastObservedTurnEpoch = 0;
+            _lastObservedRound = -1;
+            _matchRoomId = newRoomId;
+            _matchStartTime = newStartTime;
+
+            // Prune ONLY events belonging to previous matches; preserve events already received
+            // and stamped for the new match before the first LateUpdate observed the room switch.
+            for (int i = _recentSkills.Count - 1; i >= 0; i--)
+            {
+                if (!IsMatchingEventStamp(_recentSkills[i].MatchRoomId, _recentSkills[i].MatchStartTime))
+                    _recentSkills.RemoveAt(i);
+            }
+
+            List<long> emptyMonsters = null;
+            foreach (var kv in _pendingPlaceByMonster)
+            {
+                var list = kv.Value;
+                for (int i = list.Count - 1; i >= 0; i--)
+                {
+                    if (!IsMatchingEventStamp(list[i].MatchRoomId, list[i].MatchStartTime))
+                        list.RemoveAt(i);
+                }
+                if (list.Count == 0)
+                {
+                    if (emptyMonsters == null) emptyMonsters = new List<long>();
+                    emptyMonsters.Add(kv.Key);
+                }
+            }
+            if (emptyMonsters != null)
+            {
+                for (int i = 0; i < emptyMonsters.Count; i++) _pendingPlaceByMonster.Remove(emptyMonsters[i]);
+            }
+
+            int skillCount = _skillQueue.Count;
+            for (int i = 0; i < skillCount && _skillQueue.TryDequeue(out var sk); i++)
+            {
+                if (sk != null && IsMatchingEventStamp(sk.MatchRoomId, sk.MatchStartTime))
+                    _skillQueue.Enqueue(sk);
+            }
+            int placeCount = _placeQueue.Count;
+            for (int i = 0; i < placeCount && _placeQueue.TryDequeue(out var pl); i++)
+            {
+                if (pl != null && IsMatchingEventStamp(pl.MatchRoomId, pl.MatchStartTime))
+                    _placeQueue.Enqueue(pl);
+            }
+            int combatCount = _combatQueue.Count;
+            for (int i = 0; i < combatCount && _combatQueue.TryDequeue(out var c); i++)
+            {
+                if (IsMatchingEventStamp(c.MatchRoomId, c.MatchStartTime))
+                    _combatQueue.Enqueue(c);
+            }
+            int stealCount = _thiefStealQueue.Count;
+            for (int i = 0; i < stealCount && _thiefStealQueue.TryDequeue(out var ts); i++)
+            {
+                if (IsMatchingEventStamp(ts.MatchRoomId, ts.MatchStartTime))
+                    _thiefStealQueue.Enqueue(ts);
+            }
+        }
+
         private bool EnsureSameMatch()
         {
             if (Players.TryGetMatch(out var info))
@@ -769,9 +880,7 @@ namespace MonsterPathPredictor.Runtime
                 bool hadMatch = _matchRoomId != 0 || _matchStartTime != 0;
                 if (_matchRoomId != info.RoomId || _matchStartTime != info.StartTime)
                 {
-                    Reset();
-                    _matchRoomId = info.RoomId;
-                    _matchStartTime = info.StartTime;
+                    ResetForNewMatch(info.RoomId, info.StartTime);
                     return hadMatch;
                 }
             }
@@ -798,7 +907,8 @@ namespace MonsterPathPredictor.Runtime
             const int MaxPendingPlacesPerMonster = 16;
             while (_placeQueue.TryDequeue(out var pl))
             {
-                if (pl == null || pl.TargetMonsterId == 0) continue;
+                if (pl == null || pl.TargetMonsterId == 0 || pl.NewLandId < 0) continue;
+                if (!IsMatchingEventStamp(pl.MatchRoomId, pl.MatchStartTime)) continue;
                 if (!_pendingPlaceByMonster.TryGetValue(pl.TargetMonsterId, out var list))
                 {
                     list = new List<SkillDisplacementRecord>(4);
@@ -819,7 +929,8 @@ namespace MonsterPathPredictor.Runtime
             var now = DateTime.UtcNow;
             while (_skillQueue.TryDequeue(out var sk))
             {
-                _recentSkills.Add(sk);
+                if (sk != null && IsMatchingEventStamp(sk.MatchRoomId, sk.MatchStartTime))
+                    _recentSkills.Add(sk);
             }
             for (int i = _recentSkills.Count - 1; i >= 0; i--)
             {
@@ -836,6 +947,7 @@ namespace MonsterPathPredictor.Runtime
             combatByUnit = new Dictionary<long, PendingUnitCombat>();
             while (_combatQueue.TryDequeue(out var c))
             {
+                if (!IsMatchingEventStamp(c.MatchRoomId, c.MatchStartTime)) continue;
                 if (c.AttackerId != 0)
                     combatByUnit[c.AttackerId] = new PendingUnitCombat
                     {
@@ -857,6 +969,7 @@ namespace MonsterPathPredictor.Runtime
             thiefStealsByUnit = new Dictionary<long, PendingThiefSteal>();
             while (_thiefStealQueue.TryDequeue(out var ts))
             {
+                if (!IsMatchingEventStamp(ts.MatchRoomId, ts.MatchStartTime)) continue;
                 if (ts.ThiefId != 0)
                     thiefStealsByUnit[ts.ThiefId] = new PendingThiefSteal
                     {
@@ -888,7 +1001,7 @@ namespace MonsterPathPredictor.Runtime
             int matchIdx = -1;
             for (int i = list.Count - 1; i >= 0; i--)
             {
-                if (list[i].NewLandId < 0 || list[i].NewLandId == newLandId)
+                if (list[i].NewLandId >= 0 && list[i].NewLandId == newLandId)
                 {
                     matchIdx = i;
                     break;
@@ -916,7 +1029,8 @@ namespace MonsterPathPredictor.Runtime
             for (int i = 0; i <= matchIdx; i++)
             {
                 var rec = list[i];
-                int nextLand = rec.NewLandId >= 0 ? rec.NewLandId : newLandId;
+                if (rec.NewLandId < 0) continue;
+                int nextLand = rec.NewLandId;
                 bool hopChangedTile = (nextLand != simLand);
                 if (hopChangedTile)
                 {

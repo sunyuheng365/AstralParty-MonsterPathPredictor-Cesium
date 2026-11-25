@@ -180,7 +180,7 @@ namespace MonsterPathPredictor.Runtime
                 int count = Math.Min(rowsPerPage, visible.Count - start);
                 float rowStep = layout.RowH + layout.RowGap;
                 listHeight = Math.Min(layout.MaxListHeight, count * rowStep + layout.RowGap);
-                bool showRows = layout.RowH >= 18f && listHeight >= layout.RowH;
+                bool showRows = layout.RowH >= 10f && listHeight >= layout.RowH;
                 _listHost.visible = showRows;
                 if (showRows)
                 {
@@ -498,8 +498,9 @@ namespace MonsterPathPredictor.Runtime
                 return new CompactLayout(HeaderHeight, FooterHeight, normalPager, Padding, RowHeight, 4f, maxList);
             }
 
-            // Ultra-short viewport compact layout (e.g. GRoot.height = 120):
-            // compress header/pager/footer/padding so 1 row + pager + footer ALWAYS stay inside [0, stageHeight].
+            // Ultra-short viewport compact layout (e.g. GRoot.height = 120 or 79):
+            // ALWAYS reserve at least one clickable monster row FIRST, then fit header/pager/footer
+            // cleanly around it so every monster remains selectable via pager AND footer stays in bounds.
             float headerH = 24f;
             float footerH = 26f;
             float pagerH = showPager ? 22f : 0f;
@@ -507,30 +508,27 @@ namespace MonsterPathPredictor.Runtime
             float rowGap = 2f;
             float avail = stageHeight - (headerH + footerH + pagerH + pad * 2f);
 
-            if (avail < 24f)
+            if (avail >= 24f)
             {
-                headerH = 20f;
-                footerH = 22f;
-                pagerH = showPager ? 18f : 0f;
-                pad = 1f;
-                rowGap = 1f;
-                avail = stageHeight - (headerH + footerH + pagerH + pad * 2f);
+                float rowH = Math.Min(28f, Math.Max(20f, avail - rowGap));
+                return new CompactLayout(headerH, footerH, pagerH, pad, rowH, rowGap, avail);
             }
 
-            float chromeTotal = headerH + footerH + pagerH + pad * 2f;
-            if (chromeTotal > stageHeight && stageHeight > 0f)
-            {
-                float scale = stageHeight / chromeTotal;
-                headerH *= scale;
-                footerH *= scale;
-                pagerH *= scale;
-                pad *= scale;
-                avail = 0f;
-            }
-
-            float maxListHeight = Math.Max(0f, avail);
-            float rowH = Math.Min(28f, Math.Max(18f, maxListHeight - rowGap));
-            return new CompactLayout(headerH, footerH, pagerH, pad, rowH, rowGap, maxListHeight);
+            // Tier 2 ultra-short budget (e.g. stageHeight = 79 with pager):
+            // guarantee 1 clickable row (~22 px at height=79), compacting chrome proportionally around it.
+            pad = 1f;
+            rowGap = 1f;
+            float desiredRowH = Math.Min(22f, Math.Max(14f, stageHeight * 0.28f));
+            float listBudget = desiredRowH + rowGap;
+            float chromeBudget = Math.Max(0f, stageHeight - listBudget - pad * 2f);
+            float baseChrome = 17f + 20f + (showPager ? 16f : 0f);
+            float chromeScale = baseChrome > 0f ? Math.Min(1f, chromeBudget / baseChrome) : 1f;
+            headerH = 17f * chromeScale;
+            footerH = 20f * chromeScale;
+            pagerH = showPager ? 16f * chromeScale : 0f;
+            float maxListHeight = Math.Max(0f, stageHeight - headerH - footerH - pagerH - pad * 2f);
+            float finalRowH = Math.Min(24f, Math.Max(10f, maxListHeight - rowGap));
+            return new CompactLayout(headerH, footerH, pagerH, pad, finalRowH, rowGap, maxListHeight);
         }
 
         private void ApplyChromeLayout(CompactLayout layout)

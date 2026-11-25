@@ -139,12 +139,11 @@ namespace MonsterPathPredictor.Runtime
             var camForward = TransformService.GetForward(camTr);
             float hOffset = settings.HeightOffset;
 
-            // Use the camera's actual near clip plane consistently for both unclipped projections
-            // and 3D near-plane segment clipping (with a strictly smaller numerical tolerance solely
-            // for endpoints already clipped onto the near plane so float rounding never drops them).
+            // Use the camera's actual near clip plane consistently in double precision across both
+            // 3D near-plane clipping and unclipped projections so passed endpoints are never rejected
+            // by lower-precision float dot-product drift.
             float nearClipDist = 0.01f;
             try { if (camera.nearClipPlane > 0f) nearClipDist = Math.Max(0.01f, camera.nearClipPlane); } catch { }
-            float clippedMinDepth = Math.Max(0.001f, nearClipDist * 0.5f);
 
             // Smooth forward-marching dash phase (px)
             float phaseOffset = settings.DashSpeed > 0.01f
@@ -189,10 +188,9 @@ namespace MonsterPathPredictor.Runtime
             }
 
             // 2. Animated forward-marching dashed lines for all predicted edges:
-            //    first clip 3D segment against camera near plane (so edges partially behind the camera stay visible),
-            //    then project unclipped to screen space (using clippedMinDepth strictly below nearClipDist
-            //    so near-plane-clipped endpoints are NEVER rejected), clip 2D against viewport, and preserve exact
-            //    static dash phase in double precision.
+            //    first clip 3D segment against camera near plane in double precision, then project
+            //    already-verified endpoints directly (no redundant float depth re-check), clip 2D
+            //    via exact float-rational Liang-Barsky, and preserve exact dash phase in 106-bit double-double.
             double dashPeriod = (double)settings.DashLength + Math.Max(0.0, settings.GapLength);
 
             for (int i = 0; i < plan.Edges.Count; i++)
@@ -214,26 +212,28 @@ namespace MonsterPathPredictor.Runtime
                     continue;
 
                 Point2 pFrom, pTo;
-                if (!clippedNearStart)
+                if (!clippedNearStart && _screenCache.TryGetValue(edge.FromLandId, out pFrom))
                 {
-                    if (!TryProjectTileRaw(edge.FromLandId, out pFrom)) continue;
+                    // Reuse cached projection
                 }
                 else
                 {
-                    if (!TryProjectWorldUnclipped(layer, camera, camPos, camForward, new Vector3(cax, cay, caz), out pFrom, clippedMinDepth)) continue;
+                    if (!TryProjectWorldUnclipped(layer, camera, camPos, camForward, new Vector3(cax, cay, caz), out pFrom, nearClipDist, skipDepthCheck: true)) continue;
+                    if (!clippedNearStart) _screenCache[edge.FromLandId] = pFrom;
                 }
 
-                if (!clippedNearEnd)
+                if (!clippedNearEnd && _screenCache.TryGetValue(edge.ToLandId, out pTo))
                 {
-                    if (!TryProjectTileRaw(edge.ToLandId, out pTo)) continue;
+                    // Reuse cached projection
                 }
                 else
                 {
-                    if (!TryProjectWorldUnclipped(layer, camera, camPos, camForward, new Vector3(cbx, cby, cbz), out pTo, clippedMinDepth)) continue;
+                    if (!TryProjectWorldUnclipped(layer, camera, camPos, camForward, new Vector3(cbx, cby, cbz), out pTo, nearClipDist, skipDepthCheck: true)) continue;
+                    if (!clippedNearEnd) _screenCache[edge.ToLandId] = pTo;
                 }
 
                 if (!DashGeometry.TryClipSegmentToRect(pFrom, pTo, -40f, -40f, layer.width + 40f, layer.height + 40f,
-                        out var clipFrom, out var clipTo, out double clippedFromStartPx))
+                        out var clipFrom, out var clipTo, out double clippedFromStartHi, out double clippedFromStartLo))
                     continue;
 
                 Color color = PickEdgeColor(edge.Probability, edge.IsAfterCombat);
@@ -242,6 +242,7 @@ namespace MonsterPathPredictor.Runtime
                     ? baseWidth
                     : Math.Max(2.0f, baseWidth * (0.65f + 0.35f * (float)edge.Probability));
 
+                double clippedFromStartPx = clippedFromStartHi + clippedFromStartLo;
                 double origTrimStart = clippedNearStart ? 0.0 : (edge.EarliestStep == 0 ? 10.0 : 3.0);
                 double origTrimEnd = clippedNearEnd ? 0.0 : 3.0;
                 double trimStart = Math.Max(0.0, origTrimStart - clippedFromStartPx);
@@ -251,7 +252,7 @@ namespace MonsterPathPredictor.Runtime
                                            ((double)clipTo.Y - clipFrom.Y) * ((double)clipTo.Y - clipFrom.Y));
                 double clippedEndPx = Math.Max(0.0, fullEdgeLen - clippedFromStartPx - clipLen);
                 double trimEnd = Math.Max(0.0, origTrimEnd - clippedEndPx);
-                float clippedPhase = DashGeometry.ComputeClippedDashPhase(phaseOffset, origTrimStart, clippedFromStartPx, trimStart, dashPeriod);
+                float clippedPhase = DashGeometry.ComputeClippedDashPhase(phaseOffset, origTrimStart, clippedFromStartHi, clippedFromStartLo, trimStart, dashPeriod);
 
                 DashGeometry.BuildDashedSegmentsInto(
                     _dashQuadBuf,
@@ -490,10 +491,15 @@ namespace MonsterPathPredictor.Runtime
             Vector3 camForward,
             Vector3 world,
             out Point2 pt,
-            float minDepth = 0.01f)
+            float minDepth = 0.01f,
+            bool skipDepthCheck = false)
         {
             pt = default;
-            if (Vector3.Dot(world - camPos, camForward) < minDepth) return false;
+            if (!skipDepthCheck &&
+                DashGeometry.ComputeCameraDepth(world.x, world.y, world.z, camPos.x, camPos.y, camPos.z, camForward.x, camForward.y, camForward.z) < minDepth)
+            {
+                return false;
+            }
             Vector2 local = layer.WorldToLocal(world, camera);
             if (float.IsNaN(local.x) || float.IsInfinity(local.x) || float.IsNaN(local.y) || float.IsInfinity(local.y))
                 return false;

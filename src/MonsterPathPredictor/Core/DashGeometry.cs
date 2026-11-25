@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 
 namespace MonsterPathPredictor.Core
 {
@@ -355,188 +356,153 @@ namespace MonsterPathPredictor.Core
             out Point2 clippedB,
             out double startTrimPx)
         {
+            bool ok = TryClipSegmentToRect(a, b, minX, minY, maxX, maxY, out clippedA, out clippedB, out double trimHi, out double trimLo);
+            startTrimPx = trimHi + trimLo;
+            return ok;
+        }
+
+        /// <summary>
+        /// Exact rational Liang-Barsky clipping over the true binary IEEE-754 float values of all 8 inputs.
+        /// Eliminates both decimal 15-digit conversion drift (e.g. H=2^57) and double anchor cancellation
+        /// (e.g. H=2^84, 2^100), and outputs the clipped start distance as a 106-bit double-double
+        /// (<paramref name="startTrimHi"/> + <paramref name="startTrimLo"/>) so huge clip distances
+        /// (e.g. 2^60 - 40 px) retain exact dash phase modulo period.
+        /// </summary>
+        public static bool TryClipSegmentToRect(
+            Point2 a,
+            Point2 b,
+            float minX,
+            float minY,
+            float maxX,
+            float maxY,
+            out Point2 clippedA,
+            out Point2 clippedB,
+            out double startTrimHi,
+            out double startTrimLo)
+        {
             clippedA = a;
             clippedB = b;
-            startTrimPx = 0.0;
+            startTrimHi = 0.0;
+            startTrimLo = 0.0;
 
-            double ax = a.X, ay = a.Y;
-            double bx = b.X, by = b.Y;
-            double dMinX = minX, dMinY = minY, dMaxX = maxX, dMaxY = maxY;
-            if (double.IsNaN(ax) || double.IsInfinity(ax) || double.IsNaN(ay) || double.IsInfinity(ay) ||
-                double.IsNaN(bx) || double.IsInfinity(bx) || double.IsNaN(by) || double.IsInfinity(by))
-                return false;
-
-            double maxAbs = Math.Max(
-                Math.Max(Math.Max(Math.Abs(ax), Math.Abs(ay)), Math.Max(Math.Abs(bx), Math.Abs(by))),
-                Math.Max(Math.Max(Math.Abs(dMinX), Math.Abs(dMaxX)), Math.Max(Math.Abs(dMinY), Math.Abs(dMaxY))));
-
-            double dx = bx - ax;
-            double dy = by - ay;
-            double fullLen = Math.Sqrt(dx * dx + dy * dy);
-
-            if (maxAbs <= 1e26)
+            if (float.IsNaN(a.X) || float.IsInfinity(a.X) || float.IsNaN(a.Y) || float.IsInfinity(a.Y) ||
+                float.IsNaN(b.X) || float.IsInfinity(b.X) || float.IsNaN(b.Y) || float.IsInfinity(b.Y) ||
+                float.IsNaN(minX) || float.IsInfinity(minX) || float.IsNaN(minY) || float.IsInfinity(minY) ||
+                float.IsNaN(maxX) || float.IsInfinity(maxX) || float.IsNaN(maxY) || float.IsInfinity(maxY) ||
+                minX > maxX || minY > maxY)
             {
-                decimal dax = (decimal)ax, day = (decimal)ay;
-                decimal dbx = (decimal)bx, dby = (decimal)by;
-                decimal dmX = (decimal)dMinX, dmY = (decimal)dMinY, dMX = (decimal)dMaxX, dMY = (decimal)dMaxY;
-                decimal mx = (dax + dbx) * 0.5m;
-                decimal my = (day + dby) * 0.5m;
-                decimal hx = (dbx - dax) * 0.5m;
-                decimal hy = (dby - day) * 0.5m;
+                return false;
+            }
 
-                decimal s0 = -1m;
-                decimal s1 = 1m;
-                int hitStartEdge = 0; // 1=minX, 2=maxX, 3=minY, 4=maxY
-                int hitEndEdge = 0;
+            // Decode exact binary IEEE-754 single representation: v = (-1)^neg * mant * 2^exp
+            DecodeFloat(a.X, out bool axNeg, out uint axM, out int axE);
+            DecodeFloat(a.Y, out bool ayNeg, out uint ayM, out int ayE);
+            DecodeFloat(b.X, out bool bxNeg, out uint bxM, out int bxE);
+            DecodeFloat(b.Y, out bool byNeg, out uint byM, out int byE);
+            DecodeFloat(minX, out bool mnXNeg, out uint mnXM, out int mnXE);
+            DecodeFloat(minY, out bool mnYNeg, out uint mnYM, out int mnYE);
+            DecodeFloat(maxX, out bool mxXNeg, out uint mxXM, out int mxXE);
+            DecodeFloat(maxY, out bool mxYNeg, out uint mxYM, out int mxYE);
 
-                bool ClipDec(decimal p, decimal q, int edgeId)
-                {
-                    if (p == 0m) return q >= 0m;
-                    // Check half-plane inequality p*s <= q at current endpoints [s0, s1] via multiplication only
-                    // before dividing q/p, guaranteeing |q/p| <= 1 and eliminating OverflowException on near-axis segments.
-                    decimal f0 = q - p * s0;
-                    decimal f1 = q - p * s1;
-                    if (p < 0m)
-                    {
-                        if (f1 < 0m) return false;
-                        if (f0 >= 0m) return true;
-                        decimal r = q / p;
-                        if (r < s0) r = s0;
-                        if (r > s1) r = s1;
-                        s0 = r;
-                        hitStartEdge = edgeId;
-                    }
-                    else
-                    {
-                        if (f0 < 0m) return false;
-                        if (f1 >= 0m) return true;
-                        decimal r = q / p;
-                        if (r < s0) r = s0;
-                        if (r > s1) r = s1;
-                        s1 = r;
-                        hitEndEdge = edgeId;
-                    }
-                    return true;
-                }
-
-                if (!ClipDec(-hx, mx - dmX, 1)) return false;
-                if (!ClipDec(hx, dMX - mx, 2)) return false;
-                if (!ClipDec(-hy, my - dmY, 3)) return false;
-                if (!ClipDec(hy, dMY - my, 4)) return false;
-
-                double t0 = (double)((s0 + 1m) * 0.5m);
-                startTrimPx = t0 * fullLen;
-
-                decimal x0 = hitStartEdge == 1 ? dmX : (hitStartEdge == 2 ? dMX : (mx + s0 * hx));
-                decimal y0 = hitStartEdge == 3 ? dmY : (hitStartEdge == 4 ? dMY : (my + s0 * hy));
-                decimal x1 = hitEndEdge == 1 ? dmX : (hitEndEdge == 2 ? dMX : (mx + s1 * hx));
-                decimal y1 = hitEndEdge == 3 ? dmY : (hitEndEdge == 4 ? dMY : (my + s1 * hy));
-
-                clippedA = new Point2((float)x0, (float)y0);
-                clippedB = new Point2((float)x1, (float)y1);
+            int baseExp = int.MaxValue;
+            void MinExp(uint m, int e) { if (m != 0 && e < baseExp) baseExp = e; }
+            MinExp(axM, axE); MinExp(ayM, ayE); MinExp(bxM, bxE); MinExp(byM, byE);
+            MinExp(mnXM, mnXE); MinExp(mnYM, mnYE); MinExp(mxXM, mxXE); MinExp(mxYM, mxYE);
+            if (baseExp == int.MaxValue)
+            {
+                clippedA = new Point2(0f, 0f);
+                clippedB = new Point2(0f, 0f);
                 return true;
             }
 
-            // Fallback for extreme coordinates > 1e26: anchor parameterization at a point on the segment
-            // closest to the viewport center so viewport bounds never suffer catastrophic cancellation
-            // against huge far-endpoint coordinates (e.g. (0,0)->(2^100,2^100) vs [0,800]x[0,100]).
-            double cx = (dMinX + dMaxX) * 0.5;
-            double cy = (dMinY + dMaxY) * 0.5;
-            double mxD = (ax + bx) * 0.5;
-            double myD = (ay + by) * 0.5;
+            ExactInt eAx = ExactInt.FromShiftedUint(axNeg, axM, axM == 0 ? 0 : axE - baseExp);
+            ExactInt eAy = ExactInt.FromShiftedUint(ayNeg, ayM, ayM == 0 ? 0 : ayE - baseExp);
+            ExactInt eBx = ExactInt.FromShiftedUint(bxNeg, bxM, bxM == 0 ? 0 : bxE - baseExp);
+            ExactInt eBy = ExactInt.FromShiftedUint(byNeg, byM, byM == 0 ? 0 : byE - baseExp);
+            ExactInt eMinX = ExactInt.FromShiftedUint(mnXNeg, mnXM, mnXM == 0 ? 0 : mnXE - baseExp);
+            ExactInt eMinY = ExactInt.FromShiftedUint(mnYNeg, mnYM, mnYM == 0 ? 0 : mnYE - baseExp);
+            ExactInt eMaxX = ExactInt.FromShiftedUint(mxXNeg, mxXM, mxXM == 0 ? 0 : mxXE - baseExp);
+            ExactInt eMaxY = ExactInt.FromShiftedUint(mxYNeg, mxYM, mxYM == 0 ? 0 : mxYE - baseExp);
 
-            double ox = ax, oy = ay, tO = 0.0;
-            double bestDist = Math.Max(Math.Abs(ax - cx), Math.Abs(ay - cy));
-            double bDist = Math.Max(Math.Abs(bx - cx), Math.Abs(by - cy));
-            if (bDist < bestDist)
-            {
-                ox = bx; oy = by; tO = 1.0; bestDist = bDist;
-            }
-            double mDist = Math.Max(Math.Abs(mxD - cx), Math.Abs(myD - cy));
-            if (mDist < bestDist)
-            {
-                ox = mxD; oy = myD; tO = 0.5; bestDist = mDist;
-            }
+            ExactInt eDx = ExactInt.Sub(eBx, eAx);
+            ExactInt eDy = ExactInt.Sub(eBy, eAy);
 
-            double rectSpan = Math.Max(1.0, Math.Max(dMaxX - dMinX, dMaxY - dMinY));
-            double dirScale = Math.Max(Math.Abs(dx), Math.Abs(dy));
-            if (bestDist > rectSpan * 16.0 && dirScale > 0.0)
+            // Exact rational interval [t0N/t0D, t1N/t1D] with t0D > 0, t1D > 0 (initially [0/1, 1/1]).
+            ExactInt t0N = ExactInt.Zero, t0D = ExactInt.One;
+            ExactInt t1N = ExactInt.One, t1D = ExactInt.One;
+            int hitStartEdge = 0; // 1=minX, 2=maxX, 3=minY, 4=maxY
+            int hitEndEdge = 0;
+
+            bool ClipExact(ExactInt p, ExactInt q, int edgeId)
             {
-                double sdx = dx / dirScale;
-                double sdy = dy / dirScale;
-                double denom = dirScale * (sdx * sdx + sdy * sdy);
-                if (denom > 0.0 && !double.IsInfinity(denom))
+                if (p.IsZero) return !q.IsNegative;
+                // Candidate root r = q / p; normalize denominator > 0 as rN / rD.
+                ExactInt rN = p.IsNegative ? q.Negate() : q;
+                ExactInt rD = p.Abs();
+                if (p.IsNegative)
                 {
-                    double du = ((cx - ox) * sdx + (cy - oy) * sdy) / denom;
-                    double minDu = -tO;
-                    double maxDu = 1.0 - tO;
-                    if (du < minDu) du = minDu;
-                    if (du > maxDu) du = maxDu;
-                    double px = ox + du * dx;
-                    double py = oy + du * dy;
-                    double pDist = Math.Max(Math.Abs(px - cx), Math.Abs(py - cy));
-                    if (pDist < bestDist)
+                    // Constraint: t >= rN / rD
+                    if (ExactInt.CompareRat(rN, rD, t1N, t1D) > 0) return false;
+                    if (ExactInt.CompareRat(rN, rD, t0N, t0D) > 0)
                     {
-                        ox = px; oy = py; tO += du;
+                        t0N = rN; t0D = rD; hitStartEdge = edgeId;
                     }
-                }
-            }
-
-            double u0 = -tO;
-            double u1 = 1.0 - tO;
-            int dHitStart = 0, dHitEnd = 0;
-
-            bool ClipDbl(double p, double q, int edgeId)
-            {
-                if (p == 0.0) return q >= 0.0;
-                double f0 = q - p * u0;
-                double f1 = q - p * u1;
-                if (p < 0.0)
-                {
-                    if (f1 < 0.0) return false;
-                    if (f0 >= 0.0) return true;
-                    double r = q / p;
-                    if (r < u0) r = u0;
-                    if (r > u1) r = u1;
-                    u0 = r;
-                    dHitStart = edgeId;
                 }
                 else
                 {
-                    if (f0 < 0.0) return false;
-                    if (f1 >= 0.0) return true;
-                    double r = q / p;
-                    if (r < u0) r = u0;
-                    if (r > u1) r = u1;
-                    u1 = r;
-                    dHitEnd = edgeId;
+                    // Constraint: t <= rN / rD
+                    if (ExactInt.CompareRat(rN, rD, t0N, t0D) < 0) return false;
+                    if (ExactInt.CompareRat(rN, rD, t1N, t1D) < 0)
+                    {
+                        t1N = rN; t1D = rD; hitEndEdge = edgeId;
+                    }
                 }
                 return true;
             }
 
-            if (!ClipDbl(-dx, ox - dMinX, 1)) return false;
-            if (!ClipDbl(dx, dMaxX - ox, 2)) return false;
-            if (!ClipDbl(-dy, oy - dMinY, 3)) return false;
-            if (!ClipDbl(dy, dMaxY - oy, 4)) return false;
+            if (!ClipExact(eDx.Negate(), ExactInt.Sub(eAx, eMinX), 1)) return false;
+            if (!ClipExact(eDx, ExactInt.Sub(eMaxX, eAx), 2)) return false;
+            if (!ClipExact(eDy.Negate(), ExactInt.Sub(eAy, eMinY), 3)) return false;
+            if (!ClipExact(eDy, ExactInt.Sub(eMaxY, eAy), 4)) return false;
 
-            double tStart = tO + u0;
-            if (tStart < 0.0) tStart = 0.0;
-            if (tStart > 1.0) tStart = 1.0;
-            startTrimPx = tStart * fullLen;
+            float x0 = hitStartEdge == 1 ? minX : (hitStartEdge == 2 ? maxX : (float)ExactInt.ToDoubleRatio(ExactInt.Add(ExactInt.Mul(eAx, t0D), ExactInt.Mul(eDx, t0N)), t0D, baseExp));
+            float y0 = hitStartEdge == 3 ? minY : (hitStartEdge == 4 ? maxY : (float)ExactInt.ToDoubleRatio(ExactInt.Add(ExactInt.Mul(eAy, t0D), ExactInt.Mul(eDy, t0N)), t0D, baseExp));
+            float x1 = hitEndEdge == 1 ? minX : (hitEndEdge == 2 ? maxX : (float)ExactInt.ToDoubleRatio(ExactInt.Add(ExactInt.Mul(eAx, t1D), ExactInt.Mul(eDx, t1N)), t1D, baseExp));
+            float y1 = hitEndEdge == 3 ? minY : (hitEndEdge == 4 ? maxY : (float)ExactInt.ToDoubleRatio(ExactInt.Add(ExactInt.Mul(eAy, t1D), ExactInt.Mul(eDy, t1N)), t1D, baseExp));
 
-            double dx0 = dHitStart == 1 ? dMinX : (dHitStart == 2 ? dMaxX : (ox + u0 * dx));
-            double dy0 = dHitStart == 3 ? dMinY : (dHitStart == 4 ? dMaxY : (oy + u0 * dy));
-            double dx1 = dHitEnd == 1 ? dMinX : (dHitEnd == 2 ? dMaxX : (ox + u1 * dx));
-            double dy1 = dHitEnd == 3 ? dMinY : (dHitEnd == 4 ? dMaxY : (oy + u1 * dy));
+            clippedA = new Point2(x0, y0);
+            clippedB = new Point2(x1, y1);
 
-            clippedA = new Point2((float)dx0, (float)dy0);
-            clippedB = new Point2((float)dx1, (float)dy1);
+            if (!t0N.IsZero)
+            {
+                // Exact 106-bit double-double clipped distance from A to clippedA:
+                // |clippedA - A| = sqrt((dx * t0)^2 + (dy * t0)^2) with dx*t0 = (eDx * t0N) / t0D * 2^baseExp
+                ExactInt.ToDoubleDoubleRatio(ExactInt.Mul(eDx, t0N), t0D, baseExp, out double dcxHi, out double dcxLo);
+                ExactInt.ToDoubleDoubleRatio(ExactInt.Mul(eDy, t0N), t0D, baseExp, out double dcyHi, out double dcyLo);
+                HypotDD(dcxHi, dcxLo, dcyHi, dcyLo, out startTrimHi, out startTrimLo);
+            }
+
             return true;
+        }
+
+        /// <summary>
+        /// Computes signed depth along the camera forward axis in double precision.
+        /// Shared by near-plane clipping, tile projection, and hit-box picking so endpoints that
+        /// pass clipping are never rejected by lower-precision float dot-product drift.
+        /// </summary>
+        public static double ComputeCameraDepth(
+            float x, float y, float z,
+            float camX, float camY, float camZ,
+            float fwdX, float fwdY, float fwdZ)
+        {
+            return ((double)x - camX) * fwdX + ((double)y - camY) * fwdY + ((double)z - camZ) * fwdZ;
         }
 
         /// <summary>
         /// Clips a 3D world-space segment against the camera near plane defined by
         /// <c>Dot(P - planeOrigin, planeNormal) >= nearDist</c>.
+        /// Interpolates from whichever endpoint is closer to the near plane so extreme depth disparities
+        /// (e.g. A=(0,0,-2^60), B=(0.25,0,10), near=1) never round t to 1.0 and collapse onto the camera plane.
         /// Returns false only when both endpoints lie strictly behind the near plane.
         /// </summary>
         public static bool TryClipSegmentToNearPlane(
@@ -550,8 +516,8 @@ namespace MonsterPathPredictor.Core
             out bool clippedStart,
             out bool clippedEnd)
         {
-            double dA = ((double)ax - camX) * fwdX + ((double)ay - camY) * fwdY + ((double)az - camZ) * fwdZ - nearDist;
-            double dB = ((double)bx - camX) * fwdX + ((double)by - camY) * fwdY + ((double)bz - camZ) * fwdZ - nearDist;
+            double dA = ComputeCameraDepth(ax, ay, az, camX, camY, camZ, fwdX, fwdY, fwdZ) - nearDist;
+            double dB = ComputeCameraDepth(bx, by, bz, camX, camY, camZ, fwdX, fwdY, fwdZ) - nearDist;
 
             clippedStart = false;
             clippedEnd = false;
@@ -564,20 +530,42 @@ namespace MonsterPathPredictor.Core
             {
                 double denom = dB - dA;
                 if (denom <= 1e-12) return false;
-                double t = -dA / denom;
-                outAx = (float)(ax + t * ((double)bx - ax));
-                outAy = (float)(ay + t * ((double)by - ay));
-                outAz = (float)(az + t * ((double)bz - az));
+                if (dB <= -dA)
+                {
+                    // B is closer to the near plane: interpolate backward from B with s in [0, 0.5]
+                    double s = dB / denom;
+                    outAx = (float)(bx + s * ((double)ax - bx));
+                    outAy = (float)(by + s * ((double)ay - by));
+                    outAz = (float)(bz + s * ((double)az - bz));
+                }
+                else
+                {
+                    double t = -dA / denom;
+                    outAx = (float)(ax + t * ((double)bx - ax));
+                    outAy = (float)(ay + t * ((double)by - ay));
+                    outAz = (float)(az + t * ((double)bz - az));
+                }
                 clippedStart = true;
             }
             else if (dB < 0.0)
             {
                 double denom = dA - dB;
                 if (denom <= 1e-12) return false;
-                double t = dA / denom;
-                outBx = (float)(ax + t * ((double)bx - ax));
-                outBy = (float)(ay + t * ((double)by - ay));
-                outBz = (float)(az + t * ((double)bz - az));
+                if (dA <= -dB)
+                {
+                    // A is closer to the near plane: interpolate forward from A with t in [0, 0.5]
+                    double t = dA / denom;
+                    outBx = (float)(ax + t * ((double)bx - ax));
+                    outBy = (float)(ay + t * ((double)by - ay));
+                    outBz = (float)(az + t * ((double)bz - az));
+                }
+                else
+                {
+                    double s = -dB / denom;
+                    outBx = (float)(bx + s * ((double)ax - bx));
+                    outBy = (float)(by + s * ((double)ay - by));
+                    outBz = (float)(bz + s * ((double)az - bz));
+                }
                 clippedEnd = true;
             }
 
@@ -586,8 +574,7 @@ namespace MonsterPathPredictor.Core
 
         /// <summary>
         /// Computes the dash phase offset for a viewport-clipped sub-segment in double precision,
-        /// reducing modulo <paramref name="period"/> before converting to float so huge clip distances
-        /// (e.g. 67,108,864 px) never suffer float-rounding phase drift.
+        /// reducing each signed term individually modulo <paramref name="period"/> before combining.
         /// </summary>
         public static float ComputeClippedDashPhase(
             double phaseOffset,
@@ -596,9 +583,26 @@ namespace MonsterPathPredictor.Core
             double newTrimStart,
             double period = 0.0)
         {
+            return ComputeClippedDashPhase(phaseOffset, origTrimStart, clippedFromStartPx, 0.0, newTrimStart, period);
+        }
+
+        /// <summary>
+        /// High-precision overload accepting a 106-bit double-double clipped length
+        /// (<paramref name="clippedFromStartHi"/> + <paramref name="clippedFromStartLo"/>) so huge
+        /// clip distances (e.g. 2^60 - 40 px) retain exact phase remainder modulo <paramref name="period"/>.
+        /// </summary>
+        public static float ComputeClippedDashPhase(
+            double phaseOffset,
+            double origTrimStart,
+            double clippedFromStartHi,
+            double clippedFromStartLo,
+            double newTrimStart,
+            double period = 0.0)
+        {
             if (double.IsNaN(phaseOffset) || double.IsInfinity(phaseOffset) ||
                 double.IsNaN(origTrimStart) || double.IsInfinity(origTrimStart) ||
-                double.IsNaN(clippedFromStartPx) || double.IsInfinity(clippedFromStartPx) ||
+                double.IsNaN(clippedFromStartHi) || double.IsInfinity(clippedFromStartHi) ||
+                double.IsNaN(clippedFromStartLo) || double.IsInfinity(clippedFromStartLo) ||
                 double.IsNaN(newTrimStart) || double.IsInfinity(newTrimStart))
             {
                 return 0f;
@@ -606,18 +610,17 @@ namespace MonsterPathPredictor.Core
 
             if (period > 0.0 && !double.IsNaN(period) && !double.IsInfinity(period))
             {
-                // Reduce each signed term individually modulo period before combining so huge
-                // clip distances (e.g. 2^60 px) never swamp small offsets like 10 px during subtraction.
                 double a = phaseOffset % period;
                 double b = origTrimStart % period;
-                double c = clippedFromStartPx % period;
+                double cHi = clippedFromStartHi % period;
+                double cLo = clippedFromStartLo % period;
                 double d = newTrimStart % period;
-                double rem = ((a + b) - (c + d)) % period;
+                double rem = ((a + b) - (cHi + cLo + d)) % period;
                 if (rem < 0.0) rem += period;
                 return (float)rem;
             }
 
-            double raw = phaseOffset + origTrimStart - clippedFromStartPx - newTrimStart;
+            double raw = phaseOffset + origTrimStart - clippedFromStartHi - clippedFromStartLo - newTrimStart;
             if (double.IsNaN(raw) || double.IsInfinity(raw)) return 0f;
             return (float)raw;
         }
@@ -766,6 +769,361 @@ namespace MonsterPathPredictor.Core
         {
             if (SignedArea(points) < 0f) Array.Reverse(points);
             return points;
+        }
+
+        [StructLayout(LayoutKind.Explicit)]
+        private struct FloatBitsUnion
+        {
+            [FieldOffset(0)] public float F;
+            [FieldOffset(0)] public int I;
+        }
+
+        private static void DecodeFloat(float value, out bool neg, out uint mant, out int exp)
+        {
+            if (value == 0f)
+            {
+                neg = false; mant = 0; exp = 0;
+                return;
+            }
+            var u = new FloatBitsUnion { F = value };
+            int bits = u.I;
+            neg = (bits & unchecked((int)0x80000000)) != 0;
+            int rawExp = (bits >> 23) & 0xFF;
+            uint frac = (uint)(bits & 0x7FFFFF);
+            if (rawExp == 0)
+            {
+                mant = frac;
+                exp = -149;
+            }
+            else
+            {
+                mant = frac | 0x800000u;
+                exp = rawExp - 150;
+            }
+            while ((mant & 1u) == 0)
+            {
+                mant >>= 1;
+                exp++;
+            }
+        }
+
+        private static void TwoSum(double a, double b, out double s, out double e)
+        {
+            s = a + b;
+            double v = s - a;
+            e = (a - (s - v)) + (b - v);
+        }
+
+        private static void TwoProd(double a, double b, out double p, out double e)
+        {
+            // Veltkamp split (27-bit) — works on netstandard2.0 without Math.FusedMultiplyAdd.
+            const double Split = 134217729.0; // 2^27 + 1
+            p = a * b;
+            double ca = Split * a;
+            double ah = ca - (ca - a);
+            double al = a - ah;
+            double cb = Split * b;
+            double bh = cb - (cb - b);
+            double bl = b - bh;
+            e = ((ah * bh - p) + ah * bl + al * bh) + al * bl;
+        }
+
+        private static void HypotDD(double axHi, double axLo, double ayHi, double ayLo, out double rHi, out double rLo)
+        {
+            if (axHi == 0.0 && axLo == 0.0)
+            {
+                rHi = Math.Abs(ayHi);
+                rLo = ayHi < 0.0 ? -ayLo : ayLo;
+                return;
+            }
+            if (ayHi == 0.0 && ayLo == 0.0)
+            {
+                rHi = Math.Abs(axHi);
+                rLo = axHi < 0.0 ? -axLo : axLo;
+                return;
+            }
+
+            double maxH = Math.Max(Math.Abs(axHi), Math.Abs(ayHi));
+            int scaleExp = (int)Math.Floor(Math.Log(maxH, 2.0));
+            double invScale = Math.Pow(2.0, -scaleExp);
+            double xh = axHi * invScale, xl = axLo * invScale;
+            double yh = ayHi * invScale, yl = ayLo * invScale;
+
+            // Compute s = x^2 + y^2 in double-double
+            TwoProd(xh, xh, out double x2h, out double x2e);
+            double x2l = x2e + 2.0 * xh * xl;
+            TwoSum(x2h, x2l, out x2h, out x2l);
+
+            TwoProd(yh, yh, out double y2h, out double y2e);
+            double y2l = y2e + 2.0 * yh * yl;
+            TwoSum(y2h, y2l, out y2h, out y2l);
+
+            TwoSum(x2h, y2h, out double sh, out double se);
+            double sl = se + x2l + y2l;
+            TwoSum(sh, sl, out sh, out sl);
+
+            // One Newton step in double-double: r = sqrt(sh); r += (s - r^2) / (2*r)
+            double r0 = Math.Sqrt(sh);
+            TwoProd(r0, r0, out double r2h, out double r2l);
+            double diff = (sh - r2h) + (sl - r2l);
+            double corr = r0 > 0.0 ? diff / (2.0 * r0) : 0.0;
+            TwoSum(r0, corr, out double rh, out double rl);
+
+            double scale = Math.Pow(2.0, scaleExp);
+            rHi = rh * scale;
+            rLo = rl * scale;
+        }
+
+        private readonly struct ExactInt
+        {
+            public static readonly ExactInt Zero = new ExactInt(false, Array.Empty<uint>());
+            public static readonly ExactInt One = new ExactInt(false, new uint[] { 1u });
+
+            private readonly bool _neg;
+            private readonly uint[] _limbs; // little-endian, trimmed (no leading zero limbs)
+
+            private ExactInt(bool neg, uint[] limbs)
+            {
+                int len = limbs != null ? limbs.Length : 0;
+                while (len > 0 && limbs[len - 1] == 0u) len--;
+                if (len == 0)
+                {
+                    _neg = false;
+                    _limbs = Array.Empty<uint>();
+                }
+                else
+                {
+                    _neg = neg;
+                    if (len == limbs.Length)
+                    {
+                        _limbs = limbs;
+                    }
+                    else
+                    {
+                        _limbs = new uint[len];
+                        Array.Copy(limbs, _limbs, len);
+                    }
+                }
+            }
+
+            public bool IsZero => _limbs == null || _limbs.Length == 0;
+            public bool IsNegative => _neg && !IsZero;
+
+            public ExactInt Abs() => IsNegative ? new ExactInt(false, _limbs) : this;
+            public ExactInt Negate() => IsZero ? Zero : new ExactInt(!_neg, _limbs);
+
+            public int BitLength
+            {
+                get
+                {
+                    if (IsZero) return 0;
+                    uint top = _limbs[_limbs.Length - 1];
+                    int bits = (_limbs.Length - 1) * 32;
+                    while (top != 0u) { bits++; top >>= 1; }
+                    return bits;
+                }
+            }
+
+            public static ExactInt FromShiftedUint(bool neg, uint mant, int shift)
+            {
+                if (mant == 0u) return Zero;
+                int w = shift >> 5;
+                int b = shift & 31;
+                if (b == 0)
+                {
+                    var arr = new uint[w + 1];
+                    arr[w] = mant;
+                    return new ExactInt(neg, arr);
+                }
+                uint lo = mant << b;
+                uint hi = mant >> (32 - b);
+                var limbs = new uint[hi != 0u ? w + 2 : w + 1];
+                limbs[w] = lo;
+                if (hi != 0u) limbs[w + 1] = hi;
+                return new ExactInt(neg, limbs);
+            }
+
+            public ExactInt ShiftLeft(int shift)
+            {
+                if (IsZero || shift <= 0) return this;
+                int w = shift >> 5;
+                int b = shift & 31;
+                int n = _limbs.Length;
+                if (b == 0)
+                {
+                    var res = new uint[n + w];
+                    Array.Copy(_limbs, 0, res, w, n);
+                    return new ExactInt(_neg, res);
+                }
+                var outArr = new uint[n + w + 1];
+                ulong carry = 0;
+                for (int i = 0; i < n; i++)
+                {
+                    ulong v = ((ulong)_limbs[i] << b) | carry;
+                    outArr[i + w] = (uint)v;
+                    carry = v >> 32;
+                }
+                if (carry != 0) outArr[n + w] = (uint)carry;
+                return new ExactInt(_neg, outArr);
+            }
+
+            public static int CompareAbs(ExactInt a, ExactInt b)
+            {
+                int al = a._limbs != null ? a._limbs.Length : 0;
+                int bl = b._limbs != null ? b._limbs.Length : 0;
+                if (al != bl) return al.CompareTo(bl);
+                for (int i = al - 1; i >= 0; i--)
+                {
+                    if (a._limbs[i] != b._limbs[i]) return a._limbs[i].CompareTo(b._limbs[i]);
+                }
+                return 0;
+            }
+
+            public static int CompareTo(ExactInt a, ExactInt b)
+            {
+                if (a.IsZero && b.IsZero) return 0;
+                if (a.IsNegative != b.IsNegative) return a.IsNegative ? -1 : 1;
+                int c = CompareAbs(a, b);
+                return a.IsNegative ? -c : c;
+            }
+
+            public static int CompareRat(ExactInt n1, ExactInt d1, ExactInt n2, ExactInt d2)
+            {
+                return CompareTo(Mul(n1, d2), Mul(n2, d1));
+            }
+
+            public static ExactInt Add(ExactInt a, ExactInt b)
+            {
+                if (a.IsZero) return b;
+                if (b.IsZero) return a;
+                if (a._neg == b._neg) return new ExactInt(a._neg, AddAbs(a._limbs, b._limbs));
+                int cmp = CompareAbs(a, b);
+                if (cmp == 0) return Zero;
+                if (cmp > 0) return new ExactInt(a._neg, SubAbs(a._limbs, b._limbs));
+                return new ExactInt(b._neg, SubAbs(b._limbs, a._limbs));
+            }
+
+            public static ExactInt Sub(ExactInt a, ExactInt b) => Add(a, b.Negate());
+
+            public static ExactInt Mul(ExactInt a, ExactInt b)
+            {
+                if (a.IsZero || b.IsZero) return Zero;
+                int al = a._limbs.Length, bl = b._limbs.Length;
+                var res = new uint[al + bl];
+                for (int i = 0; i < al; i++)
+                {
+                    ulong ai = a._limbs[i];
+                    ulong carry = 0;
+                    for (int j = 0; j < bl; j++)
+                    {
+                        ulong prod = ai * b._limbs[j] + res[i + j] + carry;
+                        res[i + j] = (uint)prod;
+                        carry = prod >> 32;
+                    }
+                    if (carry != 0) res[i + bl] = (uint)carry;
+                }
+                return new ExactInt(a._neg != b._neg, res);
+            }
+
+            private static uint[] AddAbs(uint[] a, uint[] b)
+            {
+                int n = Math.Max(a.Length, b.Length);
+                var res = new uint[n + 1];
+                ulong carry = 0;
+                for (int i = 0; i < n; i++)
+                {
+                    ulong sum = carry + (i < a.Length ? a[i] : 0UL) + (i < b.Length ? b[i] : 0UL);
+                    res[i] = (uint)sum;
+                    carry = sum >> 32;
+                }
+                if (carry != 0) res[n] = (uint)carry;
+                return res;
+            }
+
+            private static uint[] SubAbs(uint[] a, uint[] b)
+            {
+                // Assumes |a| >= |b|
+                var res = new uint[a.Length];
+                long borrow = 0;
+                for (int i = 0; i < a.Length; i++)
+                {
+                    long diff = (long)a[i] - (i < b.Length ? b[i] : 0L) - borrow;
+                    if (diff < 0)
+                    {
+                        diff += 1L << 32;
+                        borrow = 1;
+                    }
+                    else
+                    {
+                        borrow = 0;
+                    }
+                    res[i] = (uint)diff;
+                }
+                return res;
+            }
+
+            public static double ToDoubleRatio(ExactInt num, ExactInt den, int scaleExp)
+            {
+                ToDoubleDoubleRatio(num, den, scaleExp, out double hi, out double lo);
+                return hi + lo;
+            }
+
+            public static void ToDoubleDoubleRatio(ExactInt num, ExactInt den, int scaleExp, out double hi, out double lo)
+            {
+                if (num.IsZero || den.IsZero)
+                {
+                    hi = 0.0;
+                    lo = 0.0;
+                    return;
+                }
+
+                bool neg = num._neg != den._neg;
+                ExactInt a = num.Abs();
+                ExactInt b = den.Abs();
+
+                // Locate exact expTop such that 2^expTop <= a / b < 2^(expTop + 1).
+                int expTop = a.BitLength - b.BitLength;
+                ExactInt rem = expTop < 0 ? a.ShiftLeft(-expTop) : a;
+                ExactInt div = expTop > 0 ? b.ShiftLeft(expTop) : b;
+                if (CompareAbs(rem, div) < 0)
+                {
+                    expTop--;
+                    rem = rem.ShiftLeft(1);
+                }
+
+                // Restoring binary long division extracting 53 bits for qHi + 53 bits for qLo (= 106 bits exact).
+                ulong qHi = 0;
+                ulong qLo = 0;
+                for (int i = 0; i < 106; i++)
+                {
+                    if (CompareAbs(rem, div) >= 0)
+                    {
+                        rem = new ExactInt(false, SubAbs(rem._limbs, div._limbs));
+                        if (i < 53) qHi |= 1UL << (52 - i);
+                        else qLo |= 1UL << (105 - i);
+                    }
+                    rem = rem.ShiftLeft(1);
+                }
+
+                // Round to nearest on bit 106
+                if (CompareAbs(rem, div) >= 0)
+                {
+                    qLo++;
+                    if (qLo == (1UL << 53))
+                    {
+                        qLo = 0;
+                        qHi++;
+                    }
+                }
+
+                hi = (double)qHi * Math.Pow(2.0, expTop - 52 + scaleExp);
+                lo = (double)qLo * Math.Pow(2.0, expTop - 105 + scaleExp);
+                if (neg)
+                {
+                    hi = -hi;
+                    lo = -lo;
+                }
+            }
         }
     }
 }

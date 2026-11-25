@@ -296,6 +296,35 @@ namespace MonsterPathPredictor.ReplayCertifier
             }
         }
 
+        public static bool HaveConflictingOutputPaths(string pathA, string pathB)
+        {
+            if (string.IsNullOrWhiteSpace(pathA) || string.IsNullOrWhiteSpace(pathB)) return false;
+            return AreSameOutputPath(pathA, pathB) ||
+                   IsPathInsideDirectory(pathA, pathB) ||
+                   IsPathInsideDirectory(pathB, pathA);
+        }
+
+        private static void ValidateWritableReportPath(string path, string label)
+        {
+            if (string.IsNullOrWhiteSpace(path)) return;
+            string full = Path.GetFullPath(path);
+            if (Directory.Exists(full))
+            {
+                throw new ArgumentException($"{label} output path \"{path}\" points to an existing directory.");
+            }
+            string ancestor = Path.GetDirectoryName(full);
+            while (!string.IsNullOrEmpty(ancestor))
+            {
+                if (File.Exists(ancestor))
+                {
+                    throw new ArgumentException($"{label} output path \"{path}\" cannot be created because ancestor \"{ancestor}\" is an existing file.");
+                }
+                string parent = Path.GetDirectoryName(ancestor);
+                if (string.Equals(parent, ancestor, StringComparison.Ordinal)) break;
+                ancestor = parent;
+            }
+        }
+
         private static void WriteTextAtomic(string path, string content)
         {
             string full = Path.GetFullPath(path);
@@ -321,10 +350,12 @@ namespace MonsterPathPredictor.ReplayCertifier
             string jsonOut,
             string mdOut)
         {
-            if (AreSameOutputPath(jsonOut, mdOut))
+            if (HaveConflictingOutputPaths(jsonOut, mdOut))
             {
-                throw new ArgumentException("JSON and Markdown output paths must not point to the same file.");
+                throw new ArgumentException("JSON and Markdown output paths must not resolve to the same file or ancestor/descendant paths.");
             }
+            ValidateWritableReportPath(jsonOut, "JSON");
+            ValidateWritableReportPath(mdOut, "Markdown");
             var eval = EvaluateGates(s, t);
             bool passed = eval.Passed;
             long aggroDetHits = eval.AggroDetHits;

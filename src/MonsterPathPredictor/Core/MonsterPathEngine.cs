@@ -844,7 +844,7 @@ namespace MonsterPathPredictor.Core
 
                     if (exactOk)
                     {
-                        if (!TryExactLongFromDouble(field.GetPathCount(nb), out long cL) || cL <= 0 || exactTotalLots > long.MaxValue - cL)
+                        if (!field.TryGetExactPathCount(nb, out long cL) || cL <= 0 || exactTotalLots > long.MaxValue - cL)
                         {
                             exactOk = false;
                         }
@@ -884,7 +884,7 @@ namespace MonsterPathPredictor.Core
 
                         if (exactOk)
                         {
-                            if (!TryExactLongFromDouble(field.GetPathCount(fwd), out long cL) || cL <= 0 ||
+                            if (!field.TryGetExactPathCount(fwd, out long cL) || cL <= 0 ||
                                 !TryMulRational(remNum, remDen, cL, exactTotalLots, out long addN, out long addD) ||
                                 !TryAddRational(exactNums[j], exactDens[j], addN, addD, out exactNums[j], out exactDens[j]))
                             {
@@ -1206,7 +1206,7 @@ namespace MonsterPathPredictor.Core
                 double logC = field.GetLogPathCount(nb);
                 if (double.IsNegativeInfinity(logC)) continue;
                 long exactC = -1;
-                if (TryExactLongFromDouble(field.GetPathCount(nb), out long cL) && cL > 0)
+                if (field.TryGetExactPathCount(nb, out long cL) && cL > 0)
                 {
                     exactC = cL;
                     if (firstExactC < 0) firstExactC = cL;
@@ -1356,7 +1356,7 @@ namespace MonsterPathPredictor.Core
                 double logC = bestField.GetLogPathCount(nb);
                 if (double.IsNegativeInfinity(logC)) continue;
                 long exactC = -1;
-                if (TryExactLongFromDouble(bestField.GetPathCount(nb), out long cL) && cL > 0)
+                if (bestField.TryGetExactPathCount(nb, out long cL) && cL > 0)
                 {
                     exactC = cL;
                     if (firstExactC < 0) firstExactC = cL;
@@ -1596,8 +1596,6 @@ namespace MonsterPathPredictor.Core
             }
         }
 
-        private const double MaxExactIntDouble = 9007199254740992.0; // 2^53
-
         private static long Gcd(long a, long b)
         {
             if (a < 0) a = -a;
@@ -1609,17 +1607,6 @@ namespace MonsterPathPredictor.Core
                 b = t;
             }
             return a == 0 ? 1 : a;
-        }
-
-        private static bool TryExactLongFromDouble(double value, out long exact)
-        {
-            exact = 0;
-            if (double.IsNaN(value) || double.IsInfinity(value) || value < 0.0 || value > MaxExactIntDouble)
-                return false;
-            double rounded = Math.Floor(value);
-            if (rounded != value) return false;
-            exact = (long)rounded;
-            return true;
         }
 
         private static bool TryMulChecked(long a, long b, out long prod)
@@ -1640,6 +1627,9 @@ namespace MonsterPathPredictor.Core
             long g2 = Gcd(n2, d1);
             if (!TryMulChecked(n1 / g1, n2 / g2, out rn)) return false;
             if (!TryMulChecked(d1 / g2, d2 / g1, out rd)) return false;
+            long gOut = Gcd(rn, rd);
+            rn /= gOut;
+            rd /= gOut;
             return true;
         }
 
@@ -1647,8 +1637,21 @@ namespace MonsterPathPredictor.Core
         {
             rn = 0;
             rd = 1;
-            if (n1 == 0) { rn = n2; rd = d2; return true; }
-            if (n2 == 0) { rn = n1; rd = d1; return true; }
+            if (n1 == 0)
+            {
+                if (n2 == 0) return true;
+                long g2 = Gcd(n2, d2);
+                rn = n2 / g2;
+                rd = d2 / g2;
+                return true;
+            }
+            if (n2 == 0)
+            {
+                long g1 = Gcd(n1, d1);
+                rn = n1 / g1;
+                rd = d1 / g1;
+                return true;
+            }
             long g = Gcd(d1, d2);
             long s1 = d1 / g;
             long s2 = d2 / g;

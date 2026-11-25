@@ -1127,5 +1127,120 @@ namespace MonsterPathPredictor.Tests
             Assert.Equal("<0.1%", tinyExit.FormatConditionalPercent());
             Assert.False(d54Fork.IsExactUniformSplit);
         }
+
+        [Fact]
+        public void Round9CoreRegressions_ReducedTwoFourthsEqual_ExactInt2Pow53Plus1_ExactFloatClip_CloserNearPlane_DoubleDoublePhase()
+        {
+            // Round 9 (#9): Two forward exits A=2, B=3 each with 2 shortest paths (via U=4, V=5) -> 2/4 and 2/4
+            // MUST reduce to exact 1/2 and set IsExactUniformSplit == true!
+            var board24 = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(0, new[] { 1 }),
+                new LandNodeSnapshot(1, new[] { 2, 3, 0 }),
+                new LandNodeSnapshot(2, new[] { 4, 5, 1 }),
+                new LandNodeSnapshot(3, new[] { 4, 5, 1 }),
+                new LandNodeSnapshot(4, new[] { 6, 2, 3 }),
+                new LandNodeSnapshot(5, new[] { 6, 2, 3 }),
+                new LandNodeSnapshot(6, new[] { 4, 5 })
+            });
+            var plan24 = MonsterPathEngine.Plan(
+                board24,
+                new MonsterState { MonsterId = 990, CurrentLandId = 1, FromLandId = 0, IsCurrentlyMovingMidTurn = true },
+                new List<TrackedPlayer> { new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = 6, IsAlive = true, IsTargetable = true } },
+                new PlanOptions { MaxSteps = 1 });
+            var fork24 = plan24.Forks.Single(f => f.ForkLandId == 1);
+            Assert.True(fork24.IsExactUniformSplit);
+            Assert.Equal(0.5, fork24.Exits[0].ConditionalProbability);
+            Assert.Equal(0.5, fork24.Exits[1].ConditionalProbability);
+
+            // Round 9 (#10): 2^53 vs 2^53 + 1 shortest paths (53 diamonds on both exits + 1 extra chain on exit B)
+            // MUST NOT be falsely certified as IsExactUniformSplit under TauntChase or MarkedTargetChase!
+            const int D53 = 53;
+            var adj53 = new Dictionary<int, List<int>> { [0] = new List<int> { 1 }, [1] = new List<int> { 2, 3, 0 } };
+            void AddE53(int u, int v) { if (!adj53.TryGetValue(u, out var l)) adj53[u] = l = new List<int>(); if (!l.Contains(v)) l.Add(v); }
+            int nid53 = 10;
+            int BuildDiamondChain(int startNode, int count)
+            {
+                int cur = startNode;
+                for (int d = 0; d < count; d++)
+                {
+                    int l1 = nid53++, l2 = nid53++, join = nid53++;
+                    AddE53(cur, l1); AddE53(cur, l2); AddE53(l1, join); AddE53(l2, join);
+                    cur = join;
+                }
+                return cur;
+            }
+            int endA = BuildDiamondChain(2, D53);
+            int endB = BuildDiamondChain(3, D53);
+            int target53 = nid53++;
+            AddE53(endA, target53);
+            AddE53(endB, target53);
+            // Add one extra equal-length chain from exit 3 to target53 (length 2*D53 + 1 edges total from 3)
+            int extraCur = 3;
+            for (int s = 0; s < 2 * D53; s++) { int nxt = nid53++; AddE53(extraCur, nxt); extraCur = nxt; }
+            AddE53(extraCur, target53);
+            AddE53(target53, target53);
+            var board53 = new BoardGraph(adj53.Select(kv => new LandNodeSnapshot(kv.Key, kv.Value.ToArray())).ToArray());
+            var field53 = board53.ComputeShortestPathsTo(target53);
+            Assert.True(field53.TryGetExactPathCount(2, out long exactA53));
+            Assert.True(field53.TryGetExactPathCount(3, out long exactB53));
+            Assert.Equal(1L << 53, exactA53);
+            Assert.Equal((1L << 53) + 1L, exactB53);
+            var tauntPlan53 = MonsterPathEngine.Plan(
+                board53,
+                new MonsterState { MonsterId = 991, CurrentLandId = 1, FromLandId = 0, IsTaunted = true, TauntTargetPlayerId = 1 },
+                new List<TrackedPlayer> { new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = target53, IsAlive = true, IsTargetable = true } },
+                new PlanOptions { MaxSteps = 1 });
+            Assert.False(tauntPlan53.Forks.Single(f => f.ForkLandId == 1).IsExactUniformSplit);
+            var markPlan53 = MonsterPathEngine.Plan(
+                board53,
+                new MonsterState { MonsterId = 992, CurrentLandId = 1, FromLandId = 0, ChasesProblemStudent = true },
+                new List<TrackedPlayer> { new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = target53, IsAlive = true, IsTargetable = true, HasProblemStudentMark = true } },
+                new PlanOptions { MaxSteps = 1 });
+            Assert.False(markPlan53.Forks.Single(f => f.ForkLandId == 1).IsExactUniformSplit);
+
+            // Round 9 (#16): (-2H, -6H) -> (H, 3H) on y=3x clipped to [0,800]x[0,100] at BOTH H=2^57 and H=2^84
+            // MUST return true with exact (0, 0) -> (100/3, 100)!
+            foreach (int exp in new[] { 57, 84 })
+            {
+                float h = (float)Math.Pow(2.0, exp);
+                Assert.True(DashGeometry.TryClipSegmentToRect(
+                    new Point2(-2f * h, -6f * h), new Point2(h, 3f * h),
+                    0f, 0f, 800f, 100f,
+                    out var ca, out var cb, out double _, out double _));
+                Assert.Equal(0f, ca.X, 3);
+                Assert.Equal(0f, ca.Y, 3);
+                Assert.Equal(100f / 3f, cb.X, 3);
+                Assert.Equal(100f, cb.Y, 3);
+            }
+
+            // Round 9 (#17 & #18):
+            //   #17: Double-precision depth at cam=(0.3,0,0), fwd=(0.6,0,0.8), pt=(8,0,-5.4) >= 0.3f
+            Assert.True(DashGeometry.ComputeCameraDepth(8f, 0f, -5.4f, 0.3f, 0f, 0f, 0.6f, 0f, 0.8f) >= 0.3f);
+            //   #18: Near-plane clip A=(0,0,-2^60), B=(0.25,0,10), near=1 MUST yield clipped z=1 (NOT z=0)!
+            float neg2_60 = -(float)Math.Pow(2.0, 60);
+            Assert.True(DashGeometry.TryClipSegmentToNearPlane(
+                0f, 0f, neg2_60, 0.25f, 0f, 10f,
+                0f, 0f, 0f, 0f, 0f, 1f, 1f,
+                out float nAx, out float nAy, out float nAz, out float nBx, out _, out float nBz,
+                out bool nClipS, out bool nClipE));
+            Assert.True(nClipS);
+            Assert.False(nClipE);
+            Assert.Equal(1f, nAz, 3);
+            Assert.Equal(0.25f, nAx, 3);
+            Assert.Equal(0f, nAy, 3);
+            Assert.Equal(10f, nBz, 3);
+
+            // Round 9 (#19): Horizontal (-2^60, 0) -> (100, 0) clipped at minX=-40, period=16, origTrim=10, phase=0
+            // True clipped length is 2^60 - 40 (mod 16 = 8), so visible phase MUST be exact 2f (NOT 10f)!
+            Assert.True(DashGeometry.TryClipSegmentToRect(
+                new Point2(neg2_60, 0f), new Point2(100f, 0f),
+                -40f, -40f, 800f, 100f,
+                out var pa, out var pb, out double trimHi, out double trimLo));
+            Assert.Equal(-40f, pa.X, 3);
+            Assert.Equal(100f, pb.X, 3);
+            float exactPhase = DashGeometry.ComputeClippedDashPhase(0.0, 10.0, trimHi, trimLo, 0.0, 16.0);
+            Assert.Equal(2f, exactPhase, 3);
+        }
     }
 }

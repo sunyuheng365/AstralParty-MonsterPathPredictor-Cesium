@@ -7,48 +7,35 @@ namespace MonsterPathPredictor.Config
 {
     internal static class PredictorConfig
     {
-        private static readonly string[] LegacyProbeKeys =
-        {
-            "enabled", "previewSteps", "pickerHotkey", "clearHotkey",
-            "clearOnEmptyClick", "dashSpeed", "lineWidth", "postCombatMode"
-        };
+        private static bool _pendingMigrationSave;
 
         public static bool TryParseValidKeyCode(string raw, out KeyCode code)
         {
             code = KeyCode.None;
-            if (string.IsNullOrWhiteSpace(raw)) return false;
+            if (!ConfigMigrationLogic.IsSingleNamedKeyToken(raw)) return false;
             string s = raw.Trim();
-            // Reject numeric strings like "123" that Enum.TryParse would accept as raw enum integers
-            bool allDigits = true;
-            for (int i = 0; i < s.Length; i++)
-            {
-                char ch = s[i];
-                if (i == 0 && (ch == '-' || ch == '+')) continue;
-                if (ch < '0' || ch > '9') { allDigits = false; break; }
-            }
-            if (allDigits) return false;
-
             return Enum.TryParse(s, ignoreCase: true, out code) &&
                    code != KeyCode.None &&
                    Enum.IsDefined(typeof(KeyCode), code);
         }
 
+        private static string NormalizeHotkeyOrNull(string raw)
+        {
+            return TryParseValidKeyCode(raw, out var code) ? code.ToString() : null;
+        }
+
         private static string NormalizeHotkey(string raw, string fallback)
         {
-            if (TryParseValidKeyCode(raw, out var code))
-            {
-                return code.ToString();
-            }
-            return fallback;
+            return NormalizeHotkeyOrNull(raw) ?? fallback;
         }
 
         private static bool HasAnyExistingKey(ModConfig config)
         {
-            for (int i = 0; i < LegacyProbeKeys.Length; i++)
+            for (int i = 0; i < ConfigMigrationLogic.AllKnownLegacyKeys.Length; i++)
             {
-                if (config.Has(LegacyProbeKeys[i])) return true;
+                if (config.Has(ConfigMigrationLogic.AllKnownLegacyKeys[i])) return true;
             }
-            return config.Has("configVersion");
+            return false;
         }
 
         public static PredictorSettings Load(ModConfig config, bool isInitial)
@@ -67,6 +54,8 @@ namespace MonsterPathPredictor.Config
             }
 
             bool migrated = ApplyMigrationsIfNeeded(config);
+            if (migrated) _pendingMigrationSave = true;
+
             if (isInitial)
             {
                 ApplyDefaultsAndDocs(config);
@@ -88,9 +77,10 @@ namespace MonsterPathPredictor.Config
             settings.SimulateCombatOnFork = config.GetBool("simulateCombatOnFork", settings.SimulateCombatOnFork);
             settings.PostCombatMode = PredictorSettings.ParsePostCombatMode(config.GetString("postCombatMode", "continue"));
             settings.AllowNonAggressiveMonsters = config.GetBool("allowNonAggressiveMonsters", settings.AllowNonAggressiveMonsters);
-            settings.PickerHotkey = NormalizeHotkey(config.GetString("pickerHotkey", settings.PickerHotkey), "F10");
-            settings.ClosePickerOnSelect = config.GetBool("closePickerOnSelect", settings.ClosePickerOnSelect);
             settings.ClearHotkey = NormalizeHotkey(config.GetString("clearHotkey", settings.ClearHotkey), "Escape");
+            string pickerFallback = string.Equals(settings.ClearHotkey, "F10", StringComparison.OrdinalIgnoreCase) ? "F8" : "F10";
+            settings.PickerHotkey = NormalizeHotkey(config.GetString("pickerHotkey", pickerFallback), pickerFallback);
+            settings.ClosePickerOnSelect = config.GetBool("closePickerOnSelect", settings.ClosePickerOnSelect);
             settings.ExcludedPlayerBuffIds = PredictorSettings.ParseIdCsv(config.GetString("excludedPlayerBuffIds", ""));
             settings.DeterministicColorHex = config.GetString("deterministicColor", settings.DeterministicColorHex);
             settings.MajorBranchColorHex = config.GetString("majorBranchColor", settings.MajorBranchColorHex);
@@ -101,9 +91,17 @@ namespace MonsterPathPredictor.Config
 
             settings.ClampInPlace();
 
-            if (isInitial || migrated)
+            if (isInitial || migrated || _pendingMigrationSave)
             {
-                try { saveOk = config.SaveIfDirty(); } catch { saveOk = false; }
+                try
+                {
+                    saveOk = _pendingMigrationSave ? config.Save() : config.SaveIfDirty();
+                    if (saveOk) _pendingMigrationSave = false;
+                }
+                catch
+                {
+                    saveOk = false;
+                }
             }
 
             return settings;
@@ -111,55 +109,56 @@ namespace MonsterPathPredictor.Config
 
         private static bool ApplyMigrationsIfNeeded(ModConfig config)
         {
-            if (config == null || !HasAnyExistingKey(config)) return false;
+            if (config == null) return false;
+            bool hasAny = HasAnyExistingKey(config);
+            int existingVer = config.GetInt("configVersion", 1);
+            bool hasPicker = config.Has("pickerHotkey");
+            string rawPicker = hasPicker ? config.GetString("pickerHotkey", "") : null;
+            string normClear = NormalizeHotkey(config.GetString("clearHotkey", "Escape"), "Escape");
 
-            int prevVersion = config.GetInt("configVersion", 1);
-            if (prevVersion >= 3) return false;
+            var plan = ConfigMigrationLogic.PlanMigration(hasAny, existingVer, hasPicker, rawPicker, normClear, NormalizeHotkeyOrNull);
+            if (!plan.NeedsMigration) return false;
 
-            if (prevVersion < 2)
+            if (plan.SetClearOnEmptyClickFalse)
             {
                 config.Set("clearOnEmptyClick", false);
             }
-
-            if (prevVersion < 3)
+            if (!string.IsNullOrEmpty(plan.SetPickerHotkeyTo))
             {
-                string existingPicker = config.GetString("pickerHotkey", "F8");
-                string existingClear = config.GetString("clearHotkey", "Escape");
-                bool isLegacyF8 = string.IsNullOrWhiteSpace(existingPicker) ||
-                                  string.Equals(existingPicker.Trim(), "F8", StringComparison.OrdinalIgnoreCase);
-                bool clearUsesF10 = !string.IsNullOrWhiteSpace(existingClear) &&
-                                    string.Equals(existingClear.Trim(), "F10", StringComparison.OrdinalIgnoreCase);
-                if (isLegacyF8 && !clearUsesF10)
-                {
-                    config.Set("pickerHotkey", "F10");
-                }
-                config.Set("configVersion", 3);
+                config.Set("pickerHotkey", plan.SetPickerHotkeyTo);
             }
+            config.Set("configVersion", plan.TargetVersion);
             return true;
         }
 
-        public static bool SaveStyle(ModConfig config, PredictorSettings settings)
+        public static bool SaveChangedStyleKeys(ModConfig config, PredictorSettings before, PredictorSettings after, bool writeAllStyleKeys = false)
         {
-            if (config == null || settings == null) return false;
-            settings.ClampInPlace();
-            config.Set("previewSteps", settings.PreviewSteps);
-            config.Set("dashLength", settings.DashLength);
-            config.Set("gapLength", settings.GapLength);
-            config.Set("dashSpeed", settings.DashSpeed);
-            config.Set("lineWidth", settings.LineWidth);
-            config.Set("heightOffset", settings.HeightOffset);
-            config.Set("fontSize", settings.FontSize);
-            config.Set("showReasonTag", settings.ShowReasonTag);
-            config.Set("showStepNumbers", settings.ShowStepNumbers);
-            config.Set("showDeterministicPercent", settings.ShowDeterministicPercent);
-            config.Set("postCombatMode", PredictorSettings.FormatPostCombatMode(settings.PostCombatMode));
-            config.Set("deterministicColor", settings.DeterministicColorHex);
-            config.Set("majorBranchColor", settings.MajorBranchColorHex);
-            config.Set("minorBranchColor", settings.MinorBranchColorHex);
-            config.Set("postCombatColor", settings.PostCombatColorHex);
-            config.Set("guideRedColor", settings.GuideRedColorHex);
-            config.Set("guideBlueColor", settings.GuideBlueColorHex);
-            return config.Save();
+            if (config == null || after == null) return false;
+            after.ClampInPlace();
+
+            bool dirty = false;
+            if (writeAllStyleKeys || before == null || before.PreviewSteps != after.PreviewSteps) { config.Set("previewSteps", after.PreviewSteps); dirty = true; }
+            if (writeAllStyleKeys || before == null || Math.Abs(before.DashLength - after.DashLength) >= 0.001f) { config.Set("dashLength", after.DashLength); dirty = true; }
+            if (writeAllStyleKeys || before == null || Math.Abs(before.GapLength - after.GapLength) >= 0.001f) { config.Set("gapLength", after.GapLength); dirty = true; }
+            if (writeAllStyleKeys || before == null || Math.Abs(before.DashSpeed - after.DashSpeed) >= 0.001f) { config.Set("dashSpeed", after.DashSpeed); dirty = true; }
+            if (writeAllStyleKeys || before == null || Math.Abs(before.LineWidth - after.LineWidth) >= 0.001f) { config.Set("lineWidth", after.LineWidth); dirty = true; }
+            if (writeAllStyleKeys || before == null || Math.Abs(before.HeightOffset - after.HeightOffset) >= 0.001f) { config.Set("heightOffset", after.HeightOffset); dirty = true; }
+            if (writeAllStyleKeys || before == null || before.FontSize != after.FontSize) { config.Set("fontSize", after.FontSize); dirty = true; }
+            if (writeAllStyleKeys || before == null || before.ShowReasonTag != after.ShowReasonTag) { config.Set("showReasonTag", after.ShowReasonTag); dirty = true; }
+            if (writeAllStyleKeys || before == null || before.ShowStepNumbers != after.ShowStepNumbers) { config.Set("showStepNumbers", after.ShowStepNumbers); dirty = true; }
+            if (writeAllStyleKeys || before == null || before.ShowDeterministicPercent != after.ShowDeterministicPercent) { config.Set("showDeterministicPercent", after.ShowDeterministicPercent); dirty = true; }
+            if (writeAllStyleKeys || before == null || before.PostCombatMode != after.PostCombatMode) { config.Set("postCombatMode", PredictorSettings.FormatPostCombatMode(after.PostCombatMode)); dirty = true; }
+            if (writeAllStyleKeys || before == null || !string.Equals(before.DeterministicColorHex, after.DeterministicColorHex, StringComparison.Ordinal)) { config.Set("deterministicColor", after.DeterministicColorHex); dirty = true; }
+            if (writeAllStyleKeys || before == null || !string.Equals(before.MajorBranchColorHex, after.MajorBranchColorHex, StringComparison.Ordinal)) { config.Set("majorBranchColor", after.MajorBranchColorHex); dirty = true; }
+            if (writeAllStyleKeys || before == null || !string.Equals(before.MinorBranchColorHex, after.MinorBranchColorHex, StringComparison.Ordinal)) { config.Set("minorBranchColor", after.MinorBranchColorHex); dirty = true; }
+            if (writeAllStyleKeys || before == null || !string.Equals(before.PostCombatColorHex, after.PostCombatColorHex, StringComparison.Ordinal)) { config.Set("postCombatColor", after.PostCombatColorHex); dirty = true; }
+            if (writeAllStyleKeys || before == null || !string.Equals(before.GuideRedColorHex, after.GuideRedColorHex, StringComparison.Ordinal)) { config.Set("guideRedColor", after.GuideRedColorHex); dirty = true; }
+            if (writeAllStyleKeys || before == null || !string.Equals(before.GuideBlueColorHex, after.GuideBlueColorHex, StringComparison.Ordinal)) { config.Set("guideBlueColor", after.GuideBlueColorHex); dirty = true; }
+
+            if (!dirty && !_pendingMigrationSave) return true;
+            bool ok = config.Save();
+            if (ok) _pendingMigrationSave = false;
+            return ok;
         }
 
         private static void ApplyDefaultsAndDocs(ModConfig cfg)

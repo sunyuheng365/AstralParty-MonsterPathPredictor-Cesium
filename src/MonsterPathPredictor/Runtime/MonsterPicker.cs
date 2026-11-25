@@ -28,6 +28,11 @@ namespace MonsterPathPredictor.Runtime
         public void CancelPendingPointer()
         {
             _clickTracker.Reset();
+            CancelRightClickOnly();
+        }
+
+        public void CancelRightClickOnly()
+        {
             _rightClickTracker.Reset();
             _rightDownPlayerId = 0;
             _rightDownLayoutGen = -1;
@@ -142,9 +147,8 @@ namespace MonsterPathPredictor.Runtime
                 return false;
             }
 
-            // Prefer the monster cleanly hit on MouseDown if still alive so a passing monster
-            // cannot hijack the release click; fall back to release-position hit test if needed.
-            long hitMonsterId = IsMonsterPresent(monsters, outcome.DownHitMonsterId)
+            // Prefer the monster cleanly hit on MouseDown if still alive AND still eligible under current settings.
+            long hitMonsterId = IsMonsterEligible(monsters, outcome.DownHitMonsterId, settings)
                 ? outcome.DownHitMonsterId
                 : 0;
             if (hitMonsterId == 0)
@@ -282,13 +286,14 @@ namespace MonsterPathPredictor.Runtime
             return BoardTileHitTester.PickTile(new Point2(clickLocal.x, clickLocal.y), _tileProjBuf, BoardTilePickRadiusPx);
         }
 
-        private static bool IsMonsterPresent(IReadOnlyList<LiveMonsterInfo> monsters, long monsterId)
+        private static bool IsMonsterEligible(IReadOnlyList<LiveMonsterInfo> monsters, long monsterId, PredictorSettings settings)
         {
             if (monsterId == 0 || monsters == null) return false;
             for (int i = 0; i < monsters.Count; i++)
             {
                 var m = monsters[i];
-                if (m != null && m.State != null && m.State.MonsterId == monsterId) return true;
+                if (m == null || m.State == null || m.State.MonsterId != monsterId) continue;
+                return settings == null || settings.AllowNonAggressiveMonsters || m.State.IsNormalAggressive;
             }
             return false;
         }

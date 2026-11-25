@@ -80,8 +80,10 @@ namespace MonsterPathPredictor.Runtime
         private readonly HashSet<int> _combatLandSet = new HashSet<int>();
         private readonly List<DashQuad> _dashQuadBuf = new List<DashQuad>(32);
         private readonly List<Vector2> _vertBuf = new List<Vector2>(4);
+        private readonly List<Rect> _placedPillRects = new List<Rect>(32);
         private int _usedLineGraphs;
         private int _usedPills;
+        private bool _hasVisibleWidgets;
 
         private RoutePalette _cachedPalette;
         private bool _hasCachedPalette;
@@ -153,6 +155,7 @@ namespace MonsterPathPredictor.Runtime
 
         public void HideAll()
         {
+            if (!_hasVisibleWidgets) return;
             for (int i = 0; i < _lineGraphPool.Count; i++)
             {
                 try
@@ -173,6 +176,9 @@ namespace MonsterPathPredictor.Runtime
             }
             _usedLineGraphs = 0;
             _usedPills = 0;
+            _hasVisibleWidgets = false;
+            _placedPillRects.Clear();
+            _hasVisibleWidgets = false;
         }
 
         public void Render(
@@ -194,7 +200,10 @@ namespace MonsterPathPredictor.Runtime
 
             _usedLineGraphs = 0;
             _usedPills = 0;
+            _hasVisibleWidgets = false;
+            _placedPillRects.Clear();
             _forkTagNextTopY.Clear();
+            _placedPillRects.Clear();
 
             var palette = GetPalette(settings);
             var camTr = UnityObject.GetTransform(camera);
@@ -492,12 +501,23 @@ namespace MonsterPathPredictor.Runtime
 
             for (int i = _usedLineGraphs; i < _lineGraphPool.Count; i++)
             {
-                if (_lineGraphPool[i].visible) _lineGraphPool[i].visible = false;
+                try
+                {
+                    var g = _lineGraphPool[i];
+                    if (g != null && !g.isDisposed && g.visible) g.visible = false;
+                }
+                catch { }
             }
             for (int i = _usedPills; i < _pillPool.Count; i++)
             {
-                if (_pillPool[i].Root.visible) _pillPool[i].Root.visible = false;
+                try
+                {
+                    var root = _pillPool[i]?.Root;
+                    if (root != null && !root.isDisposed && root.visible) root.visible = false;
+                }
+                catch { }
             }
+            _hasVisibleWidgets = _usedLineGraphs > 0 || _usedPills > 0;
         }
 
         private Vector3 GetStableHeaderAnchorWorld(LiveMonsterInfo selectedMonster)
@@ -630,15 +650,15 @@ namespace MonsterPathPredictor.Runtime
                 string selfTag = ghost.IsLocalPlayer ? "(我)" : string.Empty;
                 string badge = "虚·" + ghost.SeatTag + selfTag + " #" + ghost.VirtualLandId;
                 var basePos = new Point2(vPt.X, vPt.Y - 24f);
-                bool hasPriorTop = _forkTagNextTopY.TryGetValue(ghost.VirtualLandId, out float priorTopY);
-                float nextTopY = DrawStackedPillLabel(basePos, hasPriorTop, priorTopY, StackGapPx, badge, labelFont, accent);
-                _forkTagNextTopY[ghost.VirtualLandId] = nextTopY;
+                DrawNonOverlappingPillLabel(basePos, StackGapPx, badge, labelFont, accent);
             }
         }
 
         private static Color PickEdgeColor(RoutePalette palette, double probability, bool isAfterCombat, bool forceSplit = false)
         {
-            bool isDeterministic = !forceSplit && probability >= 0.999999;
+            // Strict >= 1.0 check ensures a 0.9999995 dominant split branch stays MajorBranch along
+            // its entire downstream path (edges, tile steps, endpoints) while true 1.0 edges stay Deterministic.
+            bool isDeterministic = !forceSplit && probability >= 1.0;
             if (isAfterCombat)
             {
                 if (isDeterministic) return palette.PostCombat;
@@ -789,13 +809,17 @@ namespace MonsterPathPredictor.Runtime
                 float padX = compact ? 5f : 7f;
                 float padY = compact ? 1.5f : 3f;
 
+                float alphaFactor = Math.Min(1f, textColor.a / 0.35f);
+                var bgColor = new Color(BadgeBg.r, BadgeBg.g, BadgeBg.b, BadgeBg.a * alphaFactor);
+                var outlineCol = new Color(0f, 0f, 0f, alphaFactor);
+
                 pill.Text.textFormat = new TextFormat
                 {
                     size = fontSize,
                     bold = true,
                     color = textColor,
                     outline = 1.5f,
-                    outlineColor = Color.black
+                    outlineColor = outlineCol
                 };
                 pill.Text.text = text;
 
@@ -805,7 +829,7 @@ namespace MonsterPathPredictor.Runtime
 
                 pill.Root.SetSize(w, h);
                 pill.Bg.SetSize(w, h);
-                pill.Bg.DrawRoundRect(w, h, BadgeBg, PillCornerRadii);
+                pill.Bg.DrawRoundRect(w, h, bgColor, PillCornerRadii);
                 pill.Text.SetXY(
                     (float)Math.Round((w - pill.Text.width) * 0.5f),
                     (float)Math.Round((h - pill.Text.height) * 0.5f));
@@ -822,7 +846,7 @@ namespace MonsterPathPredictor.Runtime
             return pill;
         }
 
-        private static void PlacePill(PooledPill pill, Point2 center)
+        private void PlacePill(PooledPill pill, Point2 center)
         {
             float left = (float)Math.Round(center.X - pill.Width * 0.5f);
             float top = (float)Math.Round(center.Y - pill.Height * 0.5f);
@@ -835,22 +859,55 @@ namespace MonsterPathPredictor.Runtime
             }
 
             if (!pill.Root.visible) pill.Root.visible = true;
+            _placedPillRects.Add(new Rect(left, top, pill.Width, pill.Height));
         }
 
         private void DrawPillLabel(Point2 center, string text, int fontSize, Color textColor, bool compact = false)
         {
+            if (textColor.a <= 0.004f) return;
             var pill = PreparePill(text, fontSize, textColor, compact);
             PlacePill(pill, center);
         }
 
         private float DrawStackedPillLabel(Point2 baseCenter, bool hasPriorTop, float priorTopY, float gapPx, string text, int fontSize, Color textColor)
         {
+            if (textColor.a <= 0.004f) return hasPriorTop ? priorTopY : baseCenter.Y;
             var pill = PreparePill(text, fontSize, textColor, compact: false);
             float centerY = hasPriorTop
                 ? (priorTopY - gapPx - pill.Height * 0.5f)
                 : baseCenter.Y;
             PlacePill(pill, new Point2(baseCenter.X, centerY));
             return centerY - pill.Height * 0.5f;
+        }
+
+        private void DrawNonOverlappingPillLabel(Point2 baseCenter, float gapPx, string text, int fontSize, Color textColor)
+        {
+            if (textColor.a <= 0.004f) return;
+            var pill = PreparePill(text, fontSize, textColor, compact: false);
+            float centerY = baseCenter.Y;
+            float left = (float)Math.Round(baseCenter.X - pill.Width * 0.5f);
+
+            // Push upward past any overlapping fork/combat/endpoint/step/ghost pill rect on screen.
+            for (int iter = 0; iter < 12; iter++)
+            {
+                float top = (float)Math.Round(centerY - pill.Height * 0.5f);
+                var cand = new Rect(left, top, pill.Width, pill.Height);
+                bool overlapped = false;
+                for (int i = 0; i < _placedPillRects.Count; i++)
+                {
+                    var r = _placedPillRects[i];
+                    if (cand.xMin < r.xMax + 2f && cand.xMax > r.xMin - 2f &&
+                        cand.yMin < r.yMax + gapPx && cand.yMax > r.yMin - gapPx)
+                    {
+                        centerY = r.yMin - gapPx - pill.Height * 0.5f;
+                        overlapped = true;
+                        break;
+                    }
+                }
+                if (!overlapped) break;
+            }
+
+            PlacePill(pill, new Point2(baseCenter.X, centerY));
         }
 
         private static bool ColorsEqual(Color a, Color b)
@@ -865,7 +922,17 @@ namespace MonsterPathPredictor.Runtime
         {
             if (_usedLineGraphs < _lineGraphPool.Count)
             {
-                return _lineGraphPool[_usedLineGraphs++];
+                var existing = _lineGraphPool[_usedLineGraphs];
+                if (existing != null && !existing.isDisposed && existing.parent == _lineLayer)
+                {
+                    _usedLineGraphs++;
+                    return existing;
+                }
+                var replacement = new GGraph { touchable = false };
+                _lineLayer.AddChild(replacement);
+                _lineGraphPool[_usedLineGraphs] = replacement;
+                _usedLineGraphs++;
+                return replacement;
             }
 
             var g = new GGraph { touchable = false };
@@ -879,9 +946,29 @@ namespace MonsterPathPredictor.Runtime
         {
             if (_usedPills < _pillPool.Count)
             {
-                return _pillPool[_usedPills++];
+                var existing = _pillPool[_usedPills];
+                if (existing != null &&
+                    existing.Root != null && !existing.Root.isDisposed && existing.Root.parent == _pillLayer &&
+                    existing.Bg != null && !existing.Bg.isDisposed &&
+                    existing.Text != null && !existing.Text.isDisposed)
+                {
+                    _usedPills++;
+                    return existing;
+                }
+                var replacement = CreatePooledPill();
+                _pillPool[_usedPills] = replacement;
+                _usedPills++;
+                return replacement;
             }
 
+            var pill = CreatePooledPill();
+            _pillPool.Add(pill);
+            _usedPills++;
+            return pill;
+        }
+
+        private PooledPill CreatePooledPill()
+        {
             var root = new GComponent { touchable = false };
             var bg = new GGraph { touchable = false };
             var tf = new GTextField
@@ -895,15 +982,12 @@ namespace MonsterPathPredictor.Runtime
             root.AddChild(tf);
             _pillLayer.AddChild(root);
 
-            var pill = new PooledPill
+            return new PooledPill
             {
                 Root = root,
                 Bg = bg,
                 Text = tf
             };
-            _pillPool.Add(pill);
-            _usedPills++;
-            return pill;
         }
 
         public void ClearStableHeaderCache()
@@ -927,6 +1011,8 @@ namespace MonsterPathPredictor.Runtime
             ClearStableHeaderCache();
             _usedLineGraphs = 0;
             _usedPills = 0;
+            _hasVisibleWidgets = false;
+            _placedPillRects.Clear();
 
             _lineLayer = null;
             _pillLayer = null;

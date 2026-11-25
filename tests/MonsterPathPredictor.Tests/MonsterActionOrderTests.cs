@@ -76,6 +76,19 @@ namespace MonsterPathPredictor.Tests
             var single = new List<MonsterState> { survivor3 };
             MonsterActionOrder.SortAndAssign(single, m => m);
             Assert.Equal("史莱姆 3", single[0].DisplayName);
+
+            // When Slime 2 dies and Slime 1 remains from a disambiguated group, Slime 1 keeps its suffix too
+            var survivor1 = new MonsterState { MonsterId = 10, Name = "史莱姆", ActionWeight = 20, SpawnSequence = 1, NameOrdinal = 1, NameGroupDisambiguated = true };
+            var single1 = new List<MonsterState> { survivor1 };
+            MonsterActionOrder.SortAndAssign(single1, m => m);
+            Assert.Equal("史莱姆 1", single1[0].DisplayName);
+
+            // Mixed explicit ordinal 1 + unset ordinal 0 must never collide on "史莱姆 1"
+            var explicit1 = new MonsterState { MonsterId = 10, Name = "史莱姆", ActionWeight = 20, SpawnSequence = 1, NameOrdinal = 1 };
+            var unset = new MonsterState { MonsterId = 11, Name = "史莱姆", ActionWeight = 20, SpawnSequence = 2, NameOrdinal = 0 };
+            var mixed = new List<MonsterState> { unset, explicit1 };
+            MonsterActionOrder.SortAndAssign(mixed, m => m);
+            Assert.Equal(new[] { "史莱姆 1", "史莱姆 2" }, mixed.ConvertAll(m => m.DisplayName));
         }
     }
 }

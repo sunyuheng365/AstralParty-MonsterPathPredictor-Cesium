@@ -43,6 +43,10 @@ namespace MonsterPathPredictor.Tests
             var lowAlpha = new RgbaColor(100, 150, 200, 16);
             Assert.Equal(16, StyleColor.AdjustChannel(lowAlpha, 3, -15, minAlpha: 51).A);
             Assert.Equal(1, StyleColor.AdjustChannel(lowAlpha, 3, -15, minAlpha: 0).A);
+
+            // Extreme integer deltas must saturate cleanly without int overflow
+            Assert.Equal(255, StyleColor.AdjustChannel(lowAlpha, 0, int.MaxValue).R);
+            Assert.Equal(0, StyleColor.AdjustChannel(lowAlpha, 0, int.MinValue).R);
         }
 
         [Fact]
@@ -60,15 +64,17 @@ namespace MonsterPathPredictor.Tests
         }
 
         [Fact]
-        public void PresetsAreAllValidAndNormalized()
+        public void PresetsMatchExactIntendedRgbaPalette()
         {
             Assert.Equal(8, StyleColor.Presets.Length);
-            foreach (var p in StyleColor.Presets)
-            {
-                Assert.False(string.IsNullOrWhiteSpace(p.Name));
-                Assert.True(StyleColor.TryParseHex(p.Hex, out var parsed));
-                Assert.Equal(p.Color, parsed);
-            }
+            Assert.Equal(new RgbaColor(0x3D, 0xE6, 0xFF, 0xF5), StyleColor.Presets[0].Color); // 青
+            Assert.Equal(new RgbaColor(0xFF, 0xD1, 0x38, 0xF5), StyleColor.Presets[1].Color); // 金
+            Assert.Equal(new RgbaColor(0xFF, 0x7A, 0x47, 0xF0), StyleColor.Presets[2].Color); // 橙
+            Assert.Equal(new RgbaColor(0x3C, 0xE6, 0x8C, 0xF5), StyleColor.Presets[3].Color); // 绿
+            Assert.Equal(new RgbaColor(0xD2, 0x6B, 0xFF, 0xF5), StyleColor.Presets[4].Color); // 紫
+            Assert.Equal(new RgbaColor(0xFF, 0x64, 0xB4, 0xF5), StyleColor.Presets[5].Color); // 粉
+            Assert.Equal(new RgbaColor(0xFF, 0x47, 0x47, 0xFA), StyleColor.Presets[6].Color); // 红
+            Assert.Equal(new RgbaColor(0xED, 0xF6, 0xFF, 0xF5), StyleColor.Presets[7].Color); // 白
         }
     }
 }

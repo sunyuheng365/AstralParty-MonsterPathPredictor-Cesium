@@ -131,6 +131,48 @@ namespace MonsterPathPredictor.Tests
             Assert.Equal(11, BoardTileHitTester.PickTile(new Point2(100f, 100f), new[] { tC, tB, tA }, maxRadiusPx: 40f));
             Assert.Equal(11, BoardTileHitTester.PickTile(new Point2(100f, 100f), new[] { tB, tC, tA }, maxRadiusPx: 40f));
             Assert.Equal(-1, BoardTileHitTester.PickTile(new Point2(300f, 300f), new[] { tA, tB, tC }, maxRadiusPx: 40f));
+
+            // Boundary radius guard: shallower tile strictly outside radius 44 (distSq=1936.25) must NEVER win!
+            var onEdge = new ProjectedBoardTile(20, new Point2(44f, 0f), cameraDepth: 10f);
+            var outside = new ProjectedBoardTile(21, new Point2(44f, 0.5f), cameraDepth: 2f);
+            Assert.Equal(20, BoardTileHitTester.PickTile(new Point2(0f, 0f), new[] { onEdge, outside }, maxRadiusPx: 44f));
+            Assert.Equal(20, BoardTileHitTester.PickTile(new Point2(0f, 0f), new[] { outside, onEdge }, maxRadiusPx: 44f));
+
+            // LandId == int.MaxValue must be returned cleanly (not treated as "no winner" sentinel)
+            var maxIdTile = new ProjectedBoardTile(int.MaxValue, new Point2(5f, 5f), cameraDepth: 5f);
+            Assert.Equal(int.MaxValue, BoardTileHitTester.PickTile(new Point2(5f, 5f), new[] { maxIdTile }, maxRadiusPx: 44f));
+        }
+
+        [Fact]
+        public void SingleUndoConsumesExactlyOneValidHistoryEntryAndArmingRequiresLivingOwner()
+        {
+            var board = BuildForkBoard();
+            var sandbox = new VirtualPlayerSandbox();
+
+            // Live at 5 -> move 2 -> 3 -> 5 (history = [null, 2, 3], no active override)
+            Assert.True(sandbox.SetVirtualLand(1001, 2, liveLandId: 5, board));
+            Assert.True(sandbox.SetVirtualLand(1001, 3, liveLandId: 5, board));
+            Assert.True(sandbox.SetVirtualLand(1001, 5, liveLandId: 5, board));
+            Assert.False(sandbox.HasOverrides);
+
+            // Real player walks to 3 -> 1st Undo consumes ONLY '3' (does NOT jump straight to '2'!)
+            Assert.True(sandbox.Undo(1001, liveLandId: 3, board));
+            Assert.False(sandbox.HasOverrides);
+            Assert.True(sandbox.CanUndo(1001));
+
+            // 2nd Undo moves back to '2'
+            Assert.True(sandbox.Undo(1001, liveLandId: 3, board));
+            Assert.True(sandbox.TryGetVirtualLand(1001, out int afterSecond));
+            Assert.Equal(2, afterSecond);
+
+            // Board-pick arming must fail when no living selected player exists
+            var deadPlayers = new List<TrackedPlayer>
+            {
+                new TrackedPlayer { PlayerId = 1001, Slot = 0, Name = "Dead", LandId = 5, IsAlive = false }
+            };
+            sandbox.Reconcile(deadPlayers, board, localPlayerId: 1001);
+            Assert.False(sandbox.SetBoardPickArmed(true, deadPlayers));
+            Assert.False(sandbox.BoardPickArmed);
         }
 
         [Fact]

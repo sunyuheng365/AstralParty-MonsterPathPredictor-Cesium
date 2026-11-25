@@ -89,12 +89,27 @@ namespace MonsterPathPredictor.Core
                 return a.MonsterId.CompareTo(b.MonsterId);
             });
 
-            var seen = new Dictionary<string, int>(StringComparer.Ordinal);
+            var reservedOrdinalsByName = new Dictionary<string, HashSet<int>>(StringComparer.Ordinal);
+            for (int i = 0; i < indexed.Count; i++)
+            {
+                var st = indexed[i];
+                if (st.NameOrdinal <= 0) continue;
+                string n = st.Name ?? string.Empty;
+                if (!reservedOrdinalsByName.TryGetValue(n, out var set))
+                {
+                    set = new HashSet<int>();
+                    reservedOrdinalsByName[n] = set;
+                }
+                set.Add(st.NameOrdinal);
+            }
+
+            var nextFallback = new Dictionary<string, int>(StringComparer.Ordinal);
             for (int i = 0; i < indexed.Count; i++)
             {
                 var st = indexed[i];
                 string n = st.Name ?? string.Empty;
-                if (nameCounts[n] > 1)
+                bool needsSuffix = nameCounts[n] > 1 || st.NameGroupDisambiguated || st.NameOrdinal > 1;
+                if (needsSuffix)
                 {
                     if (st.NameOrdinal > 0)
                     {
@@ -102,16 +117,16 @@ namespace MonsterPathPredictor.Core
                     }
                     else
                     {
-                        seen.TryGetValue(n, out int idx);
-                        idx++;
-                        seen[n] = idx;
+                        nextFallback.TryGetValue(n, out int idx);
+                        reservedOrdinalsByName.TryGetValue(n, out var reserved);
+                        do
+                        {
+                            idx++;
+                        }
+                        while (reserved != null && reserved.Contains(idx));
+                        nextFallback[n] = idx;
                         st.DisplayName = n + " " + idx;
                     }
-                }
-                else if (st.NameOrdinal > 1)
-                {
-                    // Keep persistent ordinal when an earlier duplicate died so remaining duplicate's name doesn't jump
-                    st.DisplayName = n + " " + st.NameOrdinal;
                 }
                 else
                 {

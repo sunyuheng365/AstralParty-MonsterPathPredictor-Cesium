@@ -67,9 +67,49 @@ namespace MonsterPathPredictor.Core
         public bool HasAnyState => _overrides.Count > 0 || _undoStacks.Count > 0;
         public int OverrideCount => _overrides.Count;
 
+        public bool SetBoardPickArmed(bool armed, IReadOnlyList<TrackedPlayer> livePlayers)
+        {
+            if (!armed)
+            {
+                bool wasArmed = BoardPickArmed;
+                BoardPickArmed = false;
+                return wasArmed;
+            }
+
+            if (SelectedPlayerId == 0 || livePlayers == null)
+            {
+                BoardPickArmed = false;
+                return false;
+            }
+
+            bool ownerAlive = false;
+            for (int i = 0; i < livePlayers.Count; i++)
+            {
+                var p = livePlayers[i];
+                if (p != null && p.PlayerId == SelectedPlayerId && p.IsAlive)
+                {
+                    ownerAlive = true;
+                    break;
+                }
+            }
+            if (!ownerAlive)
+            {
+                BoardPickArmed = false;
+                return false;
+            }
+
+            bool changed = !BoardPickArmed;
+            BoardPickArmed = true;
+            return changed;
+        }
+
         public void SelectPlayer(long playerId)
         {
-            SelectedPlayerId = playerId;
+            if (SelectedPlayerId != playerId)
+            {
+                SelectedPlayerId = playerId;
+                if (playerId == 0) BoardPickArmed = false;
+            }
         }
 
         public bool TryGetVirtualLand(long playerId, out int landId)
@@ -141,8 +181,9 @@ namespace MonsterPathPredictor.Core
         }
 
         /// <summary>
-        /// Steps one entry back in the player's virtual override history.
-        /// Restoring a null entry returns to following the live player's current tile.
+        /// Steps one valid entry back in the player's virtual override history.
+        /// Consumes exactly ONE valid prior state (even if its tile already matches liveLandId),
+        /// skipping only invalid/disabled historical tiles.
         /// </summary>
         public bool Undo(long playerId, int liveLandId, BoardGraph board)
         {
@@ -157,23 +198,19 @@ namespace MonsterPathPredictor.Core
 
                 if (!prevOverride.HasValue)
                 {
-                    bool removed = _overrides.Remove(playerId);
-                    if (removed || stack.Count == 0) return true;
-                    continue;
+                    _overrides.Remove(playerId);
+                    return true;
                 }
 
                 int prevLand = prevOverride.Value;
                 if (prevLand == liveLandId)
                 {
-                    bool removed = _overrides.Remove(playerId);
-                    if (removed || stack.Count == 0) return true;
-                    continue;
+                    _overrides.Remove(playerId);
+                    return true;
                 }
 
                 if (board != null && board.TryGetNode(prevLand, out var node) && !node.Disabled)
                 {
-                    if (_overrides.TryGetValue(playerId, out int cur) && cur == prevLand && stack.Count > 0)
-                        continue;
                     _overrides[playerId] = prevLand;
                     return true;
                 }
@@ -289,7 +326,7 @@ namespace MonsterPathPredictor.Core
             bool selectedValid = hadSelected && aliveById.ContainsKey(SelectedPlayerId);
             if (!selectedValid)
             {
-                if (hadSelected && BoardPickArmed)
+                if (BoardPickArmed)
                 {
                     BoardPickArmed = false;
                     changed = true;
@@ -442,8 +479,8 @@ namespace MonsterPathPredictor.Core
             }
             if (minDistSq == double.MaxValue) return -1;
 
-            // Pass 2: among tiles within DistanceTieEpsSq of minDistSq, find true minimum CameraDepth
-            double distCutoff = minDistSq + DistanceTieEpsSq;
+            // Pass 2: among tiles strictly within maxDistSq AND within DistanceTieEpsSq of minDistSq, find true minimum CameraDepth
+            double distCutoff = Math.Min(maxDistSq, minDistSq + DistanceTieEpsSq);
             float minDepth = float.MaxValue;
             for (int i = 0; i < projectedTiles.Count; i++)
             {
@@ -456,21 +493,23 @@ namespace MonsterPathPredictor.Core
                 }
             }
 
-            // Pass 3: among tiles within DepthTieEps of minDepth, pick deterministic smallest LandId
+            // Pass 3: among eligible tiles within DepthTieEps of minDepth, pick deterministic smallest LandId
             float depthCutoff = minDepth + DepthTieEps;
-            int bestLandId = int.MaxValue;
+            bool found = false;
+            int bestLandId = -1;
             for (int i = 0; i < projectedTiles.Count; i++)
             {
                 var t = projectedTiles[i];
                 double dx = clickLocal.X - t.ScreenPos.X;
                 double dy = clickLocal.Y - t.ScreenPos.Y;
-                if (dx * dx + dy * dy <= distCutoff && t.CameraDepth <= depthCutoff && t.LandId < bestLandId)
+                if (dx * dx + dy * dy <= distCutoff && t.CameraDepth <= depthCutoff && (!found || t.LandId < bestLandId))
                 {
                     bestLandId = t.LandId;
+                    found = true;
                 }
             }
 
-            return bestLandId == int.MaxValue ? -1 : bestLandId;
+            return found ? bestLandId : -1;
         }
     }
 }

@@ -338,15 +338,16 @@ namespace MonsterPathPredictor.Runtime
             _footerBg.DrawRect(panelW, layout.FooterH, 0, Color.clear, HeaderBg);
             float fBtnH = Math.Min(24f, Math.Max(14f, layout.FooterH - 4f));
             float fBtnY = Math.Max(1f, (layout.FooterH - fBtnH) * 0.5f);
-            float gap = panelW < 220f ? 3f : 4f;
-            float stepBtnW = panelW < 200f ? 20f : 26f;
-            float clearW = panelW < 200f ? 52f : (panelW < 260f ? 68f : 76f);
+            float gap = panelW < 220f ? 2f : 4f;
+            float availFooter = Math.Max(32f, panelW - padX * 2f);
+            float stepBtnW = panelW < 160f ? 16f : (panelW < 200f ? 20f : 26f);
+            float clearW = panelW < 160f ? Math.Max(28f, availFooter * 0.34f) : (panelW < 200f ? 48f : (panelW < 260f ? 68f : 76f));
             float clearX = Math.Max(padX, panelW - padX - clearW);
             float minusX = padX;
             float stepsX = minusX + stepBtnW + gap;
-            float maxStepsW = Math.Max(28f, clearX - gap - stepBtnW - gap - stepsX);
-            float stepsW = Math.Min(88f, maxStepsW);
-            float plusX = stepsX + stepsW + gap;
+            float plusMaxX = Math.Max(stepsX, clearX - gap - stepBtnW);
+            float stepsW = Math.Max(16f, Math.Min(88f, plusMaxX - gap - stepsX));
+            float plusX = Math.Min(plusMaxX, stepsX + stepsW + gap);
 
             ResizeMiniButton(_minusBtn, stepBtnW, fBtnH);
             _minusBtn.SetXY(minusX, fBtnY);

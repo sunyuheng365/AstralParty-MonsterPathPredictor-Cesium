@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Text;
+using CesiumLoader.SDK.Inputs;
 using FairyGUI;
 using UnityEngine;
 using MonsterPathPredictor.Core;
@@ -100,7 +101,7 @@ namespace MonsterPathPredictor.Runtime
         public event Action<int> StepsDeltaRequested;
 
         public event Action<long> VirtualPlayerSelected;
-        public event Action<long, int> VirtualMoveRequested;
+        public event Action<long, int, int, int> VirtualStepNeighborRequested;
         public event Action<long> VirtualUndoRequested;
         public event Action<long> VirtualResetPlayerRequested;
         public event Action VirtualResetAllRequested;
@@ -204,6 +205,15 @@ namespace MonsterPathPredictor.Runtime
             float stageHeight = GRoot.inst != null && GRoot.inst.height > 0f ? GRoot.inst.height : 720f;
             float panelW = Math.Min(PanelWidth, Math.Max(48f, stageWidth));
             float padX = panelW < 220f ? 4f : Padding;
+            float contentW = Math.Max(40f, panelW - padX * 2f);
+
+            // Defer destructive content rebuild while the user is actively pressing inside our popup
+            // so a live HP/position tick never disposes a pressed row/button before MouseUp fires onClick.
+            if (!string.IsNullOrEmpty(_lastSignature) && IsPrimaryPointerHeldInsidePopup())
+            {
+                if (_positioned) ClampToStage();
+                return;
+            }
 
             bool hasVirtualOverrides = sandbox != null && sandbox.HasOverrides;
             int rowsPerPage = ComputeRowsPerPage(stageHeight, hasVirtualOverrides);
@@ -217,13 +227,13 @@ namespace MonsterPathPredictor.Runtime
             }
             else if (_activeTab == PickerPopupTab.VirtualMove)
             {
-                totalPages = ComputeVirtualTabPageCount(stageHeight);
+                totalPages = ComputeVirtualTabPageCount(stageHeight, players != null ? players.Count : 0);
                 _virtualPageIndex = ClampPage(_virtualPageIndex, totalPages);
                 activePageIndex = _virtualPageIndex;
             }
             else
             {
-                totalPages = ComputeStyleTabPageCount(stageHeight, panelW - padX * 2f);
+                totalPages = ComputeStyleTabPageCount(stageHeight, contentW, _styleSaveFailed);
                 _stylePageIndex = ClampPage(_stylePageIndex, totalPages);
                 activePageIndex = _stylePageIndex;
             }
@@ -244,7 +254,6 @@ namespace MonsterPathPredictor.Runtime
             _contentHost.visible = true;
             _emptyText.visible = false;
 
-            float contentW = Math.Max(40f, panelW - padX * 2f);
             float contentY = layout.HeaderH + layout.TabH + layout.Pad;
             float contentHeight;
 
@@ -316,6 +325,22 @@ namespace MonsterPathPredictor.Runtime
             else
                 _stylePageIndex = Math.Max(0, _stylePageIndex + delta);
             _lastSignature = string.Empty;
+        }
+
+        private bool IsPrimaryPointerHeldInsidePopup()
+        {
+            if (_root == null || _root.isDisposed || !_root.visible) return false;
+            try
+            {
+                if (!InputService.IsMouseButtonHeld(0) && !InputService.IsMouseButtonPressed(0))
+                    return false;
+                if (Stage.inst != null)
+                {
+                    return ContainsStagePoint(Stage.inst.touchPosition);
+                }
+            }
+            catch { }
+            return false;
         }
 
         private void SwitchTab(PickerPopupTab tab)

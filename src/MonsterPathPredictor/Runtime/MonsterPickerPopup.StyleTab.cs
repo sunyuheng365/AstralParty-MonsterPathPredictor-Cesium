@@ -8,22 +8,30 @@ namespace MonsterPathPredictor.Runtime
 {
     internal sealed partial class MonsterPickerPopup
     {
-        private static int ComputeStyleTabPageCount(float stageHeight, float contentW)
+        private static int ComputeStyleTabPageCount(float stageHeight, float contentW, bool hasSaveWarn)
         {
-            // Single page holds 6 steppers + toggle row + color header + 2 role rows + presets + 2/4 RGBA rows + reset (~430-480 px) + chrome (~114 px).
-            float minSinglePageStageH = contentW < 210f ? 620f : 560f;
-            return stageHeight >= minSinglePageStageH ? 1 : 2;
+            float warnExtra = hasSaveWarn ? 20f : 0f;
+            // Spacious single page (all 6 steppers + toggles + color roles + presets + RGBA + reset)
+            float singleMin = (contentW < 210f ? 620f : 560f) + warnExtra;
+            if (stageHeight >= singleMin) return 1;
+            // Two pages (Page 0: 6 steppers + toggles ~200px; Page 1: roles + presets + RGBA + reset ~210px)
+            float twoMin = (contentW < 210f ? 420f : 365f) + warnExtra;
+            if (stageHeight >= twoMin) return 2;
+            // Compact 4 pages (guarantees every single control is reachable even at 220-300px height with save warning!)
+            return 4;
         }
 
         private float BuildStyleTab(PredictorSettings settings, CompactLayout layout, float contentW, int pageIndex, int totalPages)
         {
             float y = 0f;
             float maxH = layout.MaxContentHeight;
-            float rowH = maxH < 360f ? 22f : 25f;
+            float rowH = maxH < 220f ? 21f : (maxH < 360f ? 23f : 25f);
             float gap = 3f;
 
-            bool showMetricsPage = totalPages == 1 || pageIndex == 0;
-            bool showColorsPage = totalPages == 1 || pageIndex == 1;
+            bool showMetricsA = totalPages == 1 || (totalPages == 2 && pageIndex == 0) || (totalPages == 4 && pageIndex == 0);
+            bool showMetricsB = totalPages == 1 || (totalPages == 2 && pageIndex == 0) || (totalPages == 4 && pageIndex == 1);
+            bool showColorRolesAndPresets = totalPages == 1 || (totalPages == 2 && pageIndex == 1) || (totalPages == 4 && pageIndex == 2);
+            bool showRgbaAndReset = totalPages == 1 || (totalPages == 2 && pageIndex == 1) || (totalPages == 4 && pageIndex == 3);
 
             if (_styleSaveFailed && y + 18f <= maxH)
             {
@@ -50,7 +58,7 @@ namespace MonsterPathPredictor.Runtime
                 y += rowH + gap;
             }
 
-            if (showMetricsPage)
+            if (showMetricsA)
             {
                 AddStepper(
                     "线条宽度",
@@ -69,7 +77,10 @@ namespace MonsterPathPredictor.Runtime
                     ((int)Math.Round(settings.DashLength)) + " px",
                     () => StyleMutationRequested?.Invoke(s => s.DashLength = (float)Math.Round(s.DashLength - 2f)),
                     () => StyleMutationRequested?.Invoke(s => s.DashLength = (float)Math.Round(s.DashLength + 2f)));
+            }
 
+            if (showMetricsB)
+            {
                 AddStepper(
                     "虚线间距",
                     ((int)Math.Round(settings.GapLength)) + " px",
@@ -115,7 +126,7 @@ namespace MonsterPathPredictor.Runtime
                 }
             }
 
-            if (!showColorsPage)
+            if (!showColorRolesAndPresets && !showRgbaAndReset)
             {
                 return Math.Min(maxH, Math.Max(32f, y));
             }
@@ -163,7 +174,7 @@ namespace MonsterPathPredictor.Runtime
 
             // 6 color role selector chips (2 rows x 3 cols)
             float chipH = Math.Min(rowH, 23f);
-            if (y + chipH * 2f + gap <= maxH)
+            if (showColorRolesAndPresets && y + chipH * 2f + gap <= maxH)
             {
                 float cGap = 3f;
                 float cW = (contentW - cGap * 2f) / 3f;
@@ -199,7 +210,7 @@ namespace MonsterPathPredictor.Runtime
 
             // 8 vivid 1-click preset swatches
             float swatchH = Math.Min(rowH, 22f);
-            if (y + swatchH <= maxH)
+            if (showColorRolesAndPresets && y + swatchH <= maxH)
             {
                 int count = StyleColor.Presets.Length;
                 float sGap = 3f;
@@ -229,46 +240,49 @@ namespace MonsterPathPredictor.Runtime
                 y += swatchH + gap + 2f;
             }
 
-            // R/G/B/A fine-tune steppers (2x2 on normal widths, 1 per row on narrow viewports so value never overlaps '+')
-            int alphaPct = (int)Math.Round(activeRgba.A * 100.0 / 255.0);
-            if (contentW >= 210f)
+            if (showRgbaAndReset)
             {
-                if (y + chipH * 2f + gap <= maxH)
+                // R/G/B/A fine-tune steppers (2x2 on normal widths, 1 per row on narrow viewports so value never overlaps '+')
+                int alphaPct = (int)Math.Round(activeRgba.A * 100.0 / 255.0);
+                if (contentW >= 210f)
                 {
-                    float halfGap = 4f;
-                    float halfW = (contentW - halfGap) * 0.5f;
-                    AddChannelControl("R", activeRgba.R.ToString(CultureInfo.InvariantCulture), 0, 16, 0, 0f, y, halfW, chipH, activeRole, new Color(1f, 0.48f, 0.48f, 1f));
-                    AddChannelControl("G", activeRgba.G.ToString(CultureInfo.InvariantCulture), 1, 16, 0, halfW + halfGap, y, halfW, chipH, activeRole, new Color(0.48f, 1f, 0.62f, 1f));
-                    y += chipH + gap;
+                    if (y + chipH * 2f + gap <= maxH)
+                    {
+                        float halfGap = 4f;
+                        float halfW = (contentW - halfGap) * 0.5f;
+                        AddChannelControl("R", activeRgba.R.ToString(CultureInfo.InvariantCulture), 0, 16, 0, 0f, y, halfW, chipH, activeRole, new Color(1f, 0.48f, 0.48f, 1f));
+                        AddChannelControl("G", activeRgba.G.ToString(CultureInfo.InvariantCulture), 1, 16, 0, halfW + halfGap, y, halfW, chipH, activeRole, new Color(0.48f, 1f, 0.62f, 1f));
+                        y += chipH + gap;
 
-                    AddChannelControl("B", activeRgba.B.ToString(CultureInfo.InvariantCulture), 2, 16, 0, 0f, y, halfW, chipH, activeRole, new Color(0.48f, 0.78f, 1f, 1f));
-                    AddChannelControl("透", alphaPct + "%", 3, 15, 0, halfW + halfGap, y, halfW, chipH, activeRole, activeUnityCol);
-                    y += chipH + gap + 3f;
+                        AddChannelControl("B", activeRgba.B.ToString(CultureInfo.InvariantCulture), 2, 16, 0, 0f, y, halfW, chipH, activeRole, new Color(0.48f, 0.78f, 1f, 1f));
+                        AddChannelControl("透", alphaPct + "%", 3, 15, 0, halfW + halfGap, y, halfW, chipH, activeRole, activeUnityCol);
+                        y += chipH + gap + 3f;
+                    }
                 }
-            }
-            else
-            {
-                if (y + chipH <= maxH) { AddChannelControl("R", activeRgba.R.ToString(CultureInfo.InvariantCulture), 0, 16, 0, 0f, y, contentW, chipH, activeRole, new Color(1f, 0.48f, 0.48f, 1f)); y += chipH + gap; }
-                if (y + chipH <= maxH) { AddChannelControl("G", activeRgba.G.ToString(CultureInfo.InvariantCulture), 1, 16, 0, 0f, y, contentW, chipH, activeRole, new Color(0.48f, 1f, 0.62f, 1f)); y += chipH + gap; }
-                if (y + chipH <= maxH) { AddChannelControl("B", activeRgba.B.ToString(CultureInfo.InvariantCulture), 2, 16, 0, 0f, y, contentW, chipH, activeRole, new Color(0.48f, 0.78f, 1f, 1f)); y += chipH + gap; }
-                if (y + chipH <= maxH) { AddChannelControl("透", alphaPct + "%", 3, 15, 0, 0f, y, contentW, chipH, activeRole, activeUnityCol); y += chipH + gap + 3f; }
-            }
+                else
+                {
+                    if (y + chipH <= maxH) { AddChannelControl("R", activeRgba.R.ToString(CultureInfo.InvariantCulture), 0, 16, 0, 0f, y, contentW, chipH, activeRole, new Color(1f, 0.48f, 0.48f, 1f)); y += chipH + gap; }
+                    if (y + chipH <= maxH) { AddChannelControl("G", activeRgba.G.ToString(CultureInfo.InvariantCulture), 1, 16, 0, 0f, y, contentW, chipH, activeRole, new Color(0.48f, 1f, 0.62f, 1f)); y += chipH + gap; }
+                    if (y + chipH <= maxH) { AddChannelControl("B", activeRgba.B.ToString(CultureInfo.InvariantCulture), 2, 16, 0, 0f, y, contentW, chipH, activeRole, new Color(0.48f, 0.78f, 1f, 1f)); y += chipH + gap; }
+                    if (y + chipH <= maxH) { AddChannelControl("透", alphaPct + "%", 3, 15, 0, 0f, y, contentW, chipH, activeRole, activeUnityCol); y += chipH + gap + 3f; }
+                }
 
-            // Reset to default style button
-            if (y + rowH <= maxH)
-            {
-                var resetBtn = CreateStyledButton(
-                    "恢复默认路线样式",
-                    contentW,
-                    rowH,
-                    BtnBg,
-                    new Color(0.55f, 0.42f, 0.30f, 0.9f),
-                    AccentGold,
-                    () => StyleResetRequested?.Invoke(),
-                    fontSize: 12);
-                resetBtn.SetXY(0f, y);
-                _contentHost.AddChild(resetBtn);
-                y += rowH + 2f;
+                // Reset to default style button
+                if (y + rowH <= maxH)
+                {
+                    var resetBtn = CreateStyledButton(
+                        "恢复默认路线样式",
+                        contentW,
+                        rowH,
+                        BtnBg,
+                        new Color(0.55f, 0.42f, 0.30f, 0.9f),
+                        AccentGold,
+                        () => StyleResetRequested?.Invoke(),
+                        fontSize: 12);
+                    resetBtn.SetXY(0f, y);
+                    _contentHost.AddChild(resetBtn);
+                    y += rowH + 2f;
+                }
             }
 
             return Math.Min(maxH, Math.Max(32f, y));
@@ -378,13 +392,16 @@ namespace MonsterPathPredictor.Runtime
             bg.DrawRect(w, h, 1, new Color(0.24f, 0.30f, 0.40f, 0.65f), RowNormalBg);
             row.AddChild(bg);
 
-            float btnW = w < 220f ? 22f : 26f;
+            float pad = w < 160f ? 2f : 4f;
+            float btnW = w < 160f ? 18f : (w < 220f ? 22f : 26f);
             float btnH = Math.Max(15f, h - 4f);
             float btnY = (h - btnH) * 0.5f;
-            float valW = w < 220f ? 52f : 68f;
-            float plusX = w - btnW - 4f;
-            float valX = plusX - valW - 4f;
-            float minusX = valX - btnW - 4f;
+            float valW = w < 160f ? Math.Max(26f, w * 0.28f) : (w < 220f ? 52f : 68f);
+            float plusX = Math.Max(pad, w - btnW - pad);
+            float valX = Math.Max(pad, plusX - valW - pad);
+            float minusX = Math.Max(pad, valX - btnW - pad);
+            float lblX = pad + 1f;
+            float lblW = Math.Max(0f, minusX - lblX - pad);
 
             var lbl = new GTextField
             {
@@ -392,11 +409,12 @@ namespace MonsterPathPredictor.Runtime
                 autoSize = AutoSizeType.None,
                 singleLine = true,
                 verticalAlign = VertAlignType.Middle,
-                textFormat = new TextFormat { size = 12, color = TextPrimary },
+                textFormat = new TextFormat { size = w < 160f ? 10 : 12, color = TextPrimary },
                 text = label
             };
-            lbl.SetXY(6f, 0f);
-            lbl.SetSize(Math.Max(36f, minusX - 10f), h);
+            lbl.SetXY(lblX, 0f);
+            lbl.SetSize(lblW, h);
+            lbl.visible = lblW >= 14f;
             row.AddChild(lbl);
 
             var minus = CreateMiniButton("-", btnW, btnH, onMinus, fontSize: 13);

@@ -153,10 +153,10 @@ namespace MonsterPathPredictor.Core
 
         public static RgbaColor AdjustChannel(RgbaColor color, int channelIndex, int delta, byte minAlpha = 0)
         {
-            int r = color.R;
-            int g = color.G;
-            int b = color.B;
-            int a = color.A;
+            long r = color.R;
+            long g = color.G;
+            long b = color.B;
+            long a = color.A;
             switch (channelIndex)
             {
                 case 0: r = ClampByte(r + delta, 0, 255); break;
@@ -164,7 +164,7 @@ namespace MonsterPathPredictor.Core
                 case 2: b = ClampByte(b + delta, 0, 255); break;
                 case 3:
                     // Never raise alpha when the user presses '-' on a low-alpha config color.
-                    int effectiveMin = delta < 0 ? Math.Min(a, (int)minAlpha) : (int)minAlpha;
+                    long effectiveMin = delta < 0 ? Math.Min(a, (long)minAlpha) : (long)minAlpha;
                     a = ClampByte(a + delta, effectiveMin, 255);
                     break;
             }
@@ -232,7 +232,7 @@ namespace MonsterPathPredictor.Core
             }
         }
 
-        private static int ClampByte(int v, int min, int max)
+        private static long ClampByte(long v, long min, long max)
         {
             if (v < min) return min;
             if (v > max) return max;

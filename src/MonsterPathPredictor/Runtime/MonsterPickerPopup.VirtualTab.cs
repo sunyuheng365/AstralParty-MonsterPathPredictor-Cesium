@@ -8,10 +8,12 @@ namespace MonsterPathPredictor.Runtime
 {
     internal sealed partial class MonsterPickerPopup
     {
-        private static int ComputeVirtualTabPageCount(float stageHeight)
+        private static int ComputeVirtualTabPageCount(float stageHeight, int playerCount)
         {
-            // Full single-page virtual tab needs ~320 px content + ~114 px chrome = ~434 px.
-            return stageHeight >= 435f ? 1 : 2;
+            if (stageHeight >= 435f) return 1;
+            if (stageHeight >= 290f) return 2;
+            int playerPages = playerCount > 2 ? 2 : 1;
+            return playerPages + 2;
         }
 
         private float BuildVirtualTab(
@@ -53,13 +55,18 @@ namespace MonsterPathPredictor.Runtime
                 }
             }
 
-            bool showPlayersSection = totalPages == 1 || pageIndex == 0;
-            bool showMoveSection = totalPages == 1 || pageIndex == 1;
-            float btnH = maxH < 240f ? 22f : 26f;
+            bool hasLivingSelected = selectedPlayer != null && selectedPlayer.IsAlive;
+            bool tightMode = totalPages >= 3;
+            int playerPages = tightMode ? (players.Count > 2 ? 2 : 1) : 1;
+            bool showPlayersSection = totalPages == 1 || pageIndex < playerPages;
+            bool showToggle = totalPages == 1 || (totalPages == 2 && pageIndex == 0) || (tightMode && pageIndex == playerPages);
+            bool showNeighbors = totalPages == 1 || (totalPages == 2 && pageIndex == 1) || (tightMode && pageIndex == playerPages);
+            bool showActions = totalPages == 1 || (totalPages == 2 && pageIndex == 1) || (tightMode && pageIndex == playerPages + 1);
+            float btnH = maxH < 180f ? 21f : (maxH < 240f ? 23f : 26f);
 
             if (showPlayersSection)
             {
-                if (maxH >= 150f)
+                if (!tightMode && maxH >= 170f)
                 {
                     var hint = new GTextField
                     {
@@ -75,9 +82,11 @@ namespace MonsterPathPredictor.Runtime
                     y += 20f;
                 }
 
-                float pRowH = maxH < 200f ? 22f : 28f;
+                float pRowH = maxH < 160f ? 22f : 28f;
                 float pGap = 3f;
-                for (int i = 0; i < players.Count; i++)
+                int startIdx = tightMode ? pageIndex * 2 : 0;
+                int endIdx = tightMode ? Math.Min(players.Count, startIdx + 2) : players.Count;
+                for (int i = startIdx; i < endIdx; i++)
                 {
                     var p = players[i];
                     if (p == null) continue;
@@ -89,38 +98,39 @@ namespace MonsterPathPredictor.Runtime
                     _contentHost.AddChild(row);
                     y += pRowH + pGap;
                 }
-
-                if (y + btnH <= maxH)
-                {
-                    y += 3f;
-                    bool armed = sandbox.BoardPickArmed;
-                    string toggleLabel = armed
-                        ? "● 右键点击棋盘任意格移位：已开启"
-                        : "○ 开启「右键点击棋盘格」快速移位";
-                    var pickBtn = CreateStyledButton(
-                        toggleLabel,
-                        contentW,
-                        btnH,
-                        armed ? BtnVioletBg : BtnBg,
-                        armed ? BtnVioletBorder : new Color(0.35f, 0.45f, 0.60f, 0.8f),
-                        armed ? AccentGold : TextPrimary,
-                        () => VirtualBoardPickToggled?.Invoke(!armed),
-                        fontSize: 12);
-                    pickBtn.SetXY(0f, y);
-                    _contentHost.AddChild(pickBtn);
-                    y += btnH + 6f;
-                }
             }
 
-            if (showMoveSection)
+            if (showToggle && y + btnH <= maxH)
             {
-                // Reserve space for the bottom action bar first so complete neighbor rows never push Undo/Reset off-panel.
-                float actionReserve = btnH + 6f;
+                if (y > 0f) y += 3f;
+                bool armed = hasLivingSelected && sandbox.BoardPickArmed;
+                string toggleLabel = !hasLivingSelected
+                    ? "○ 暂无存活角色可右键移位"
+                    : (armed ? "● 右键点击棋盘任意格移位：已开启" : "○ 开启「右键点击棋盘格」快速移位");
+                var pickBtn = CreateStyledButton(
+                    toggleLabel,
+                    contentW,
+                    btnH,
+                    armed ? BtnVioletBg : BtnBg,
+                    armed ? BtnVioletBorder : (hasLivingSelected ? new Color(0.35f, 0.45f, 0.60f, 0.8f) : new Color(0.26f, 0.30f, 0.36f, 0.55f)),
+                    armed ? AccentGold : (hasLivingSelected ? TextPrimary : TextMuted),
+                    () => VirtualBoardPickToggled?.Invoke(!armed),
+                    fontSize: 12);
+                pickBtn.touchable = hasLivingSelected;
+                pickBtn.SetXY(0f, y);
+                _contentHost.AddChild(pickBtn);
+                y += btnH + 5f;
+            }
+
+            if (showNeighbors)
+            {
+                float actionReserve = showActions ? (btnH + 6f) : 0f;
                 float nbLimitY = Math.Max(y, maxH - actionReserve);
 
-                if (selectedPlayer != null && selectedPlayer.IsAlive && board != null && y + btnH <= nbLimitY)
+                if (hasLivingSelected && board != null && y + btnH <= nbLimitY)
                 {
                     int effLand = sandbox.GetEffectiveLandId(selectedPlayer);
+                    int layoutGen = sandbox.LayoutGeneration;
                     var neighbors = VirtualPlayerSandbox.GetReachableNeighbors(board, effLand);
 
                     if (y + 19f + btnH <= nbLimitY)
@@ -164,7 +174,7 @@ namespace MonsterPathPredictor.Runtime
                                     isRealTile ? BtnActiveBg : BtnBg,
                                     isRealTile ? AccentCyan : BtnVioletBorder,
                                     isRealTile ? AccentCyan : TextPrimary,
-                                    () => VirtualMoveRequested?.Invoke(capturedPid, targetTile),
+                                    () => VirtualStepNeighborRequested?.Invoke(capturedPid, effLand, targetTile, layoutGen),
                                     fontSize: 12);
                                 stepBtn.SetXY(c * (nbW + nbGap), y);
                                 _contentHost.AddChild(stepBtn);
@@ -174,34 +184,33 @@ namespace MonsterPathPredictor.Runtime
                         y += 2f;
                     }
                 }
+            }
 
-                // Action bar: Undo | Reset Selected | Reset All (touchable & visual state strictly synced to HasPlayerState / HasAnyState)
-                if (y + btnH <= maxH)
-                {
-                    float aGap = 4f;
-                    float aW = (contentW - aGap * 2f) / 3f;
-                    long selId = sandbox.SelectedPlayerId;
-                    bool canUndo = sandbox.CanUndo(selId);
-                    bool selHasState = sandbox.HasPlayerState(selId);
-                    bool anyState = sandbox.HasAnyState;
+            if (showActions && y + btnH <= maxH)
+            {
+                float aGap = 4f;
+                float aW = (contentW - aGap * 2f) / 3f;
+                long selId = sandbox.SelectedPlayerId;
+                bool canUndo = sandbox.CanUndo(selId);
+                bool selHasState = sandbox.HasPlayerState(selId);
+                bool anyState = sandbox.HasAnyState;
 
-                    var undoBtn = CreateStyledButton("撤回一步", aW, btnH, BtnBg, canUndo ? AccentCyan : new Color(0.28f, 0.34f, 0.42f, 0.6f), canUndo ? TextPrimary : TextMuted, () => VirtualUndoRequested?.Invoke(selId), fontSize: 12);
-                    undoBtn.touchable = canUndo;
-                    undoBtn.SetXY(0f, y);
-                    _contentHost.AddChild(undoBtn);
+                var undoBtn = CreateStyledButton("撤回一步", aW, btnH, BtnBg, canUndo ? AccentCyan : new Color(0.28f, 0.34f, 0.42f, 0.6f), canUndo ? TextPrimary : TextMuted, () => VirtualUndoRequested?.Invoke(selId), fontSize: 12);
+                undoBtn.touchable = canUndo;
+                undoBtn.SetXY(0f, y);
+                _contentHost.AddChild(undoBtn);
 
-                    var resetOneBtn = CreateStyledButton("重置角色", aW, btnH, BtnBg, selHasState ? AccentGold : new Color(0.28f, 0.34f, 0.42f, 0.6f), selHasState ? AccentGold : TextMuted, () => VirtualResetPlayerRequested?.Invoke(selId), fontSize: 12);
-                    resetOneBtn.touchable = selHasState;
-                    resetOneBtn.SetXY(aW + aGap, y);
-                    _contentHost.AddChild(resetOneBtn);
+                var resetOneBtn = CreateStyledButton("重置角色", aW, btnH, BtnBg, selHasState ? AccentGold : new Color(0.28f, 0.34f, 0.42f, 0.6f), selHasState ? AccentGold : TextMuted, () => VirtualResetPlayerRequested?.Invoke(selId), fontSize: 12);
+                resetOneBtn.touchable = selHasState;
+                resetOneBtn.SetXY(aW + aGap, y);
+                _contentHost.AddChild(resetOneBtn);
 
-                    var resetAllBtn = CreateStyledButton("全部还原", aW, btnH, anyState ? BtnVioletBg : BtnBg, anyState ? BtnVioletBorder : new Color(0.28f, 0.34f, 0.42f, 0.6f), anyState ? AccentViolet : TextMuted, () => VirtualResetAllRequested?.Invoke(), fontSize: 12);
-                    resetAllBtn.touchable = anyState;
-                    resetAllBtn.SetXY((aW + aGap) * 2f, y);
-                    _contentHost.AddChild(resetAllBtn);
+                var resetAllBtn = CreateStyledButton("全部还原", aW, btnH, anyState ? BtnVioletBg : BtnBg, anyState ? BtnVioletBorder : new Color(0.28f, 0.34f, 0.42f, 0.6f), anyState ? AccentViolet : TextMuted, () => VirtualResetAllRequested?.Invoke(), fontSize: 12);
+                resetAllBtn.touchable = anyState;
+                resetAllBtn.SetXY((aW + aGap) * 2f, y);
+                _contentHost.AddChild(resetAllBtn);
 
-                    y += btnH + 4f;
-                }
+                y += btnH + 4f;
             }
 
             return Math.Min(maxH, Math.Max(32f, y));

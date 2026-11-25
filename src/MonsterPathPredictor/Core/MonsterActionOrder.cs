@@ -96,10 +96,22 @@ namespace MonsterPathPredictor.Core
                 string n = st.Name ?? string.Empty;
                 if (nameCounts[n] > 1)
                 {
-                    seen.TryGetValue(n, out int idx);
-                    idx++;
-                    seen[n] = idx;
-                    st.DisplayName = n + " " + idx;
+                    if (st.NameOrdinal > 0)
+                    {
+                        st.DisplayName = n + " " + st.NameOrdinal;
+                    }
+                    else
+                    {
+                        seen.TryGetValue(n, out int idx);
+                        idx++;
+                        seen[n] = idx;
+                        st.DisplayName = n + " " + idx;
+                    }
+                }
+                else if (st.NameOrdinal > 1)
+                {
+                    // Keep persistent ordinal when an earlier duplicate died so remaining duplicate's name doesn't jump
+                    st.DisplayName = n + " " + st.NameOrdinal;
                 }
                 else
                 {

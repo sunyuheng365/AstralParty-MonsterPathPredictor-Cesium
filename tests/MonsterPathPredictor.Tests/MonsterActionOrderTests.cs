@@ -61,5 +61,21 @@ namespace MonsterPathPredictor.Tests
             Assert.Equal("玩具恐龙 1", list[1].DisplayName);
             Assert.Equal(2, list[1].ActionOrderRank);
         }
+
+        [Fact]
+        public void PersistentNameOrdinalPreservesSuffixWhenEarlierDuplicateDies()
+        {
+            var survivor2 = new MonsterState { MonsterId = 20, Name = "史莱姆", ActionWeight = 20, SpawnSequence = 2, NameOrdinal = 2 };
+            var survivor3 = new MonsterState { MonsterId = 30, Name = "史莱姆", ActionWeight = 20, SpawnSequence = 3, NameOrdinal = 3 };
+            var list = new List<MonsterState> { survivor3, survivor2 };
+
+            MonsterActionOrder.SortAndAssign(list, m => m);
+            Assert.Equal(new[] { "史莱姆 2", "史莱姆 3" }, list.ConvertAll(m => m.DisplayName));
+
+            // Even when only one survivor with NameOrdinal > 1 remains, keep its suffix stable
+            var single = new List<MonsterState> { survivor3 };
+            MonsterActionOrder.SortAndAssign(single, m => m);
+            Assert.Equal("史莱姆 3", single[0].DisplayName);
+        }
     }
 }

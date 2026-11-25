@@ -74,6 +74,8 @@ namespace MonsterPathPredictor.Core
         public int ActionWeight { get; set; }
         /// <summary>1-based monotonic spawn sequence within the match (handles 100k -> 1 MonsterId wraparound).</summary>
         public int SpawnSequence { get; set; }
+        /// <summary>Persistent per-match ordinal within monsters sharing the same Name (0 = unset).</summary>
+        public int NameOrdinal { get; set; }
         /// <summary>1-based live action-order rank in the sorted monster list.</summary>
         public int ActionOrderRank { get; set; }
         /// <summary>True when this monster is the active turn actor right now.</summary>

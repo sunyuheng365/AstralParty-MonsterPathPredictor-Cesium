@@ -76,12 +76,24 @@ namespace MonsterPathPredictor.Runtime
         private bool _temporarilyHidden;
         private bool _positioned;
         private bool _closeOnSelect;
+        private bool _styleSaveFailed;
         private PickerPopupTab _activeTab = PickerPopupTab.Monsters;
         private RouteColorRole _selectedColorRole = RouteColorRole.Deterministic;
-        private int _pageIndex;
+        private int _monsterPageIndex;
+        private int _virtualPageIndex;
+        private int _stylePageIndex;
         private string _lastSignature = string.Empty;
+        private readonly List<LiveMonsterInfo> _visibleMonstersBuf = new List<LiveMonsterInfo>(16);
+        private readonly StringBuilder _sigBuilder = new StringBuilder(320);
 
         public bool IsOpen => _isOpen && !_temporarilyHidden;
+
+        public void SetStyleSaveFailed(bool failed)
+        {
+            if (_styleSaveFailed == failed) return;
+            _styleSaveFailed = failed;
+            _lastSignature = string.Empty;
+        }
 
         public event Action<long> MonsterSelected;
         public event Action ClearRequested;
@@ -109,10 +121,16 @@ namespace MonsterPathPredictor.Runtime
             _temporarilyHidden = false;
             _lastSignature = string.Empty;
             EnsureCreated();
-            if (_root != null)
+            if (_root != null && !_root.isDisposed)
             {
                 _root.visible = true;
-                GRoot.inst.SetChildIndex(_root, GRoot.inst.numChildren - 1);
+                // Re-insert within our sortingOrder band so reopening brings the popup to the front
+                // of any equal-sortingOrder sibling (SetChildIndex is ignored by FairyGUI for sorted children).
+                if (GRoot.inst != null && _root.parent == GRoot.inst)
+                {
+                    GRoot.inst.RemoveChild(_root, false);
+                    GRoot.inst.AddChild(_root);
+                }
             }
         }
 
@@ -170,7 +188,7 @@ namespace MonsterPathPredictor.Runtime
 
             _closeOnSelect = settings.ClosePickerOnSelect;
 
-            var visible = new List<LiveMonsterInfo>();
+            _visibleMonstersBuf.Clear();
             if (monsters != null)
             {
                 for (int i = 0; i < monsters.Count; i++)
@@ -178,29 +196,44 @@ namespace MonsterPathPredictor.Runtime
                     var m = monsters[i];
                     if (m == null || m.State == null) continue;
                     if (!settings.AllowNonAggressiveMonsters && !m.State.IsNormalAggressive) continue;
-                    visible.Add(m);
+                    _visibleMonstersBuf.Add(m);
                 }
             }
 
             float stageWidth = GRoot.inst != null && GRoot.inst.width > 0f ? GRoot.inst.width : PanelWidth;
             float stageHeight = GRoot.inst != null && GRoot.inst.height > 0f ? GRoot.inst.height : 720f;
-            float panelW = Math.Min(PanelWidth, Math.Max(140f, stageWidth));
+            float panelW = Math.Min(PanelWidth, Math.Max(48f, stageWidth));
             float padX = panelW < 220f ? 4f : Padding;
 
-            int rowsPerPage = ComputeRowsPerPage(stageHeight);
-            int totalPages = _activeTab == PickerPopupTab.Monsters
-                ? Math.Max(1, (visible.Count + rowsPerPage - 1) / rowsPerPage)
-                : 1;
-            if (_pageIndex >= totalPages) _pageIndex = totalPages - 1;
-            if (_pageIndex < 0) _pageIndex = 0;
+            bool hasVirtualOverrides = sandbox != null && sandbox.HasOverrides;
+            int rowsPerPage = ComputeRowsPerPage(stageHeight, hasVirtualOverrides);
+            int totalPages;
+            int activePageIndex;
+            if (_activeTab == PickerPopupTab.Monsters)
+            {
+                totalPages = Math.Max(1, (_visibleMonstersBuf.Count + rowsPerPage - 1) / rowsPerPage);
+                _monsterPageIndex = ClampPage(_monsterPageIndex, totalPages);
+                activePageIndex = _monsterPageIndex;
+            }
+            else if (_activeTab == PickerPopupTab.VirtualMove)
+            {
+                totalPages = ComputeVirtualTabPageCount(stageHeight);
+                _virtualPageIndex = ClampPage(_virtualPageIndex, totalPages);
+                activePageIndex = _virtualPageIndex;
+            }
+            else
+            {
+                totalPages = ComputeStyleTabPageCount(stageHeight, panelW - padX * 2f);
+                _stylePageIndex = ClampPage(_stylePageIndex, totalPages);
+                activePageIndex = _stylePageIndex;
+            }
 
             if (_positioned) ClampToStage();
 
-            string sig = BuildSignature(visible, players, board, sandbox, localPlayerId, selectedMonsterId, settings, _pageIndex, totalPages, rowsPerPage, stageWidth, stageHeight);
+            string sig = BuildSignature(_visibleMonstersBuf, players, board, sandbox, localPlayerId, selectedMonsterId, settings, activePageIndex, totalPages, rowsPerPage, stageWidth, stageHeight);
             if (sig == _lastSignature) return;
-            _lastSignature = sig;
 
-            bool showPager = _activeTab == PickerPopupTab.Monsters && totalPages > 1;
+            bool showPager = totalPages > 1;
             var layout = ComputeCompactLayout(stageHeight, showPager);
 
             _titleText.text = "怪物寻路 [" + settings.PickerHotkey + "]";
@@ -217,15 +250,15 @@ namespace MonsterPathPredictor.Runtime
 
             if (_activeTab == PickerPopupTab.Monsters)
             {
-                contentHeight = BuildMonstersTab(visible, sandbox, selectedMonsterId, layout, contentW, padX, contentY, rowsPerPage);
+                contentHeight = BuildMonstersTab(_visibleMonstersBuf, sandbox, selectedMonsterId, layout, contentW, padX, contentY, rowsPerPage);
             }
             else if (_activeTab == PickerPopupTab.VirtualMove)
             {
-                contentHeight = BuildVirtualTab(players, board, sandbox, localPlayerId, layout, contentW);
+                contentHeight = BuildVirtualTab(players, board, sandbox, localPlayerId, layout, contentW, activePageIndex, totalPages);
             }
             else
             {
-                contentHeight = BuildStyleTab(settings, layout, contentW);
+                contentHeight = BuildStyleTab(settings, layout, contentW, activePageIndex, totalPages);
             }
 
             if (_pagerHost != null)
@@ -233,7 +266,9 @@ namespace MonsterPathPredictor.Runtime
                 _pagerHost.visible = showPager && layout.PagerH > 0f;
                 if (_pagerHost.visible)
                 {
-                    _pageLabel.text = (_pageIndex + 1) + " / " + totalPages + " (" + visible.Count + "只)";
+                    _pageLabel.text = _activeTab == PickerPopupTab.Monsters
+                        ? ((activePageIndex + 1) + " / " + totalPages + " (" + _visibleMonstersBuf.Count + "只)")
+                        : ("第 " + (activePageIndex + 1) + " / " + totalPages + " 页");
                     _pagerHost.SetXY(0f, contentY + contentHeight);
                 }
             }
@@ -259,6 +294,28 @@ namespace MonsterPathPredictor.Runtime
                 _root.SetXY(x, y);
             }
             ClampToStage();
+
+            // Commit signature only AFTER full tab construction and layout succeed.
+            _lastSignature = sig;
+        }
+
+        private static int ClampPage(int index, int totalPages)
+        {
+            if (totalPages <= 1) return 0;
+            if (index < 0) return 0;
+            if (index >= totalPages) return totalPages - 1;
+            return index;
+        }
+
+        private void StepActivePage(int delta)
+        {
+            if (_activeTab == PickerPopupTab.Monsters)
+                _monsterPageIndex = Math.Max(0, _monsterPageIndex + delta);
+            else if (_activeTab == PickerPopupTab.VirtualMove)
+                _virtualPageIndex = Math.Max(0, _virtualPageIndex + delta);
+            else
+                _stylePageIndex = Math.Max(0, _stylePageIndex + delta);
+            _lastSignature = string.Empty;
         }
 
         private void SwitchTab(PickerPopupTab tab)

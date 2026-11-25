@@ -21,13 +21,16 @@ namespace MonsterPathPredictor.Tests
         [InlineData("#FFF")]
         [InlineData("#GGGGGG")]
         [InlineData("#1234567")]
+        [InlineData("#F FFFF")]
+        [InlineData("#3D E6FF")]
+        [InlineData("#3DE6FF 0")]
         public void TryParseHexRejectsMalformedInputs(string raw)
         {
             Assert.False(StyleColor.TryParseHex(raw, out _));
         }
 
         [Fact]
-        public void AdjustChannelClampsWithinBoundsAndRespectsMinAlpha()
+        public void AdjustChannelClampsWithinBoundsAndNeverRaisesAlphaOnMinus()
         {
             var c = new RgbaColor(250, 10, 128, 60);
             Assert.Equal(255, StyleColor.AdjustChannel(c, 0, 20).R);
@@ -35,6 +38,11 @@ namespace MonsterPathPredictor.Tests
             Assert.Equal(144, StyleColor.AdjustChannel(c, 2, 16).B);
             Assert.Equal(51, StyleColor.AdjustChannel(c, 3, -30, minAlpha: 51).A);
             Assert.Equal(255, StyleColor.AdjustChannel(c, 3, 250, minAlpha: 51).A);
+
+            // Low-alpha config color (16): pressing '-' must never jump UP to minAlpha (51)
+            var lowAlpha = new RgbaColor(100, 150, 200, 16);
+            Assert.Equal(16, StyleColor.AdjustChannel(lowAlpha, 3, -15, minAlpha: 51).A);
+            Assert.Equal(1, StyleColor.AdjustChannel(lowAlpha, 3, -15, minAlpha: 0).A);
         }
 
         [Fact]

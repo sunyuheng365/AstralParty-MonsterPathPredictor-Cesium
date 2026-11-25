@@ -1,12 +1,64 @@
+using System;
 using CesiumLoader.SDK.Configuration;
 using MonsterPathPredictor.Core;
+using UnityEngine;
 
 namespace MonsterPathPredictor.Config
 {
     internal static class PredictorConfig
     {
+        private static readonly string[] LegacyProbeKeys =
+        {
+            "enabled", "previewSteps", "pickerHotkey", "clearHotkey",
+            "clearOnEmptyClick", "dashSpeed", "lineWidth", "postCombatMode"
+        };
+
+        public static bool TryParseValidKeyCode(string raw, out KeyCode code)
+        {
+            code = KeyCode.None;
+            if (string.IsNullOrWhiteSpace(raw)) return false;
+            string s = raw.Trim();
+            // Reject numeric strings like "123" that Enum.TryParse would accept as raw enum integers
+            bool allDigits = true;
+            for (int i = 0; i < s.Length; i++)
+            {
+                char ch = s[i];
+                if (i == 0 && (ch == '-' || ch == '+')) continue;
+                if (ch < '0' || ch > '9') { allDigits = false; break; }
+            }
+            if (allDigits) return false;
+
+            return Enum.TryParse(s, ignoreCase: true, out code) &&
+                   code != KeyCode.None &&
+                   Enum.IsDefined(typeof(KeyCode), code);
+        }
+
+        private static string NormalizeHotkey(string raw, string fallback)
+        {
+            if (TryParseValidKeyCode(raw, out var code))
+            {
+                return code.ToString();
+            }
+            return fallback;
+        }
+
+        private static bool HasAnyExistingKey(ModConfig config)
+        {
+            for (int i = 0; i < LegacyProbeKeys.Length; i++)
+            {
+                if (config.Has(LegacyProbeKeys[i])) return true;
+            }
+            return config.Has("configVersion");
+        }
+
         public static PredictorSettings Load(ModConfig config, bool isInitial)
         {
+            return Load(config, isInitial, out _);
+        }
+
+        public static PredictorSettings Load(ModConfig config, bool isInitial, out bool saveOk)
+        {
+            saveOk = true;
             var settings = new PredictorSettings();
             if (config == null)
             {
@@ -14,29 +66,9 @@ namespace MonsterPathPredictor.Config
                 return settings;
             }
 
+            bool migrated = ApplyMigrationsIfNeeded(config);
             if (isInitial)
             {
-                bool hasExistingConfig = config.Has("enabled");
-                int prevVersion = config.GetInt("configVersion", 1);
-
-                // One-time migration from v1 configs where clearOnEmptyClick defaulted to true.
-                if (hasExistingConfig && prevVersion < 2)
-                {
-                    config.Set("clearOnEmptyClick", false);
-                }
-
-                // One-time migration from v1/v2 configs where pickerHotkey defaulted to F8 -> F10,
-                // while preserving any custom user-chosen hotkey (e.g. F7).
-                if (hasExistingConfig && prevVersion < 3)
-                {
-                    string existingHotkey = config.GetString("pickerHotkey", "F8");
-                    if (string.IsNullOrWhiteSpace(existingHotkey) ||
-                        string.Equals(existingHotkey.Trim(), "F8", System.StringComparison.OrdinalIgnoreCase))
-                    {
-                        config.Set("pickerHotkey", "F10");
-                    }
-                    config.Set("configVersion", 3);
-                }
                 ApplyDefaultsAndDocs(config);
             }
 
@@ -56,9 +88,9 @@ namespace MonsterPathPredictor.Config
             settings.SimulateCombatOnFork = config.GetBool("simulateCombatOnFork", settings.SimulateCombatOnFork);
             settings.PostCombatMode = PredictorSettings.ParsePostCombatMode(config.GetString("postCombatMode", "continue"));
             settings.AllowNonAggressiveMonsters = config.GetBool("allowNonAggressiveMonsters", settings.AllowNonAggressiveMonsters);
-            settings.PickerHotkey = config.GetString("pickerHotkey", settings.PickerHotkey);
+            settings.PickerHotkey = NormalizeHotkey(config.GetString("pickerHotkey", settings.PickerHotkey), "F10");
             settings.ClosePickerOnSelect = config.GetBool("closePickerOnSelect", settings.ClosePickerOnSelect);
-            settings.ClearHotkey = config.GetString("clearHotkey", settings.ClearHotkey);
+            settings.ClearHotkey = NormalizeHotkey(config.GetString("clearHotkey", settings.ClearHotkey), "Escape");
             settings.ExcludedPlayerBuffIds = PredictorSettings.ParseIdCsv(config.GetString("excludedPlayerBuffIds", ""));
             settings.DeterministicColorHex = config.GetString("deterministicColor", settings.DeterministicColorHex);
             settings.MajorBranchColorHex = config.GetString("majorBranchColor", settings.MajorBranchColorHex);
@@ -69,17 +101,46 @@ namespace MonsterPathPredictor.Config
 
             settings.ClampInPlace();
 
-            if (isInitial)
+            if (isInitial || migrated)
             {
-                config.SaveIfDirty();
+                try { saveOk = config.SaveIfDirty(); } catch { saveOk = false; }
             }
 
             return settings;
         }
 
-        public static void SaveStyle(ModConfig config, PredictorSettings settings)
+        private static bool ApplyMigrationsIfNeeded(ModConfig config)
         {
-            if (config == null || settings == null) return;
+            if (config == null || !HasAnyExistingKey(config)) return false;
+
+            int prevVersion = config.GetInt("configVersion", 1);
+            if (prevVersion >= 3) return false;
+
+            if (prevVersion < 2)
+            {
+                config.Set("clearOnEmptyClick", false);
+            }
+
+            if (prevVersion < 3)
+            {
+                string existingPicker = config.GetString("pickerHotkey", "F8");
+                string existingClear = config.GetString("clearHotkey", "Escape");
+                bool isLegacyF8 = string.IsNullOrWhiteSpace(existingPicker) ||
+                                  string.Equals(existingPicker.Trim(), "F8", StringComparison.OrdinalIgnoreCase);
+                bool clearUsesF10 = !string.IsNullOrWhiteSpace(existingClear) &&
+                                    string.Equals(existingClear.Trim(), "F10", StringComparison.OrdinalIgnoreCase);
+                if (isLegacyF8 && !clearUsesF10)
+                {
+                    config.Set("pickerHotkey", "F10");
+                }
+                config.Set("configVersion", 3);
+            }
+            return true;
+        }
+
+        public static bool SaveStyle(ModConfig config, PredictorSettings settings)
+        {
+            if (config == null || settings == null) return false;
             settings.ClampInPlace();
             config.Set("previewSteps", settings.PreviewSteps);
             config.Set("dashLength", settings.DashLength);
@@ -98,7 +159,7 @@ namespace MonsterPathPredictor.Config
             config.Set("postCombatColor", settings.PostCombatColorHex);
             config.Set("guideRedColor", settings.GuideRedColorHex);
             config.Set("guideBlueColor", settings.GuideBlueColorHex);
-            config.Save();
+            return config.Save();
         }
 
         private static void ApplyDefaultsAndDocs(ModConfig cfg)

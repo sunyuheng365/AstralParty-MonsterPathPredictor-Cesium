@@ -79,6 +79,69 @@ namespace MonsterPathPredictor.Core
             GuideBlueColorHex = StyleColor.DefaultGuideBlueHex;
         }
 
+        public bool StyleSettingsEqual(PredictorSettings other)
+        {
+            if (other == null) return false;
+            return PreviewSteps == other.PreviewSteps &&
+                   Math.Abs(DashLength - other.DashLength) < 0.001f &&
+                   Math.Abs(GapLength - other.GapLength) < 0.001f &&
+                   Math.Abs(DashSpeed - other.DashSpeed) < 0.001f &&
+                   Math.Abs(LineWidth - other.LineWidth) < 0.001f &&
+                   Math.Abs(HeightOffset - other.HeightOffset) < 0.001f &&
+                   FontSize == other.FontSize &&
+                   ShowReasonTag == other.ShowReasonTag &&
+                   ShowStepNumbers == other.ShowStepNumbers &&
+                   ShowDeterministicPercent == other.ShowDeterministicPercent &&
+                   PostCombatMode == other.PostCombatMode &&
+                   string.Equals(DeterministicColorHex, other.DeterministicColorHex, StringComparison.Ordinal) &&
+                   string.Equals(MajorBranchColorHex, other.MajorBranchColorHex, StringComparison.Ordinal) &&
+                   string.Equals(MinorBranchColorHex, other.MinorBranchColorHex, StringComparison.Ordinal) &&
+                   string.Equals(PostCombatColorHex, other.PostCombatColorHex, StringComparison.Ordinal) &&
+                   string.Equals(GuideRedColorHex, other.GuideRedColorHex, StringComparison.Ordinal) &&
+                   string.Equals(GuideBlueColorHex, other.GuideBlueColorHex, StringComparison.Ordinal);
+        }
+
+        public bool PlanInputsEqual(PredictorSettings other)
+        {
+            if (other == null) return false;
+            return PreviewSteps == other.PreviewSteps &&
+                   SimulateCombatOnFork == other.SimulateCombatOnFork &&
+                   PostCombatMode == other.PostCombatMode;
+        }
+
+        public PredictorSettings Clone()
+        {
+            return new PredictorSettings
+            {
+                Enabled = Enabled,
+                PreviewSteps = PreviewSteps,
+                DashLength = DashLength,
+                GapLength = GapLength,
+                DashSpeed = DashSpeed,
+                LineWidth = LineWidth,
+                HeightOffset = HeightOffset,
+                FontSize = FontSize,
+                ClickRadius = ClickRadius,
+                ClearOnEmptyClick = ClearOnEmptyClick,
+                ShowReasonTag = ShowReasonTag,
+                ShowStepNumbers = ShowStepNumbers,
+                ShowDeterministicPercent = ShowDeterministicPercent,
+                SimulateCombatOnFork = SimulateCombatOnFork,
+                PostCombatMode = PostCombatMode,
+                AllowNonAggressiveMonsters = AllowNonAggressiveMonsters,
+                PickerHotkey = PickerHotkey,
+                ClosePickerOnSelect = ClosePickerOnSelect,
+                ClearHotkey = ClearHotkey,
+                ExcludedPlayerBuffIds = ExcludedPlayerBuffIds != null ? new HashSet<int>(ExcludedPlayerBuffIds) : new HashSet<int>(),
+                DeterministicColorHex = DeterministicColorHex,
+                MajorBranchColorHex = MajorBranchColorHex,
+                MinorBranchColorHex = MinorBranchColorHex,
+                PostCombatColorHex = PostCombatColorHex,
+                GuideRedColorHex = GuideRedColorHex,
+                GuideBlueColorHex = GuideBlueColorHex
+            };
+        }
+
         public static PostCombatMode ParsePostCombatMode(string raw)
         {
             if (string.IsNullOrWhiteSpace(raw)) return PostCombatMode.ContinueByGuide;

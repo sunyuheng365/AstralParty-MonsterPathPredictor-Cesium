@@ -120,18 +120,150 @@ namespace MonsterPathPredictor.Tests
         }
 
         [Fact]
-        public void BoardTileHitTesterPicksClosestTileWithDepthTieBreak()
+        public void BoardTileHitTesterPicksClosestTileOrderIndependently()
         {
-            var tiles = new[]
+            var tA = new ProjectedBoardTile(10, new Point2(110f, 100f), cameraDepth: 12f);    // distSq = 100
+            var tB = new ProjectedBoardTile(11, new Point2(110.03f, 100f), cameraDepth: 8f);  // distSq = 100.6009
+            var tC = new ProjectedBoardTile(12, new Point2(110.07f, 100f), cameraDepth: 4f);  // distSq = 101.4049 (> 100 + 1.0!)
+
+            // Order-independence: tC is outside minDistSq + 1.0 of tA, so tB must win regardless of list permutation
+            Assert.Equal(11, BoardTileHitTester.PickTile(new Point2(100f, 100f), new[] { tA, tB, tC }, maxRadiusPx: 40f));
+            Assert.Equal(11, BoardTileHitTester.PickTile(new Point2(100f, 100f), new[] { tC, tB, tA }, maxRadiusPx: 40f));
+            Assert.Equal(11, BoardTileHitTester.PickTile(new Point2(100f, 100f), new[] { tB, tC, tA }, maxRadiusPx: 40f));
+            Assert.Equal(-1, BoardTileHitTester.PickTile(new Point2(300f, 300f), new[] { tA, tB, tC }, maxRadiusPx: 40f));
+        }
+
+        [Fact]
+        public void UndoRestoresFollowLiveStateEvenAfterRealPlayerMoved()
+        {
+            var board = BuildForkBoard();
+            var sandbox = new VirtualPlayerSandbox();
+
+            // Live at 5 -> place virtually at 6 -> real player walks to 3 -> Undo must follow live (3), not override to 5
+            Assert.True(sandbox.SetVirtualLand(1001, 6, liveLandId: 5, board));
+            Assert.True(sandbox.Undo(1001, liveLandId: 3, board));
+            Assert.False(sandbox.HasOverrides);
+            Assert.False(sandbox.CanUndo(1001));
+
+            // Starting from unknown tile -1 still creates a reversible undo entry
+            Assert.True(sandbox.SetVirtualLand(1001, 4, liveLandId: -1, board));
+            Assert.True(sandbox.CanUndo(1001));
+            Assert.True(sandbox.Undo(1001, liveLandId: 3, board));
+            Assert.False(sandbox.HasOverrides);
+        }
+
+        [Fact]
+        public void ReconcilePreservesUndoWhenLivePlayerLandsOnVirtualTileAndDisarmsOnDeath()
+        {
+            var board = BuildForkBoard();
+            var sandbox = new VirtualPlayerSandbox();
+            var players = new List<TrackedPlayer>
             {
-                new ProjectedBoardTile(10, new Point2(100f, 100f), cameraDepth: 12f),
-                new ProjectedBoardTile(11, new Point2(100f, 100f), cameraDepth: 8f),
-                new ProjectedBoardTile(12, new Point2(160f, 100f), cameraDepth: 5f)
+                new TrackedPlayer { PlayerId = 1001, Slot = 0, Name = "A", LandId = 5, IsAlive = true },
+                new TrackedPlayer { PlayerId = 1002, Slot = 1, Name = "B", LandId = 6, IsAlive = true }
+            };
+            sandbox.Reconcile(players, board, localPlayerId: 1001);
+            sandbox.BoardPickArmed = true;
+
+            Assert.True(sandbox.SetVirtualLand(1001, 3, liveLandId: 5, board));
+            Assert.True(sandbox.SetVirtualLand(1001, 2, liveLandId: 5, board));
+
+            // Real player 1001 arrives at tile 2 -> redundant override cleared, but undo back to 3 survives!
+            players[0].LandId = 2;
+            Assert.True(sandbox.Reconcile(players, board, localPlayerId: 1001));
+            Assert.False(sandbox.HasOverrides);
+            Assert.True(sandbox.CanUndo(1001));
+            Assert.True(sandbox.HasPlayerState(1001));
+            Assert.True(sandbox.Undo(1001, liveLandId: 2, board));
+            Assert.True(sandbox.TryGetVirtualLand(1001, out int restored));
+            Assert.Equal(3, restored);
+
+            // Selected player 1001 dies -> BoardPickArmed must automatically disarm to prevent moving 1002
+            players[0].IsAlive = false;
+            sandbox.Reconcile(players, board, localPlayerId: 1001);
+            Assert.False(sandbox.BoardPickArmed);
+            Assert.Equal(1002, sandbox.SelectedPlayerId);
+
+            // Layout switch increments LayoutGeneration and clears all overrides/history
+            int genBefore = sandbox.LayoutGeneration;
+            Assert.True(sandbox.SetVirtualLand(1002, 4, liveLandId: 6, board));
+            Assert.True(sandbox.NotifyBoardLayoutChanged());
+            Assert.Equal(genBefore + 1, sandbox.LayoutGeneration);
+            Assert.False(sandbox.HasAnyState);
+        }
+
+        [Fact]
+        public void ApplyOverridesPreservesAllPlayerFieldsAndSupportsSpecialMonsterMechanics()
+        {
+            var board = BuildForkBoard();
+            var livePlayers = new List<TrackedPlayer>
+            {
+                new TrackedPlayer
+                {
+                    PlayerId = 1001,
+                    Slot = 0,
+                    Name = "StealthP1",
+                    LandId = 5,
+                    IsAlive = true,
+                    IsTargetable = true,
+                    CanBeAttacked = false,
+                    Gold = 0,
+                    CrimeNum = 0,
+                    HasProblemStudentMark = false,
+                    HasMandarinDuckMark = false
+                },
+                new TrackedPlayer
+                {
+                    PlayerId = 1002,
+                    Slot = 1,
+                    Name = "CulpritP2",
+                    LandId = 6,
+                    IsAlive = true,
+                    IsTargetable = true,
+                    CanBeAttacked = true,
+                    Gold = 25,
+                    CrimeNum = 2,
+                    HasProblemStudentMark = true,
+                    HasMandarinDuckMark = true
+                }
             };
 
-            Assert.Equal(11, BoardTileHitTester.PickTile(new Point2(102f, 101f), tiles, maxRadiusPx: 40f));
-            Assert.Equal(12, BoardTileHitTester.PickTile(new Point2(150f, 100f), tiles, maxRadiusPx: 40f));
-            Assert.Equal(-1, BoardTileHitTester.PickTile(new Point2(300f, 300f), tiles, maxRadiusPx: 40f));
+            var sandbox = new VirtualPlayerSandbox();
+            Assert.True(sandbox.SetVirtualLand(1002, 5, liveLandId: 6, board));
+            var cloned = sandbox.ApplyOverrides(livePlayers, board);
+
+            // Every field preserved accurately without mutating livePlayers
+            Assert.Equal(6, livePlayers[1].LandId);
+            Assert.Equal(5, cloned[1].LandId);
+            Assert.False(cloned[0].CanBeAttacked);
+            Assert.Equal(0, cloned[0].Gold);
+            Assert.Equal(25, cloned[1].Gold);
+            Assert.Equal(2, cloned[1].CrimeNum);
+            Assert.True(cloned[1].HasProblemStudentMark);
+            Assert.True(cloned[1].HasMandarinDuckMark);
+
+            // Crime-restricted Warden (1067) ignores CrimeNum==0 P1 and chases CrimeNum>0 P2 at virtual tile 5 (branch 3)
+            var warden = new MonsterState
+            {
+                MonsterId = 6001,
+                Name = "典狱长",
+                DisplayName = "典狱长",
+                HeroId = 1067,
+                CurrentLandId = 1,
+                FromLandId = 0,
+                FrontNodeIds = new[] { 2 },
+                IsNormalAggressive = true,
+                RequiresCrimeTarget = true
+            };
+            var planVirtual = MonsterPathEngine.Plan(board, warden, cloned, new PlanOptions { MaxSteps = 6 });
+            Assert.Equal(3, Assert.Single(planVirtual.Forks).Exits[0].NextLandId);
+            Assert.Contains(planVirtual.Combats, c => c.LandId == 5 && c.TargetLabel == "P2");
+
+            // Undo virtual move of P2 -> Warden flips back to real P2 at tile 6 (branch 4)
+            Assert.True(sandbox.Undo(1002, liveLandId: 6, board));
+            var planLive = MonsterPathEngine.Plan(board, warden, sandbox.ApplyOverrides(livePlayers, board), new PlanOptions { MaxSteps = 6 });
+            Assert.Equal(4, Assert.Single(planLive.Forks).Exits[0].NextLandId);
+            Assert.Contains(planLive.Combats, c => c.LandId == 6 && c.TargetLabel == "P2");
         }
     }
 }

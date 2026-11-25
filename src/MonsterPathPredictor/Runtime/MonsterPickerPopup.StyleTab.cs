@@ -8,12 +8,38 @@ namespace MonsterPathPredictor.Runtime
 {
     internal sealed partial class MonsterPickerPopup
     {
-        private float BuildStyleTab(PredictorSettings settings, CompactLayout layout, float contentW)
+        private static int ComputeStyleTabPageCount(float stageHeight, float contentW)
+        {
+            // Single page holds 6 steppers + toggle row + color header + 2 role rows + presets + 2/4 RGBA rows + reset (~430-480 px) + chrome (~114 px).
+            float minSinglePageStageH = contentW < 210f ? 620f : 560f;
+            return stageHeight >= minSinglePageStageH ? 1 : 2;
+        }
+
+        private float BuildStyleTab(PredictorSettings settings, CompactLayout layout, float contentW, int pageIndex, int totalPages)
         {
             float y = 0f;
             float maxH = layout.MaxContentHeight;
             float rowH = maxH < 360f ? 22f : 25f;
             float gap = 3f;
+
+            bool showMetricsPage = totalPages == 1 || pageIndex == 0;
+            bool showColorsPage = totalPages == 1 || pageIndex == 1;
+
+            if (_styleSaveFailed && y + 18f <= maxH)
+            {
+                var warn = new GTextField
+                {
+                    touchable = false,
+                    autoSize = AutoSizeType.None,
+                    singleLine = true,
+                    textFormat = new TextFormat { size = 11, bold = true, color = new Color(1f, 0.42f, 0.36f, 1f) },
+                    text = "⚠ 样式写入 config.json 失败（仅本局临时生效）"
+                };
+                warn.SetXY(2f, y);
+                warn.SetSize(contentW - 4f, 18f);
+                _contentHost.AddChild(warn);
+                y += 19f;
+            }
 
             void AddStepper(string label, string valueText, Action onMinus, Action onPlus)
             {
@@ -24,63 +50,77 @@ namespace MonsterPathPredictor.Runtime
                 y += rowH + gap;
             }
 
-            AddStepper(
-                "线条宽度",
-                settings.LineWidth.ToString("0.0", CultureInfo.InvariantCulture) + " px",
-                () => StyleMutationRequested?.Invoke(s => s.LineWidth = (float)Math.Round(s.LineWidth - 0.5f, 1)),
-                () => StyleMutationRequested?.Invoke(s => s.LineWidth = (float)Math.Round(s.LineWidth + 0.5f, 1)));
-
-            AddStepper(
-                "行进速度",
-                settings.DashSpeed <= 0.01f ? "静态 (0)" : ((int)Math.Round(settings.DashSpeed) + " px/s"),
-                () => StyleMutationRequested?.Invoke(s => s.DashSpeed = Math.Max(0f, (float)Math.Round(s.DashSpeed - 6f))),
-                () => StyleMutationRequested?.Invoke(s => s.DashSpeed = Math.Min(150f, (float)Math.Round(s.DashSpeed + 6f))));
-
-            AddStepper(
-                "虚线长度",
-                ((int)Math.Round(settings.DashLength)) + " px",
-                () => StyleMutationRequested?.Invoke(s => s.DashLength = (float)Math.Round(s.DashLength - 2f)),
-                () => StyleMutationRequested?.Invoke(s => s.DashLength = (float)Math.Round(s.DashLength + 2f)));
-
-            AddStepper(
-                "虚线间距",
-                ((int)Math.Round(settings.GapLength)) + " px",
-                () => StyleMutationRequested?.Invoke(s => s.GapLength = (float)Math.Round(s.GapLength - 2f)),
-                () => StyleMutationRequested?.Invoke(s => s.GapLength = (float)Math.Round(s.GapLength + 2f)));
-
-            AddStepper(
-                "标签字号",
-                settings.FontSize + " pt",
-                () => StyleMutationRequested?.Invoke(s => s.FontSize -= 2),
-                () => StyleMutationRequested?.Invoke(s => s.FontSize += 2));
-
-            // Toggles + PostCombatMode row
-            if (y + rowH <= maxH)
+            if (showMetricsPage)
             {
-                float tGap = 3f;
-                float tW = (contentW - tGap * 3f) / 4f;
-                string pcLabel = settings.PostCombatMode == PostCombatMode.StopAtFirstCombat
-                    ? "战后:截断"
-                    : (settings.PostCombatMode == PostCombatMode.RedBlueAfterCombat ? "战后:红蓝" : "战后:续行");
+                AddStepper(
+                    "线条宽度",
+                    settings.LineWidth.ToString("0.0", CultureInfo.InvariantCulture) + " px",
+                    () => StyleMutationRequested?.Invoke(s => s.LineWidth = (float)Math.Round(s.LineWidth - 0.5f, 1)),
+                    () => StyleMutationRequested?.Invoke(s => s.LineWidth = (float)Math.Round(s.LineWidth + 0.5f, 1)));
 
-                var pcBtn = CreateStyledButton(pcLabel, tW, rowH, BtnBg, AccentCyan, AccentCyan, () =>
+                AddStepper(
+                    "行进速度",
+                    settings.DashSpeed <= 0.01f ? "静态 (0)" : ((int)Math.Round(settings.DashSpeed) + " px/s"),
+                    () => StyleMutationRequested?.Invoke(s => s.DashSpeed = Math.Max(0f, (float)Math.Round(s.DashSpeed - 6f))),
+                    () => StyleMutationRequested?.Invoke(s => s.DashSpeed = Math.Min(150f, (float)Math.Round(s.DashSpeed + 6f))));
+
+                AddStepper(
+                    "虚线长度",
+                    ((int)Math.Round(settings.DashLength)) + " px",
+                    () => StyleMutationRequested?.Invoke(s => s.DashLength = (float)Math.Round(s.DashLength - 2f)),
+                    () => StyleMutationRequested?.Invoke(s => s.DashLength = (float)Math.Round(s.DashLength + 2f)));
+
+                AddStepper(
+                    "虚线间距",
+                    ((int)Math.Round(settings.GapLength)) + " px",
+                    () => StyleMutationRequested?.Invoke(s => s.GapLength = (float)Math.Round(s.GapLength - 2f)),
+                    () => StyleMutationRequested?.Invoke(s => s.GapLength = (float)Math.Round(s.GapLength + 2f)));
+
+                AddStepper(
+                    "标签字号",
+                    settings.FontSize + " pt",
+                    () => StyleMutationRequested?.Invoke(s => s.FontSize -= 2),
+                    () => StyleMutationRequested?.Invoke(s => s.FontSize += 2));
+
+                AddStepper(
+                    "悬浮高度",
+                    settings.HeightOffset.ToString("0.00", CultureInfo.InvariantCulture),
+                    () => StyleMutationRequested?.Invoke(s => s.HeightOffset = (float)Math.Round(s.HeightOffset - 0.1f, 2)),
+                    () => StyleMutationRequested?.Invoke(s => s.HeightOffset = (float)Math.Round(s.HeightOffset + 0.1f, 2)));
+
+                // Toggles + PostCombatMode row
+                if (y + rowH <= maxH)
                 {
-                    StyleMutationRequested?.Invoke(s =>
+                    float tGap = 3f;
+                    float tW = (contentW - tGap * 3f) / 4f;
+                    string pcLabel = settings.PostCombatMode == PostCombatMode.StopAtFirstCombat
+                        ? "战后:截断"
+                        : (settings.PostCombatMode == PostCombatMode.RedBlueAfterCombat ? "战后:红蓝" : "战后:续行");
+
+                    var pcBtn = CreateStyledButton(pcLabel, tW, rowH, BtnBg, AccentCyan, AccentCyan, () =>
                     {
-                        s.PostCombatMode = (PostCombatMode)(((int)s.PostCombatMode + 1) % 3);
-                    });
-                }, fontSize: 11);
-                pcBtn.SetXY(0f, y);
-                _contentHost.AddChild(pcBtn);
+                        StyleMutationRequested?.Invoke(s =>
+                        {
+                            s.PostCombatMode = (PostCombatMode)(((int)s.PostCombatMode + 1) % 3);
+                        });
+                    }, fontSize: 11);
+                    pcBtn.SetXY(0f, y);
+                    _contentHost.AddChild(pcBtn);
 
-                AddToggleChip("步数", settings.ShowStepNumbers, tW + tGap, y, tW, rowH, () => StyleMutationRequested?.Invoke(s => s.ShowStepNumbers = !s.ShowStepNumbers));
-                AddToggleChip("依据", settings.ShowReasonTag, (tW + tGap) * 2f, y, tW, rowH, () => StyleMutationRequested?.Invoke(s => s.ShowReasonTag = !s.ShowReasonTag));
-                AddToggleChip("100%", settings.ShowDeterministicPercent, (tW + tGap) * 3f, y, tW, rowH, () => StyleMutationRequested?.Invoke(s => s.ShowDeterministicPercent = !s.ShowDeterministicPercent));
+                    AddToggleChip("步数", settings.ShowStepNumbers, tW + tGap, y, tW, rowH, () => StyleMutationRequested?.Invoke(s => s.ShowStepNumbers = !s.ShowStepNumbers));
+                    AddToggleChip("依据", settings.ShowReasonTag, (tW + tGap) * 2f, y, tW, rowH, () => StyleMutationRequested?.Invoke(s => s.ShowReasonTag = !s.ShowReasonTag));
+                    AddToggleChip("100%", settings.ShowDeterministicPercent, (tW + tGap) * 3f, y, tW, rowH, () => StyleMutationRequested?.Invoke(s => s.ShowDeterministicPercent = !s.ShowDeterministicPercent));
 
-                y += rowH + gap + 3f;
+                    y += rowH + gap + 3f;
+                }
             }
 
-            // Color customization header + live preview swatch
+            if (!showColorsPage)
+            {
+                return Math.Min(maxH, Math.Max(32f, y));
+            }
+
+            // Color customization header + true-alpha live preview swatch over contrasting dark/light backing
             var activeRole = _selectedColorRole;
             var activeRgba = StyleColor.GetRoleColor(settings, activeRole);
             var activeUnityCol = new Color(activeRgba.Rf, activeRgba.Gf, activeRgba.Bf, 1f);
@@ -100,10 +140,23 @@ namespace MonsterPathPredictor.Runtime
                 colTitle.SetSize(Math.Max(60f, contentW - 44f), 20f);
                 _contentHost.AddChild(colTitle);
 
+                // Contrasting half-dark/half-light backing so true low alpha is accurately visible
+                var swBackDark = new GGraph { touchable = false };
+                swBackDark.SetXY(contentW - 38f, y + 2f);
+                swBackDark.SetSize(18f, 16f);
+                swBackDark.DrawRect(18f, 16f, 0, Color.clear, new Color(0.10f, 0.12f, 0.16f, 1f));
+                _contentHost.AddChild(swBackDark);
+
+                var swBackLight = new GGraph { touchable = false };
+                swBackLight.SetXY(contentW - 20f, y + 2f);
+                swBackLight.SetSize(18f, 16f);
+                swBackLight.DrawRect(18f, 16f, 0, Color.clear, new Color(0.75f, 0.78f, 0.84f, 1f));
+                _contentHost.AddChild(swBackLight);
+
                 var previewSwatch = new GGraph { touchable = false };
                 previewSwatch.SetXY(contentW - 38f, y + 2f);
                 previewSwatch.SetSize(36f, 16f);
-                previewSwatch.DrawRect(36f, 16f, 1, TextPrimary, new Color(activeRgba.Rf, activeRgba.Gf, activeRgba.Bf, Math.Max(0.25f, activeRgba.Af)));
+                previewSwatch.DrawRect(36f, 16f, 1, TextPrimary, new Color(activeRgba.Rf, activeRgba.Gf, activeRgba.Bf, activeRgba.Af));
                 _contentHost.AddChild(previewSwatch);
                 y += 22f;
             }
@@ -155,7 +208,7 @@ namespace MonsterPathPredictor.Runtime
                 {
                     var preset = StyleColor.Presets[i];
                     var pc = preset.Color;
-                    bool matches = pc.R == activeRgba.R && pc.G == activeRgba.G && pc.B == activeRgba.B;
+                    bool matches = pc == activeRgba;
                     var sw = CreateStyledButton(
                         preset.Name,
                         sW,
@@ -176,19 +229,29 @@ namespace MonsterPathPredictor.Runtime
                 y += swatchH + gap + 2f;
             }
 
-            // R/G/B/A fine-tune steppers (2 rows x 2 cols)
-            if (y + chipH * 2f + gap <= maxH)
+            // R/G/B/A fine-tune steppers (2x2 on normal widths, 1 per row on narrow viewports so value never overlaps '+')
+            int alphaPct = (int)Math.Round(activeRgba.A * 100.0 / 255.0);
+            if (contentW >= 210f)
             {
-                float halfGap = 4f;
-                float halfW = (contentW - halfGap) * 0.5f;
-                AddChannelControl("R", activeRgba.R.ToString(CultureInfo.InvariantCulture), 0, 16, 0, 0f, y, halfW, chipH, activeRole, new Color(1f, 0.48f, 0.48f, 1f));
-                AddChannelControl("G", activeRgba.G.ToString(CultureInfo.InvariantCulture), 1, 16, 0, halfW + halfGap, y, halfW, chipH, activeRole, new Color(0.48f, 1f, 0.62f, 1f));
-                y += chipH + gap;
+                if (y + chipH * 2f + gap <= maxH)
+                {
+                    float halfGap = 4f;
+                    float halfW = (contentW - halfGap) * 0.5f;
+                    AddChannelControl("R", activeRgba.R.ToString(CultureInfo.InvariantCulture), 0, 16, 0, 0f, y, halfW, chipH, activeRole, new Color(1f, 0.48f, 0.48f, 1f));
+                    AddChannelControl("G", activeRgba.G.ToString(CultureInfo.InvariantCulture), 1, 16, 0, halfW + halfGap, y, halfW, chipH, activeRole, new Color(0.48f, 1f, 0.62f, 1f));
+                    y += chipH + gap;
 
-                int alphaPct = (int)Math.Round(activeRgba.A * 100.0 / 255.0);
-                AddChannelControl("B", activeRgba.B.ToString(CultureInfo.InvariantCulture), 2, 16, 0, 0f, y, halfW, chipH, activeRole, new Color(0.48f, 0.78f, 1f, 1f));
-                AddChannelControl("透", alphaPct + "%", 3, 15, 51, halfW + halfGap, y, halfW, chipH, activeRole, activeUnityCol);
-                y += chipH + gap + 3f;
+                    AddChannelControl("B", activeRgba.B.ToString(CultureInfo.InvariantCulture), 2, 16, 0, 0f, y, halfW, chipH, activeRole, new Color(0.48f, 0.78f, 1f, 1f));
+                    AddChannelControl("透", alphaPct + "%", 3, 15, 0, halfW + halfGap, y, halfW, chipH, activeRole, activeUnityCol);
+                    y += chipH + gap + 3f;
+                }
+            }
+            else
+            {
+                if (y + chipH <= maxH) { AddChannelControl("R", activeRgba.R.ToString(CultureInfo.InvariantCulture), 0, 16, 0, 0f, y, contentW, chipH, activeRole, new Color(1f, 0.48f, 0.48f, 1f)); y += chipH + gap; }
+                if (y + chipH <= maxH) { AddChannelControl("G", activeRgba.G.ToString(CultureInfo.InvariantCulture), 1, 16, 0, 0f, y, contentW, chipH, activeRole, new Color(0.48f, 1f, 0.62f, 1f)); y += chipH + gap; }
+                if (y + chipH <= maxH) { AddChannelControl("B", activeRgba.B.ToString(CultureInfo.InvariantCulture), 2, 16, 0, 0f, y, contentW, chipH, activeRole, new Color(0.48f, 0.78f, 1f, 1f)); y += chipH + gap; }
+                if (y + chipH <= maxH) { AddChannelControl("透", alphaPct + "%", 3, 15, 0, 0f, y, contentW, chipH, activeRole, activeUnityCol); y += chipH + gap + 3f; }
             }
 
             // Reset to default style button

@@ -56,12 +56,15 @@ namespace MonsterPathPredictor.Core
         private const int MaxUndoDepthPerPlayer = 64;
 
         private readonly Dictionary<long, int> _overrides = new Dictionary<long, int>();
-        private readonly Dictionary<long, List<int>> _undoStacks = new Dictionary<long, List<int>>();
+        // Each undo entry stores the prior OVERRIDE state (null = following live player, non-null = virtual tile ID).
+        private readonly Dictionary<long, List<int?>> _undoStacks = new Dictionary<long, List<int?>>();
 
         public long SelectedPlayerId { get; private set; }
         public bool BoardPickArmed { get; set; }
+        public int LayoutGeneration { get; private set; }
 
         public bool HasOverrides => _overrides.Count > 0;
+        public bool HasAnyState => _overrides.Count > 0 || _undoStacks.Count > 0;
         public int OverrideCount => _overrides.Count;
 
         public void SelectPlayer(long playerId)
@@ -87,6 +90,24 @@ namespace MonsterPathPredictor.Core
             return _undoStacks.TryGetValue(playerId, out var stack) && stack.Count > 0;
         }
 
+        public bool HasPlayerState(long playerId)
+        {
+            return _overrides.ContainsKey(playerId) || CanUndo(playerId);
+        }
+
+        /// <summary>
+        /// Clears all tile-scoped overrides and undo history when the board layout topology switches mid-match
+        /// (e.g. Magic Academy 82012 dynamic map replacement) so old tile IDs never leak into a new layout.
+        /// </summary>
+        public bool NotifyBoardLayoutChanged()
+        {
+            LayoutGeneration++;
+            bool changed = _overrides.Count > 0 || _undoStacks.Count > 0;
+            _overrides.Clear();
+            _undoStacks.Clear();
+            return changed;
+        }
+
         /// <summary>
         /// Moves a player virtually to <paramref name="targetLandId"/> on <paramref name="board"/>.
         /// Returns true if the virtual state changed.
@@ -96,19 +117,17 @@ namespace MonsterPathPredictor.Core
             if (playerId == 0 || board == null) return false;
             if (!board.TryGetNode(targetLandId, out var node) || node.Disabled) return false;
 
-            int currentLand = _overrides.TryGetValue(playerId, out int existing) ? existing : liveLandId;
+            bool hadOverride = _overrides.TryGetValue(playerId, out int existingOverride);
+            int currentLand = hadOverride ? existingOverride : liveLandId;
             if (currentLand == targetLandId) return false;
 
-            if (currentLand >= 0)
+            if (!_undoStacks.TryGetValue(playerId, out var stack))
             {
-                if (!_undoStacks.TryGetValue(playerId, out var stack))
-                {
-                    stack = new List<int>();
-                    _undoStacks[playerId] = stack;
-                }
-                if (stack.Count >= MaxUndoDepthPerPlayer) stack.RemoveAt(0);
-                stack.Add(currentLand);
+                stack = new List<int?>();
+                _undoStacks[playerId] = stack;
             }
+            if (stack.Count >= MaxUndoDepthPerPlayer) stack.RemoveAt(0);
+            stack.Add(hadOverride ? (int?)existingOverride : null);
 
             if (targetLandId == liveLandId)
             {
@@ -122,7 +141,8 @@ namespace MonsterPathPredictor.Core
         }
 
         /// <summary>
-        /// Steps one entry back in the player's virtual movement history.
+        /// Steps one entry back in the player's virtual override history.
+        /// Restoring a null entry returns to following the live player's current tile.
         /// </summary>
         public bool Undo(long playerId, int liveLandId, BoardGraph board)
         {
@@ -131,9 +151,18 @@ namespace MonsterPathPredictor.Core
 
             while (stack.Count > 0)
             {
-                int prevLand = stack[stack.Count - 1];
+                int? prevOverride = stack[stack.Count - 1];
                 stack.RemoveAt(stack.Count - 1);
+                if (stack.Count == 0) _undoStacks.Remove(playerId);
 
+                if (!prevOverride.HasValue)
+                {
+                    bool removed = _overrides.Remove(playerId);
+                    if (removed || stack.Count == 0) return true;
+                    continue;
+                }
+
+                int prevLand = prevOverride.Value;
                 if (prevLand == liveLandId)
                 {
                     bool removed = _overrides.Remove(playerId);
@@ -143,6 +172,8 @@ namespace MonsterPathPredictor.Core
 
                 if (board != null && board.TryGetNode(prevLand, out var node) && !node.Disabled)
                 {
+                    if (_overrides.TryGetValue(playerId, out int cur) && cur == prevLand && stack.Count > 0)
+                        continue;
                     _overrides[playerId] = prevLand;
                     return true;
                 }
@@ -194,26 +225,41 @@ namespace MonsterPathPredictor.Core
 
             if (_overrides.Count > 0)
             {
-                List<long> toRemove = null;
+                List<long> toRemoveWithHistory = null;
+                List<long> toRemoveRedundantOnly = null;
                 foreach (var kv in _overrides)
                 {
-                    bool valid = aliveById.TryGetValue(kv.Key, out var liveP) &&
-                                 board != null &&
-                                 board.TryGetNode(kv.Value, out var node) &&
-                                 !node.Disabled &&
-                                 kv.Value != liveP.LandId;
-                    if (!valid)
+                    bool aliveAndValidTile = aliveById.TryGetValue(kv.Key, out var liveP) &&
+                                             board != null &&
+                                             board.TryGetNode(kv.Value, out var node) &&
+                                             !node.Disabled;
+                    if (!aliveAndValidTile)
                     {
-                        if (toRemove == null) toRemove = new List<long>();
-                        toRemove.Add(kv.Key);
+                        if (toRemoveWithHistory == null) toRemoveWithHistory = new List<long>();
+                        toRemoveWithHistory.Add(kv.Key);
+                    }
+                    else if (kv.Value == liveP.LandId)
+                    {
+                        // Real player arrived at the virtual tile: clear the now-redundant override
+                        // while preserving valid undo entries so the user can still step back.
+                        if (toRemoveRedundantOnly == null) toRemoveRedundantOnly = new List<long>();
+                        toRemoveRedundantOnly.Add(kv.Key);
                     }
                 }
-                if (toRemove != null)
+                if (toRemoveWithHistory != null)
                 {
-                    for (int i = 0; i < toRemove.Count; i++)
+                    for (int i = 0; i < toRemoveWithHistory.Count; i++)
                     {
-                        _overrides.Remove(toRemove[i]);
-                        _undoStacks.Remove(toRemove[i]);
+                        _overrides.Remove(toRemoveWithHistory[i]);
+                        _undoStacks.Remove(toRemoveWithHistory[i]);
+                    }
+                    changed = true;
+                }
+                if (toRemoveRedundantOnly != null)
+                {
+                    for (int i = 0; i < toRemoveRedundantOnly.Count; i++)
+                    {
+                        _overrides.Remove(toRemoveRedundantOnly[i]);
                     }
                     changed = true;
                 }
@@ -236,10 +282,18 @@ namespace MonsterPathPredictor.Core
                 }
             }
 
-            // Ensure SelectedPlayerId points to a valid player in the current roster
-            bool selectedValid = SelectedPlayerId != 0 && aliveById.ContainsKey(SelectedPlayerId);
+            // Ensure SelectedPlayerId points to a valid player in the current roster.
+            // If the previously edited player died/vanished and had board-picking armed, disarm to prevent
+            // accidentally moving a different auto-selected player on the next right-click.
+            bool hadSelected = SelectedPlayerId != 0;
+            bool selectedValid = hadSelected && aliveById.ContainsKey(SelectedPlayerId);
             if (!selectedValid)
             {
+                if (hadSelected && BoardPickArmed)
+                {
+                    BoardPickArmed = false;
+                    changed = true;
+                }
                 if (localPlayerId != 0 && aliveById.ContainsKey(localPlayerId))
                 {
                     SelectedPlayerId = localPlayerId;
@@ -310,7 +364,15 @@ namespace MonsterPathPredictor.Core
         public List<VirtualPlayerGhost> BuildGhosts(IReadOnlyList<TrackedPlayer> livePlayers, BoardGraph board, long localPlayerId)
         {
             var ghosts = new List<VirtualPlayerGhost>();
-            if (livePlayers == null || board == null || _overrides.Count == 0) return ghosts;
+            BuildGhostsInto(livePlayers, board, localPlayerId, ghosts);
+            return ghosts;
+        }
+
+        public void BuildGhostsInto(IReadOnlyList<TrackedPlayer> livePlayers, BoardGraph board, long localPlayerId, List<VirtualPlayerGhost> target)
+        {
+            if (target == null) return;
+            target.Clear();
+            if (livePlayers == null || board == null || _overrides.Count == 0) return;
 
             for (int i = 0; i < livePlayers.Count; i++)
             {
@@ -320,7 +382,7 @@ namespace MonsterPathPredictor.Core
                 if (virtLand == p.LandId) continue;
                 if (!board.TryGetNode(virtLand, out var node) || node.Disabled) continue;
 
-                ghosts.Add(new VirtualPlayerGhost(
+                target.Add(new VirtualPlayerGhost(
                     p.PlayerId,
                     p.SeatTag,
                     p.Name,
@@ -330,8 +392,7 @@ namespace MonsterPathPredictor.Core
                     p.PlayerId == SelectedPlayerId));
             }
 
-            ghosts.Sort((a, b) => string.CompareOrdinal(a.SeatTag, b.SeatTag));
-            return ghosts;
+            target.Sort((a, b) => string.CompareOrdinal(a.SeatTag, b.SeatTag));
         }
 
         public static List<int> GetReachableNeighbors(BoardGraph board, int currentLandId)
@@ -353,41 +414,63 @@ namespace MonsterPathPredictor.Core
     }
 
     /// <summary>
-    /// Pure-C# screen-space board tile hit-tester for right-click virtual placement.
+    /// Pure-C# order-independent screen-space board tile hit-tester for right-click virtual placement.
     /// </summary>
     public static class BoardTileHitTester
     {
+        private const double DistanceTieEpsSq = 1.0;
+        private const float DepthTieEps = 0.01f;
+
         public static int PickTile(Point2 clickLocal, IReadOnlyList<ProjectedBoardTile> projectedTiles, float maxRadiusPx)
         {
             if (projectedTiles == null || projectedTiles.Count == 0 || maxRadiusPx <= 0f) return -1;
 
             double maxDistSq = (double)maxRadiusPx * maxRadiusPx;
-            int bestLandId = -1;
-            double bestDistSq = double.MaxValue;
-            float bestDepth = float.MaxValue;
 
+            // Pass 1: find true minimum squared distance across all eligible tiles (order-independent)
+            double minDistSq = double.MaxValue;
             for (int i = 0; i < projectedTiles.Count; i++)
             {
                 var t = projectedTiles[i];
                 double dx = clickLocal.X - t.ScreenPos.X;
                 double dy = clickLocal.Y - t.ScreenPos.Y;
                 double d2 = dx * dx + dy * dy;
-                if (d2 > maxDistSq) continue;
-
-                const double TieEps = 1.0; // 1 px^2 tie-break tolerance
-                if (bestLandId < 0 ||
-                    d2 < bestDistSq - TieEps ||
-                    (Math.Abs(d2 - bestDistSq) <= TieEps &&
-                     (t.CameraDepth < bestDepth - 0.01f ||
-                      (Math.Abs(t.CameraDepth - bestDepth) <= 0.01f && t.LandId < bestLandId))))
+                if (d2 <= maxDistSq && d2 < minDistSq)
                 {
-                    bestLandId = t.LandId;
-                    bestDistSq = d2;
-                    bestDepth = t.CameraDepth;
+                    minDistSq = d2;
+                }
+            }
+            if (minDistSq == double.MaxValue) return -1;
+
+            // Pass 2: among tiles within DistanceTieEpsSq of minDistSq, find true minimum CameraDepth
+            double distCutoff = minDistSq + DistanceTieEpsSq;
+            float minDepth = float.MaxValue;
+            for (int i = 0; i < projectedTiles.Count; i++)
+            {
+                var t = projectedTiles[i];
+                double dx = clickLocal.X - t.ScreenPos.X;
+                double dy = clickLocal.Y - t.ScreenPos.Y;
+                if (dx * dx + dy * dy <= distCutoff && t.CameraDepth < minDepth)
+                {
+                    minDepth = t.CameraDepth;
                 }
             }
 
-            return bestLandId;
+            // Pass 3: among tiles within DepthTieEps of minDepth, pick deterministic smallest LandId
+            float depthCutoff = minDepth + DepthTieEps;
+            int bestLandId = int.MaxValue;
+            for (int i = 0; i < projectedTiles.Count; i++)
+            {
+                var t = projectedTiles[i];
+                double dx = clickLocal.X - t.ScreenPos.X;
+                double dy = clickLocal.Y - t.ScreenPos.Y;
+                if (dx * dx + dy * dy <= distCutoff && t.CameraDepth <= depthCutoff && t.LandId < bestLandId)
+                {
+                    bestLandId = t.LandId;
+                }
+            }
+
+            return bestLandId == int.MaxValue ? -1 : bestLandId;
         }
     }
 }

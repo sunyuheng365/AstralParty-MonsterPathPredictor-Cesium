@@ -4,6 +4,7 @@ using CesiumLoader.SDK.Engine;
 using CesiumLoader.SDK.Inputs;
 using FairyGUI;
 using UnityEngine;
+using MonsterPathPredictor.Config;
 using MonsterPathPredictor.Core;
 
 namespace MonsterPathPredictor.Runtime
@@ -15,16 +16,21 @@ namespace MonsterPathPredictor.Runtime
     internal sealed class MonsterPicker
     {
         private const float DragThresholdPx = 8f;
+        private const float BoardTilePickRadiusPx = 44f;
 
         private readonly PointerClickTracker _clickTracker = new PointerClickTracker(DragThresholdPx);
         private readonly PointerClickTracker _rightClickTracker = new PointerClickTracker(DragThresholdPx);
         private readonly List<ProjectedBoardTile> _tileProjBuf = new List<ProjectedBoardTile>(96);
         private int _lastProcessedFrame = -1;
+        private long _rightDownPlayerId;
+        private int _rightDownLayoutGen;
 
         public void CancelPendingPointer()
         {
             _clickTracker.Reset();
             _rightClickTracker.Reset();
+            _rightDownPlayerId = 0;
+            _rightDownLayoutGen = -1;
         }
 
         public bool ProcessInput(
@@ -35,20 +41,26 @@ namespace MonsterPathPredictor.Runtime
             PredictorSettings settings,
             MonsterPickerPopup popup,
             bool virtualBoardPickArmed,
+            long activeVirtualPlayerId,
+            int layoutGeneration,
             ref long selectedMonsterId,
             out int pickedVirtualLandId,
+            out long pickedVirtualPlayerId,
             out bool clearVirtualRequested)
         {
             pickedVirtualLandId = -1;
+            pickedVirtualPlayerId = 0;
             clearVirtualRequested = false;
 
             int frame = UnityTime.FrameCount;
             if (frame == _lastProcessedFrame) return false;
             _lastProcessedFrame = frame;
 
-            // 1. Toggle monster picker popup hotkey (default F10)
+            // 1. Toggle monster picker popup hotkey (default F10): cancel any in-flight gestures so
+            //    releasing a mouse button after opening/closing the popup never leaks onto the board.
             if (IsHotkeyDown(settings.PickerHotkey))
             {
+                CancelPendingPointer();
                 popup?.Toggle();
                 return false;
             }
@@ -74,13 +86,15 @@ namespace MonsterPathPredictor.Runtime
             }
 
             // 3. Optional right-click board tile placement when virtual-move board picking is armed
-            if (virtualBoardPickArmed && board != null && camera != null)
+            if (virtualBoardPickArmed && activeVirtualPlayerId != 0 && board != null && camera != null)
             {
-                pickedVirtualLandId = ProcessRightClickTilePick(layer, camera, board, settings, popup);
+                pickedVirtualLandId = ProcessRightClickTilePick(layer, camera, board, popup, activeVirtualPlayerId, layoutGeneration, out pickedVirtualPlayerId);
             }
-            else if (_rightClickTracker.IsTracking)
+            else if (_rightClickTracker.IsTracking || _rightDownPlayerId != 0)
             {
                 _rightClickTracker.Reset();
+                _rightDownPlayerId = 0;
+                _rightDownLayoutGen = -1;
             }
 
             bool isDown = InputService.IsMouseButtonPressed(0);
@@ -122,6 +136,12 @@ namespace MonsterPathPredictor.Runtime
 
             if (!outcome.IsBoardClick) return false;
 
+            // Reject releases that land inside our open popup or blocking game UI.
+            if (hasPos && ((popup != null && popup.IsOpen && popup.ContainsStagePoint(stagePos)) || IsPointerOverBlockingUi()))
+            {
+                return false;
+            }
+
             // Prefer the monster cleanly hit on MouseDown if still alive so a passing monster
             // cannot hijack the release click; fall back to release-position hit test if needed.
             long hitMonsterId = IsMonsterPresent(monsters, outcome.DownHitMonsterId)
@@ -150,15 +170,28 @@ namespace MonsterPathPredictor.Runtime
             GComponent layer,
             Camera camera,
             BoardGraph board,
-            PredictorSettings settings,
-            MonsterPickerPopup popup)
+            MonsterPickerPopup popup,
+            long activeVirtualPlayerId,
+            int layoutGeneration,
+            out long targetPlayerId)
         {
+            targetPlayerId = 0;
             bool isDown = InputService.IsMouseButtonPressed(1);
             bool isHeld = InputService.IsMouseButtonHeld(1);
             bool isUp = InputService.IsMouseButtonReleased(1);
 
             if (!isDown && !isHeld && !isUp && !_rightClickTracker.IsTracking)
                 return -1;
+
+            // Cancel in-flight right-click if the edited player or board layout changed mid-gesture.
+            if (_rightClickTracker.IsTracking &&
+                (_rightDownPlayerId != activeVirtualPlayerId || _rightDownLayoutGen != layoutGeneration))
+            {
+                _rightClickTracker.Reset();
+                _rightDownPlayerId = 0;
+                _rightDownLayoutGen = -1;
+                if (!isDown) return -1;
+            }
 
             bool hasPos = TryGetStageAndLayerMouse(layer, out Vector2 stagePos, out Vector2 localPos);
 
@@ -169,6 +202,11 @@ namespace MonsterPathPredictor.Runtime
                     IsPointerOverBlockingUi())
                 {
                     blockedOnDown = true;
+                }
+                else
+                {
+                    _rightDownPlayerId = activeVirtualPlayerId;
+                    _rightDownLayoutGen = layoutGeneration;
                 }
             }
 
@@ -181,17 +219,38 @@ namespace MonsterPathPredictor.Runtime
                 blockedByUiOnDown: blockedOnDown,
                 downHitMonsterId: 0);
 
-            if (!outcome.IsBoardClick || !hasPos) return -1;
+            if (!outcome.IsBoardClick)
+            {
+                if (!_rightClickTracker.IsTracking)
+                {
+                    _rightDownPlayerId = 0;
+                    _rightDownLayoutGen = -1;
+                }
+                return -1;
+            }
 
-            return HitTestBoardTile(layer, camera, board, localPos, settings);
+            long ownerPlayerId = _rightDownPlayerId;
+            int ownerLayoutGen = _rightDownLayoutGen;
+            _rightDownPlayerId = 0;
+            _rightDownLayoutGen = -1;
+
+            if (!hasPos || ownerPlayerId == 0 || ownerPlayerId != activeVirtualPlayerId || ownerLayoutGen != layoutGeneration)
+                return -1;
+
+            // Reject releases landing inside the open popup or blocking game UI.
+            if ((popup != null && popup.IsOpen && popup.ContainsStagePoint(stagePos)) || IsPointerOverBlockingUi())
+                return -1;
+
+            int landId = HitTestBoardTile(layer, camera, board, localPos);
+            if (landId >= 0) targetPlayerId = ownerPlayerId;
+            return landId;
         }
 
         private int HitTestBoardTile(
             GComponent layer,
             Camera camera,
             BoardGraph board,
-            Vector2 clickLocal,
-            PredictorSettings settings)
+            Vector2 clickLocal)
         {
             var camTr = UnityObject.GetTransform(camera);
             var camPos = TransformService.GetPosition(camTr);
@@ -203,7 +262,8 @@ namespace MonsterPathPredictor.Runtime
             foreach (var node in board.ActiveNodes())
             {
                 if (node == null || node.Disabled) continue;
-                var w = new Vector3(node.X, node.Y + settings.HeightOffset * 0.5f, node.Z);
+                // Project at physical board tile surface (node.Y) so visual HeightOffset never shifts hit targets.
+                var w = new Vector3(node.X, node.Y, node.Z);
                 double depth = DashGeometry.ComputeCameraDepth(
                     w.x, w.y, w.z,
                     camPos.x, camPos.y, camPos.z,
@@ -219,8 +279,7 @@ namespace MonsterPathPredictor.Runtime
                 _tileProjBuf.Add(new ProjectedBoardTile(node.Id, new Point2(p.x, p.y), (float)depth));
             }
 
-            float pickRadius = Math.Max(46f, settings.ClickRadius * 1.6f);
-            return BoardTileHitTester.PickTile(new Point2(clickLocal.x, clickLocal.y), _tileProjBuf, pickRadius);
+            return BoardTileHitTester.PickTile(new Point2(clickLocal.x, clickLocal.y), _tileProjBuf, BoardTilePickRadiusPx);
         }
 
         private static bool IsMonsterPresent(IReadOnlyList<LiveMonsterInfo> monsters, long monsterId)
@@ -236,8 +295,7 @@ namespace MonsterPathPredictor.Runtime
 
         private static bool IsHotkeyDown(string keyName)
         {
-            if (string.IsNullOrWhiteSpace(keyName)) return false;
-            if (Enum.TryParse(keyName.Trim(), ignoreCase: true, out KeyCode code) && code != KeyCode.None)
+            if (PredictorConfig.TryParseValidKeyCode(keyName, out var code))
             {
                 return InputService.IsKeyDown(code);
             }

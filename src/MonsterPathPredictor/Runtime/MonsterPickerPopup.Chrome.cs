@@ -11,10 +11,13 @@ namespace MonsterPathPredictor.Runtime
     {
         private void EnsureCreated()
         {
-            if (_root != null && !_root.isDisposed && _root.parent == GRoot.inst) return;
+            if (_root != null && !_root.isDisposed && _root.parent == GRoot.inst && _footerHost != null && !_footerHost.isDisposed)
+                return;
             Dispose();
             if (GRoot.inst == null) return;
 
+            try
+            {
             _root = new GComponent
             {
                 name = "MonsterPathPredictor.PickerPopup",
@@ -64,7 +67,7 @@ namespace MonsterPathPredictor.Runtime
 
             _pagerHost = new GComponent { touchable = true, visible = false };
             _pagerHost.SetSize(PanelWidth, 28f);
-            _prevBtn = CreateMiniButton("◀", 28f, 22f, () => { _pageIndex = Math.Max(0, _pageIndex - 1); _lastSignature = string.Empty; });
+            _prevBtn = CreateMiniButton("◀", 28f, 22f, () => StepActivePage(-1));
             _prevBtn.SetXY(Padding, 3f);
             _pagerHost.AddChild(_prevBtn);
             _pageLabel = new GTextField
@@ -77,7 +80,7 @@ namespace MonsterPathPredictor.Runtime
             _pageLabel.SetXY(44f, 5f);
             _pageLabel.SetSize(PanelWidth - 88f, 18f);
             _pagerHost.AddChild(_pageLabel);
-            _nextBtn = CreateMiniButton("▶", 28f, 22f, () => { _pageIndex++; _lastSignature = string.Empty; });
+            _nextBtn = CreateMiniButton("▶", 28f, 22f, () => StepActivePage(1));
             _nextBtn.SetXY(PanelWidth - Padding - 28f, 3f);
             _pagerHost.AddChild(_nextBtn);
             _root.AddChild(_pagerHost);
@@ -118,6 +121,12 @@ namespace MonsterPathPredictor.Runtime
             _footerHost.AddChild(_clearBtn);
 
             _root.AddChild(_footerHost);
+            }
+            catch
+            {
+                Dispose();
+                throw;
+            }
         }
 
         private static GComponent CreateMiniButton(string text, float w, float h, Action onClick, int fontSize = 13)
@@ -349,12 +358,17 @@ namespace MonsterPathPredictor.Runtime
             _clearBtn.SetXY(clearX, fBtnY);
         }
 
-        private static int ComputeRowsPerPage(float stageHeight)
+        private static int ComputeRowsPerPage(float stageHeight, bool hasVirtualBanner)
         {
             const float PagerReserve = 28f;
             const float MarginReserve = 28f;
+            float bannerReserve = hasVirtualBanner ? 30f : 0f;
             float chrome = HeaderHeight + TabBarHeight + Padding + PagerReserve + Padding + FooterHeight + MarginReserve;
             float availList = stageHeight - chrome;
+            if (availList >= RowHeight + 4f + bannerReserve)
+            {
+                availList -= bannerReserve;
+            }
             if (availList <= RowHeight + 4f) return 1;
             int rows = (int)((availList - 4f) / (RowHeight + 4f));
             return Math.Max(1, Math.Min(MaxVisibleRows, rows));
@@ -374,9 +388,11 @@ namespace MonsterPathPredictor.Runtime
             float stageWidth,
             float stageHeight)
         {
-            var sb = new StringBuilder(256);
+            var sb = _sigBuilder;
+            sb.Clear();
             sb.Append((int)_activeTab).Append('|')
               .Append((int)_selectedColorRole).Append('|')
+              .Append(_styleSaveFailed ? 'E' : 'O').Append('|')
               .Append(selectedId).Append('|')
               .Append(settings.PreviewSteps).Append('|')
               .Append(settings.PickerHotkey).Append('|')
@@ -390,6 +406,7 @@ namespace MonsterPathPredictor.Runtime
                 sb.Append("VS:").Append(sandbox.SelectedPlayerId).Append(':')
                   .Append(sandbox.BoardPickArmed ? '1' : '0').Append(':')
                   .Append(sandbox.OverrideCount).Append(':')
+                  .Append(sandbox.HasAnyState ? '1' : '0').Append(':')
                   .Append(sandbox.CanUndo(sandbox.SelectedPlayerId) ? '1' : '0').Append('|');
             }
 
@@ -445,6 +462,7 @@ namespace MonsterPathPredictor.Runtime
                   .Append((int)Math.Round(settings.DashSpeed)).Append(':')
                   .Append((int)Math.Round(settings.DashLength)).Append(':')
                   .Append((int)Math.Round(settings.GapLength)).Append(':')
+                  .Append((int)Math.Round(settings.HeightOffset * 100f)).Append(':')
                   .Append(settings.FontSize).Append(':')
                   .Append((int)settings.PostCombatMode).Append(':')
                   .Append(settings.ShowStepNumbers ? '1' : '0')
@@ -466,7 +484,9 @@ namespace MonsterPathPredictor.Runtime
             _lastSignature = string.Empty;
             _positioned = false;
             _temporarilyHidden = false;
-            _pageIndex = 0;
+            _monsterPageIndex = 0;
+            _virtualPageIndex = 0;
+            _stylePageIndex = 0;
             if (_root != null)
             {
                 try { _root.Dispose(); } catch { }

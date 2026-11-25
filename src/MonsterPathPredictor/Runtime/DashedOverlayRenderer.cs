@@ -75,11 +75,39 @@ namespace MonsterPathPredictor.Runtime
         private readonly Dictionary<long, int> _forkExitLabelStack = new Dictionary<long, int>();
         private readonly Dictionary<long, float> _forkExitNextTopY = new Dictionary<long, float>();
         private readonly Dictionary<int, int> _ghostTileStack = new Dictionary<int, int>();
+        private readonly HashSet<int> _drawnGhostRingTiles = new HashSet<int>();
+        private readonly HashSet<long> _multiBranchEdgeKeys = new HashSet<long>();
         private readonly HashSet<int> _combatLandSet = new HashSet<int>();
         private readonly List<DashQuad> _dashQuadBuf = new List<DashQuad>(32);
         private readonly List<Vector2> _vertBuf = new List<Vector2>(4);
         private int _usedLineGraphs;
         private int _usedPills;
+
+        private RoutePalette _cachedPalette;
+        private bool _hasCachedPalette;
+        private string _palDet, _palMaj, _palMin, _palPost, _palRed, _palBlue;
+
+        private RoutePalette GetPalette(PredictorSettings settings)
+        {
+            if (!_hasCachedPalette ||
+                !string.Equals(_palDet, settings.DeterministicColorHex, StringComparison.Ordinal) ||
+                !string.Equals(_palMaj, settings.MajorBranchColorHex, StringComparison.Ordinal) ||
+                !string.Equals(_palMin, settings.MinorBranchColorHex, StringComparison.Ordinal) ||
+                !string.Equals(_palPost, settings.PostCombatColorHex, StringComparison.Ordinal) ||
+                !string.Equals(_palRed, settings.GuideRedColorHex, StringComparison.Ordinal) ||
+                !string.Equals(_palBlue, settings.GuideBlueColorHex, StringComparison.Ordinal))
+            {
+                _palDet = settings.DeterministicColorHex;
+                _palMaj = settings.MajorBranchColorHex;
+                _palMin = settings.MinorBranchColorHex;
+                _palPost = settings.PostCombatColorHex;
+                _palRed = settings.GuideRedColorHex;
+                _palBlue = settings.GuideBlueColorHex;
+                _cachedPalette = new RoutePalette(settings);
+                _hasCachedPalette = true;
+            }
+            return _cachedPalette;
+        }
 
         public GComponent EnsureLayer()
         {
@@ -127,11 +155,21 @@ namespace MonsterPathPredictor.Runtime
         {
             for (int i = 0; i < _lineGraphPool.Count; i++)
             {
-                if (_lineGraphPool[i].visible) _lineGraphPool[i].visible = false;
+                try
+                {
+                    var g = _lineGraphPool[i];
+                    if (g != null && !g.isDisposed && g.visible) g.visible = false;
+                }
+                catch { }
             }
             for (int i = 0; i < _pillPool.Count; i++)
             {
-                if (_pillPool[i].Root.visible) _pillPool[i].Root.visible = false;
+                try
+                {
+                    var root = _pillPool[i]?.Root;
+                    if (root != null && !root.isDisposed && root.visible) root.visible = false;
+                }
+                catch { }
             }
             _usedLineGraphs = 0;
             _usedPills = 0;
@@ -156,8 +194,9 @@ namespace MonsterPathPredictor.Runtime
 
             _usedLineGraphs = 0;
             _usedPills = 0;
+            _forkTagNextTopY.Clear();
 
-            var palette = new RoutePalette(settings);
+            var palette = GetPalette(settings);
             var camTr = UnityObject.GetTransform(camera);
             var camPos = TransformService.GetPosition(camTr);
             var camForward = TransformService.GetForward(camTr);
@@ -227,7 +266,18 @@ namespace MonsterPathPredictor.Runtime
 
             if (hasMonsterPlan)
             {
-            for (int i = 0; i < plan.Edges.Count; i++)
+                _multiBranchEdgeKeys.Clear();
+                for (int fi = 0; fi < plan.Forks.Count; fi++)
+                {
+                    var fk = plan.Forks[fi];
+                    if (!fk.HasMultipleBranches) continue;
+                    for (int ei = 0; ei < fk.Exits.Count; ei++)
+                    {
+                        _multiBranchEdgeKeys.Add(((long)fk.ForkLandId << 32) ^ (uint)fk.Exits[ei].NextLandId);
+                    }
+                }
+
+                for (int i = 0; i < plan.Edges.Count; i++)
             {
                 var edge = plan.Edges[i];
                 if (!board.TryGetNode(edge.FromLandId, out var fromNode)) continue;
@@ -273,7 +323,9 @@ namespace MonsterPathPredictor.Runtime
                         out double clippedFromStartPx, out double clippedStartModPeriod, out double clippedEndPx))
                     continue;
 
-                Color color = PickEdgeColor(palette, edge.Probability, edge.IsAfterCombat);
+                long edgeKey = ((long)edge.FromLandId << 32) ^ (uint)edge.ToLandId;
+                bool edgeIsSplit = _multiBranchEdgeKeys.Contains(edgeKey);
+                Color color = PickEdgeColor(palette, edge.Probability, edge.IsAfterCombat, edgeIsSplit);
                 float baseWidth = edge.IsAfterCombat ? Math.Max(2.2f, settings.LineWidth * 0.78f) : settings.LineWidth;
                 float width = edge.Probability >= 0.999
                     ? baseWidth
@@ -495,8 +547,24 @@ namespace MonsterPathPredictor.Runtime
             const float TetherDashLen = 8f;
             const float TetherGapLen = 6f;
             const double TetherPeriod = TetherDashLen + TetherGapLen;
+            const float StackGapPx = 4f;
             int labelFont = Math.Max(12, settings.FontSize - 3);
             _ghostTileStack.Clear();
+            _drawnGhostRingTiles.Clear();
+
+            // First determine which virtual tiles have the currently edited player so their gold ring wins on shared tiles.
+            for (int i = 0; i < ghosts.Count; i++)
+            {
+                if (!ghosts[i].IsSelectedForEdit) continue;
+                int vid = ghosts[i].VirtualLandId;
+                if (_drawnGhostRingTiles.Add(vid) &&
+                    board.TryGetNode(vid, out var vn) &&
+                    TryProjectWorld(layer, camera, camPos, camForward, new Vector3(vn.X, vn.Y + hOffset, vn.Z), out var selPt, nearClipDist))
+                {
+                    DrawDot(selPt, 11.5f, RingColor);
+                    DrawDot(selPt, 5.5f, VirtualInnerDotColor);
+                }
+            }
 
             for (int i = 0; i < ghosts.Count; i++)
             {
@@ -547,34 +615,38 @@ namespace MonsterPathPredictor.Runtime
                     }
                 }
 
-                // Virtual position ring & label pill
+                // Virtual position ring & label pill (stacked cleanly above any existing fork/ghost pills on this tile)
                 var virtWorld = new Vector3(virtNode.X, virtNode.Y + hOffset, virtNode.Z);
                 if (!TryProjectWorld(layer, camera, camPos, camForward, virtWorld, out var vPt, nearClipDist))
                     continue;
 
                 Color accent = ghost.IsSelectedForEdit ? RingColor : VirtualGhostColor;
-                DrawDot(vPt, 11.5f, accent);
-                DrawDot(vPt, 5.5f, VirtualInnerDotColor);
-
-                _ghostTileStack.TryGetValue(ghost.VirtualLandId, out int stackIdx);
-                _ghostTileStack[ghost.VirtualLandId] = stackIdx + 1;
+                if (_drawnGhostRingTiles.Add(ghost.VirtualLandId))
+                {
+                    DrawDot(vPt, 11.5f, accent);
+                    DrawDot(vPt, 5.5f, VirtualInnerDotColor);
+                }
 
                 string selfTag = ghost.IsLocalPlayer ? "(我)" : string.Empty;
                 string badge = "虚·" + ghost.SeatTag + selfTag + " #" + ghost.VirtualLandId;
-                float yOffset = -24f - stackIdx * (labelFont + 10f);
-                DrawPillLabel(new Point2(vPt.X, vPt.Y + yOffset), badge, labelFont, accent);
+                var basePos = new Point2(vPt.X, vPt.Y - 24f);
+                bool hasPriorTop = _forkTagNextTopY.TryGetValue(ghost.VirtualLandId, out float priorTopY);
+                float nextTopY = DrawStackedPillLabel(basePos, hasPriorTop, priorTopY, StackGapPx, badge, labelFont, accent);
+                _forkTagNextTopY[ghost.VirtualLandId] = nextTopY;
             }
         }
 
-        private static Color PickEdgeColor(RoutePalette palette, double probability, bool isAfterCombat)
+        private static Color PickEdgeColor(RoutePalette palette, double probability, bool isAfterCombat, bool forceSplit = false)
         {
+            bool isDeterministic = !forceSplit && probability >= 0.999999;
             if (isAfterCombat)
             {
-                if (probability >= 0.999) return palette.PostCombat;
+                if (isDeterministic) return palette.PostCombat;
                 var c = probability >= 0.50 ? palette.MajorBranch : palette.MinorBranch;
-                return new Color(c.r, c.g, c.b, Math.Min(0.60f, c.a * 0.65f));
+                // Apply configured PostCombat alpha consistently to post-combat split edges as well.
+                return new Color(c.r, c.g, c.b, Math.Min(c.a, palette.PostCombat.a));
             }
-            if (probability >= 0.999) return palette.Deterministic;
+            if (isDeterministic) return palette.Deterministic;
             if (probability >= 0.50) return palette.MajorBranch;
             return palette.MinorBranch;
         }
@@ -595,7 +667,7 @@ namespace MonsterPathPredictor.Runtime
                 default:
                     if (fork.HasMultipleBranches)
                         return fork.IsAfterCombat
-                            ? new Color(palette.MajorBranch.r, palette.MajorBranch.g, palette.MajorBranch.b, Math.Min(0.72f, palette.MajorBranch.a * 0.78f))
+                            ? new Color(palette.MajorBranch.r, palette.MajorBranch.g, palette.MajorBranch.b, Math.Min(palette.MajorBranch.a, palette.PostCombat.a))
                             : palette.MajorBranch;
                     return fork.IsAfterCombat ? palette.PostCombat : palette.Deterministic;
             }
@@ -603,11 +675,11 @@ namespace MonsterPathPredictor.Runtime
 
         private static Color PickForkExitColor(RoutePalette palette, PredictedFork fork, ForkExitPrediction exit)
         {
-            if (!fork.HasMultipleBranches)
+            if (!fork.HasMultipleBranches && !exit.HasOtherPositiveExits)
             {
                 return PickForkAccentColor(palette, fork);
             }
-            return PickEdgeColor(palette, exit.ConditionalProbability, fork.IsAfterCombat);
+            return PickEdgeColor(palette, exit.ConditionalProbability, fork.IsAfterCombat, forceSplit: true);
         }
 
         private static bool TryProjectWorldUnclipped(

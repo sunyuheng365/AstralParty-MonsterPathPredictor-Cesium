@@ -116,12 +116,21 @@ namespace MonsterPathPredictor.Core
             if (s[0] == '#') s = s.Substring(1);
             if (s.Length != 6 && s.Length != 8) return false;
 
-            if (!byte.TryParse(s.Substring(0, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out byte r)) return false;
-            if (!byte.TryParse(s.Substring(2, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out byte g)) return false;
-            if (!byte.TryParse(s.Substring(4, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out byte b)) return false;
+            for (int i = 0; i < s.Length; i++)
+            {
+                char ch = s[i];
+                bool isHex = (ch >= '0' && ch <= '9') ||
+                             (ch >= 'a' && ch <= 'f') ||
+                             (ch >= 'A' && ch <= 'F');
+                if (!isHex) return false;
+            }
+
+            if (!byte.TryParse(s.Substring(0, 2), NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out byte r)) return false;
+            if (!byte.TryParse(s.Substring(2, 2), NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out byte g)) return false;
+            if (!byte.TryParse(s.Substring(4, 2), NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out byte b)) return false;
             byte a = 255;
             if (s.Length == 8 &&
-                !byte.TryParse(s.Substring(6, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out a))
+                !byte.TryParse(s.Substring(6, 2), NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out a))
             {
                 return false;
             }
@@ -153,7 +162,11 @@ namespace MonsterPathPredictor.Core
                 case 0: r = ClampByte(r + delta, 0, 255); break;
                 case 1: g = ClampByte(g + delta, 0, 255); break;
                 case 2: b = ClampByte(b + delta, 0, 255); break;
-                case 3: a = ClampByte(a + delta, minAlpha, 255); break;
+                case 3:
+                    // Never raise alpha when the user presses '-' on a low-alpha config color.
+                    int effectiveMin = delta < 0 ? Math.Min(a, (int)minAlpha) : (int)minAlpha;
+                    a = ClampByte(a + delta, effectiveMin, 255);
+                    break;
             }
             return new RgbaColor((byte)r, (byte)g, (byte)b, (byte)a);
         }

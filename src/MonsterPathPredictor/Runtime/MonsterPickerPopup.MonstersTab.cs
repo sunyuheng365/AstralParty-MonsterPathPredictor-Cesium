@@ -20,9 +20,11 @@ namespace MonsterPathPredictor.Runtime
         {
             float y = 0f;
             bool hasVirtual = sandbox != null && sandbox.HasOverrides;
-            if (hasVirtual && layout.MaxContentHeight >= 52f)
+            float bannerH = layout.RowH < 28f ? 22f : 26f;
+            // Always reserve space for at least one selectable monster row FIRST before showing the virtual banner.
+            float minForBannerAndOneRow = bannerH + layout.RowGap + (visible.Count > 0 ? layout.RowH : 22f);
+            if (hasVirtual && layout.MaxContentHeight >= minForBannerAndOneRow)
             {
-                float bannerH = layout.RowH < 28f ? 22f : 26f;
                 var banner = BuildVirtualActiveBanner(sandbox.OverrideCount, rowW, bannerH);
                 banner.SetXY(0f, y);
                 _contentHost.AddChild(banner);
@@ -40,7 +42,7 @@ namespace MonsterPathPredictor.Runtime
             }
 
             _emptyText.visible = false;
-            int start = _pageIndex * rowsPerPage;
+            int start = _monsterPageIndex * rowsPerPage;
             int count = Math.Min(rowsPerPage, visible.Count - start);
             float rowStep = layout.RowH + layout.RowGap;
             bool showRows = layout.RowH >= 10f && availListH >= layout.RowH;

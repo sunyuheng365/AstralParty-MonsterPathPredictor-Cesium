@@ -27,6 +27,11 @@ namespace MonsterPathPredictor.Runtime
                 sortingOrder = 2200,
                 visible = IsOpen
             };
+            _root.onTouchBegin.Add(OnPopupTouchBegin);
+            if (Stage.inst != null)
+            {
+                Stage.inst.onTouchEnd.Add(OnStageTouchEnd);
+            }
             GRoot.inst.AddChild(_root);
 
             _panelBg = new GGraph { touchable = false };
@@ -300,18 +305,24 @@ namespace MonsterPathPredictor.Runtime
             _titleText.SetXY(padX, Math.Max(1f, (layout.HeaderH - 20f) * 0.5f));
             _titleText.SetSize(Math.Max(40f, closeX - padX - 4f), Math.Min(20f, layout.HeaderH - 2f));
 
-            // 3-tab bar directly under header
+            // 3-tab bar directly under header — guaranteed strictly inside [padX, panelW - padX].
             _tabHost.SetXY(0f, layout.HeaderH);
             _tabHost.SetSize(panelW, layout.TabH);
-            float tabGap = panelW < 220f ? 3f : 4f;
-            float tabW = Math.Max(36f, (panelW - padX * 2f - tabGap * 2f) / 3f);
+            PopupPagination.ComputeThreeTabGeometry(panelW, padX, out float tabW, out float tabGap);
             float tabBtnH = Math.Min(24f, Math.Max(13f, layout.TabH - 4f));
             float tabBtnY = Math.Max(1f, (layout.TabH - tabBtnH) * 0.5f);
 
-            string virtualLabel = virtualOverrideCount > 0 ? ("虚拟(" + virtualOverrideCount + ")") : "虚拟走位";
-            StyleTabButton(_tabMonstersBtn, panelW < 210f ? "怪物" : "怪物列表", tabW, tabBtnH, _activeTab == PickerPopupTab.Monsters, accentViolet: false);
-            StyleTabButton(_tabVirtualBtn, panelW < 210f ? (virtualOverrideCount > 0 ? "虚(" + virtualOverrideCount + ")" : "虚拟") : virtualLabel, tabW, tabBtnH, _activeTab == PickerPopupTab.VirtualMove, accentViolet: virtualOverrideCount > 0);
-            StyleTabButton(_tabStyleBtn, panelW < 210f ? "样式" : "路线样式", tabW, tabBtnH, _activeTab == PickerPopupTab.RouteStyle, accentViolet: false);
+            string monstersLabel = tabW < 42f ? "怪" : (panelW < 210f ? "怪物" : "怪物列表");
+            string virtualLabel = tabW < 42f
+                ? (virtualOverrideCount > 0 ? ("虚" + virtualOverrideCount) : "虚")
+                : (panelW < 210f
+                    ? (virtualOverrideCount > 0 ? "虚(" + virtualOverrideCount + ")" : "虚拟")
+                    : (virtualOverrideCount > 0 ? ("虚拟(" + virtualOverrideCount + ")") : "虚拟走位"));
+            string styleLabel = tabW < 42f ? "样" : (panelW < 210f ? "样式" : "路线样式");
+
+            StyleTabButton(_tabMonstersBtn, monstersLabel, tabW, tabBtnH, _activeTab == PickerPopupTab.Monsters, accentViolet: false);
+            StyleTabButton(_tabVirtualBtn, virtualLabel, tabW, tabBtnH, _activeTab == PickerPopupTab.VirtualMove, accentViolet: virtualOverrideCount > 0);
+            StyleTabButton(_tabStyleBtn, styleLabel, tabW, tabBtnH, _activeTab == PickerPopupTab.RouteStyle, accentViolet: false);
 
             _tabMonstersBtn.SetXY(padX, tabBtnY);
             _tabVirtualBtn.SetXY(padX + tabW + tabGap, tabBtnY);
@@ -320,17 +331,18 @@ namespace MonsterPathPredictor.Runtime
             if (layout.PagerH > 0f)
             {
                 _pagerHost.SetSize(panelW, layout.PagerH);
-                float pBtnW = panelW < 200f ? 24f : 28f;
+                float usablePager = Math.Max(24f, panelW - padX * 2f);
+                float pBtnW = Math.Min(panelW < 200f ? 24f : 28f, Math.Max(12f, usablePager * 0.28f));
                 float pBtnH = Math.Min(22f, Math.Max(13f, layout.PagerH - 4f));
                 float pBtnY = Math.Max(1f, (layout.PagerH - pBtnH) * 0.5f);
                 ResizeMiniButton(_prevBtn, pBtnW, pBtnH);
                 _prevBtn.SetXY(padX, pBtnY);
-                float nextX = Math.Max(padX + pBtnW + 4f, panelW - padX - pBtnW);
+                float nextX = Math.Max(padX + pBtnW + 2f, panelW - padX - pBtnW);
                 ResizeMiniButton(_nextBtn, pBtnW, pBtnH);
                 _nextBtn.SetXY(nextX, pBtnY);
-                float labelX = padX + pBtnW + 4f;
+                float labelX = padX + pBtnW + 2f;
                 _pageLabel.SetXY(labelX, Math.Max(1f, (layout.PagerH - 18f) * 0.5f));
-                _pageLabel.SetSize(Math.Max(24f, nextX - labelX - 4f), Math.Min(18f, layout.PagerH - 2f));
+                _pageLabel.SetSize(Math.Max(12f, nextX - labelX - 2f), Math.Min(18f, layout.PagerH - 2f));
             }
 
             _footerHost.SetSize(panelW, layout.FooterH);
@@ -338,16 +350,12 @@ namespace MonsterPathPredictor.Runtime
             _footerBg.DrawRect(panelW, layout.FooterH, 0, Color.clear, HeaderBg);
             float fBtnH = Math.Min(24f, Math.Max(14f, layout.FooterH - 4f));
             float fBtnY = Math.Max(1f, (layout.FooterH - fBtnH) * 0.5f);
-            float gap = panelW < 220f ? 2f : 4f;
-            float availFooter = Math.Max(32f, panelW - padX * 2f);
-            float stepBtnW = panelW < 160f ? 16f : (panelW < 200f ? 20f : 26f);
-            float clearW = panelW < 160f ? Math.Max(28f, availFooter * 0.34f) : (panelW < 200f ? 48f : (panelW < 260f ? 68f : 76f));
-            float clearX = Math.Max(padX, panelW - padX - clearW);
-            float minusX = padX;
-            float stepsX = minusX + stepBtnW + gap;
-            float plusMaxX = Math.Max(stepsX, clearX - gap - stepBtnW);
-            float stepsW = Math.Max(16f, Math.Min(88f, plusMaxX - gap - stepsX));
-            float plusX = Math.Min(plusMaxX, stepsX + stepsW + gap);
+            PopupPagination.ComputeFooterGeometry(
+                panelW, padX,
+                out float minusX, out float stepBtnW,
+                out float stepsX, out float stepsW,
+                out float plusX,
+                out float clearX, out float clearW);
 
             ResizeMiniButton(_minusBtn, stepBtnW, fBtnH);
             _minusBtn.SetXY(minusX, fBtnY);
@@ -485,11 +493,19 @@ namespace MonsterPathPredictor.Runtime
             _lastSignature = string.Empty;
             _positioned = false;
             _temporarilyHidden = false;
+            _pointerPressedOnPopup = false;
+            _hasRenderedContent = false;
             _monsterPageIndex = 0;
             _virtualPageIndex = 0;
             _stylePageIndex = 0;
+            try
+            {
+                if (Stage.inst != null) Stage.inst.onTouchEnd.Remove(OnStageTouchEnd);
+            }
+            catch { }
             if (_root != null)
             {
+                try { _root.onTouchBegin.Remove(OnPopupTouchBegin); } catch { }
                 try { _root.Dispose(); } catch { }
                 _root = null;
             }

@@ -18,11 +18,12 @@ namespace MonsterPathPredictor.Core
     }
 
     /// <summary>
-    /// Pure-C# turn/round/acted-monster tracker that handles asynchronous delivery orders:
-    ///   - (R, A) -> (R+1, A) -> (R+1, B): never marks A as acted in R+1!
-    ///   - (R, A) -> (R, null) -> (R, A): transient null actor preserves A's active turn state!
-    ///   - (R, A) -> (R+1, null) -> (R+1, A): pending round transition resets A's turn once identity recovers!
-    ///   - Dice notification owner correlation: B's dice while A is still readable never resets A!
+    /// Pure-C# turn/round/acted-monster tracker handling all asynchronous client delivery orders:
+    ///   - (7,A) -> (8,A) -> (8,A) -> (8,B): repeated stale-actor reads never fabricate a round-8 turn for A.
+    ///   - (7,A) -> (7,null) -> (7,A): transient null actor preserves A's active turn state.
+    ///   - (7,A) -> (8,null) -> (8,A): pending null-round reset advances cleanly once identity returns.
+    ///   - (3,A) -> (3,B,dice=1) -> (3,B,dice=2,owner=B): actor-first first dice roll coalesces with B's turn.
+    ///   - (7,A) -> (8,A) -> (-1,B): unavailable round read uses _lastObservedRound=8, never miscrediting A.
     /// </summary>
     public sealed class ActionRoundTracker
     {
@@ -31,10 +32,11 @@ namespace MonsterPathPredictor.Core
         private long _activeActorId;
         private int _activeActorStartedRound = -1;
         private int _lastObservedRound = -1;
-        private bool _pendingRoundReset;
+        private bool _pendingNullRoundReset;
+        private bool _staleActorRoundPending;
+        private bool _actorAwaitingFirstDice;
         private int _turnSequence;
         private int _lastConsumedDiceEpoch;
-        private long _lastConsumedDiceActorId;
 
         public long ActiveActorId => _activeActorId;
         public int ActiveActorStartedRound => _activeActorStartedRound;
@@ -47,10 +49,11 @@ namespace MonsterPathPredictor.Core
             _activeActorId = 0;
             _activeActorStartedRound = -1;
             _lastObservedRound = -1;
-            _pendingRoundReset = false;
+            _pendingNullRoundReset = false;
+            _staleActorRoundPending = false;
+            _actorAwaitingFirstDice = false;
             _turnSequence = 0;
             _lastConsumedDiceEpoch = currentDiceEpoch;
-            _lastConsumedDiceActorId = 0;
         }
 
         public bool HasActedThisRound(long monsterId) => monsterId != 0 && _actedMonsterIdsThisRound.Contains(monsterId);
@@ -83,14 +86,15 @@ namespace MonsterPathPredictor.Core
             bool roundChanged = curRound >= 0 && _lastObservedRound >= 0 && curRound != _lastObservedRound;
 
             // Transient unavailable GetCurrentPlayer() while an actor was active:
-            // preserve active turn state within the same round, and record a pending reset if round changed.
+            // preserve active turn within same round; flag _pendingNullRoundReset if round advanced.
             if (!hasCurrentActor && _activeActorId != 0)
             {
                 if (roundChanged)
                 {
                     _actedMonsterIdsThisRound.Clear();
                     _lastObservedRound = curRound;
-                    _pendingRoundReset = true;
+                    _pendingNullRoundReset = true;
+                    _staleActorRoundPending = false;
                 }
                 else if (curRound >= 0 && _lastObservedRound < 0)
                 {
@@ -98,14 +102,6 @@ namespace MonsterPathPredictor.Core
                 }
                 return new TurnBoundaryResult(boundaryAdvanced: false, roundChanged: roundChanged, shouldResetMovementState: false);
             }
-
-            // Correlate dice notification strictly with its owning actor (ignore B's roll while A is still readable).
-            bool ownDiceAdvanced = hasCurrentActor &&
-                                   latestDiceEpoch != _lastConsumedDiceEpoch &&
-                                   (latestDiceOwnerId == 0 || latestDiceOwnerId == curActorId) &&
-                                   !(latestDiceEpoch == _lastConsumedDiceEpoch && curActorId == _lastConsumedDiceActorId);
-
-            bool actorChanged = curActorId != _activeActorId;
 
             if (roundChanged)
             {
@@ -117,15 +113,32 @@ namespace MonsterPathPredictor.Core
                 _lastObservedRound = curRound;
             }
 
-            // Case 1: Round ticked while GetCurrentPlayer() STILL returns the previous round's actor (with no new dice for it).
-            // Keep _activeActorStartedRound at its original round so the upcoming actor switch won't mark it acted in the new round!
-            if (roundChanged && !actorChanged && !ownDiceAdvanced && hasCurrentActor)
+            int effectiveRound = curRound >= 0 ? curRound : _lastObservedRound;
+            bool actorChanged = curActorId != _activeActorId;
+
+            // Require explicit positive ownership (latestDiceOwnerId == curActorId) to advance an unchanged actor.
+            bool hasNewOwnedDice = hasCurrentActor &&
+                                   latestDiceEpoch != _lastConsumedDiceEpoch &&
+                                   latestDiceOwnerId > 0 &&
+                                   latestDiceOwnerId == curActorId;
+
+            // Coalesce an actor's very first owned dice roll that arrives slightly AFTER actorChanged!
+            if (hasNewOwnedDice && !actorChanged && _actorAwaitingFirstDice && !roundChanged && !_staleActorRoundPending && !_pendingNullRoundReset)
             {
-                _pendingRoundReset = true;
-                return new TurnBoundaryResult(boundaryAdvanced: false, roundChanged: true, shouldResetMovementState: false);
+                _actorAwaitingFirstDice = false;
+                _lastConsumedDiceEpoch = latestDiceEpoch;
+                return new TurnBoundaryResult(boundaryAdvanced: false, roundChanged: false, shouldResetMovementState: false);
             }
 
-            bool boundaryAdvanced = actorChanged || ownDiceAdvanced || (_pendingRoundReset && hasCurrentActor);
+            // Round ticked while GetCurrentPlayer() STILL returns the previous round's actor (with no owned new roll):
+            // keep _staleActorRoundPending latched across repeated reads until actor changes or an owned roll arrives!
+            if ((roundChanged || _staleActorRoundPending) && !actorChanged && !hasNewOwnedDice && hasCurrentActor)
+            {
+                _staleActorRoundPending = true;
+                return new TurnBoundaryResult(boundaryAdvanced: false, roundChanged: roundChanged, shouldResetMovementState: false);
+            }
+
+            bool boundaryAdvanced = actorChanged || hasNewOwnedDice || (_pendingNullRoundReset && hasCurrentActor);
             if (!boundaryAdvanced)
             {
                 return new TurnBoundaryResult(boundaryAdvanced: false, roundChanged: roundChanged, shouldResetMovementState: false);
@@ -133,34 +146,41 @@ namespace MonsterPathPredictor.Core
 
             if (!roundChanged && actorChanged && _activeActorId != 0 && isAliveMonster != null && isAliveMonster(_activeActorId))
             {
-                // Credit completion ONLY if the outgoing monster actually started in the current round.
-                bool startedInCurrentRound = _activeActorStartedRound < 0 || curRound < 0 || _activeActorStartedRound == curRound;
+                // Credit completion ONLY if the outgoing monster actually started in effectiveRound
+                // (never credit a monster whose round ticked ahead of actor switch!).
+                bool startedInCurrentRound = !_staleActorRoundPending &&
+                                             (_activeActorStartedRound < 0 || effectiveRound < 0 || _activeActorStartedRound == effectiveRound);
                 if (startedInCurrentRound)
                 {
                     _actedMonsterIdsThisRound.Add(_activeActorId);
                 }
             }
 
-            // Fallback round clear if Room.Round reflection is unavailable and turn enters Hero phase
-            if (curRound < 0 && _actedMonsterIdsThisRound.Count > 0 && hasCurrentActor && isHeroUnit != null && isHeroUnit(curActorId))
+            // Fallback round clear ONLY while session lacks any reliable Room.Round baseline.
+            if (_lastObservedRound < 0 && _actedMonsterIdsThisRound.Count > 0 && hasCurrentActor && isHeroUnit != null && isHeroUnit(curActorId))
             {
                 _actedMonsterIdsThisRound.Clear();
             }
 
             _turnSequence++;
             _activeActorId = hasCurrentActor ? curActorId : 0;
-            _activeActorStartedRound = hasCurrentActor ? curRound : -1;
-            _pendingRoundReset = false;
+            _activeActorStartedRound = hasCurrentActor ? effectiveRound : -1;
+            _pendingNullRoundReset = false;
+            _staleActorRoundPending = false;
 
-            if (ownDiceAdvanced)
+            if (hasNewOwnedDice)
             {
                 _lastConsumedDiceEpoch = latestDiceEpoch;
-                _lastConsumedDiceActorId = curActorId;
+                _actorAwaitingFirstDice = false;
             }
-            else if (actorChanged && latestDiceOwnerId == curActorId)
+            else if (actorChanged && hasCurrentActor)
             {
-                _lastConsumedDiceEpoch = latestDiceEpoch;
-                _lastConsumedDiceActorId = curActorId;
+                // Actor switched before its first dice notification arrived: coalesce that incoming first roll.
+                _actorAwaitingFirstDice = true;
+            }
+            else
+            {
+                _actorAwaitingFirstDice = false;
             }
 
             if (hasCurrentActor)

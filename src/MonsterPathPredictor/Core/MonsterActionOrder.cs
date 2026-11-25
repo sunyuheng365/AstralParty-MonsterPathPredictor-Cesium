@@ -103,6 +103,7 @@ namespace MonsterPathPredictor.Core
                 set.Add(st.NameOrdinal);
             }
 
+            var usedOrdinalsByName = new Dictionary<string, HashSet<int>>(StringComparer.Ordinal);
             var nextFallback = new Dictionary<string, int>(StringComparer.Ordinal);
             for (int i = 0; i < indexed.Count; i++)
             {
@@ -111,7 +112,12 @@ namespace MonsterPathPredictor.Core
                 bool needsSuffix = nameCounts[n] > 1 || st.NameGroupDisambiguated || st.NameOrdinal > 1;
                 if (needsSuffix)
                 {
-                    if (st.NameOrdinal > 0)
+                    if (!usedOrdinalsByName.TryGetValue(n, out var usedSet))
+                    {
+                        usedSet = new HashSet<int>();
+                        usedOrdinalsByName[n] = usedSet;
+                    }
+                    if (st.NameOrdinal > 0 && usedSet.Add(st.NameOrdinal))
                     {
                         st.DisplayName = n + " " + st.NameOrdinal;
                     }
@@ -123,7 +129,8 @@ namespace MonsterPathPredictor.Core
                         {
                             idx++;
                         }
-                        while (reserved != null && reserved.Contains(idx));
+                        while (usedSet.Contains(idx) || (reserved != null && reserved.Contains(idx)));
+                        usedSet.Add(idx);
                         nextFallback[n] = idx;
                         st.DisplayName = n + " " + idx;
                     }
@@ -144,6 +151,38 @@ namespace MonsterPathPredictor.Core
                 var st = stateSelector(items[i]);
                 if (st != null) st.ActionOrderRank = rank++;
             }
+        }
+
+        /// <summary>
+        /// Orders a batch of newly discovered monsters from a single snapshot into chronological spawn order
+        /// using Astral Party's sequential server MonsterId assignment (handling 100,000 -&gt; 1 wraparound),
+        /// preventing arbitrary dictionary enumeration order from freezing reversed priorities.
+        /// </summary>
+        public static void OrderBatchedNewSpawnIds(List<long> ids)
+        {
+            if (ids == null || ids.Count <= 1) return;
+
+            long minId = long.MaxValue;
+            long maxId = long.MinValue;
+            for (int i = 0; i < ids.Count; i++)
+            {
+                long id = ids[i];
+                if (id < minId) minId = id;
+                if (id > maxId) maxId = id;
+            }
+
+            bool isWraparound = minId >= 1 && minId <= 25000 && maxId >= 75000 && maxId <= 100000;
+            ids.Sort((a, b) =>
+            {
+                if (isWraparound)
+                {
+                    int groupA = a >= 50000 ? 0 : 1;
+                    int groupB = b >= 50000 ? 0 : 1;
+                    int gCmp = groupA.CompareTo(groupB);
+                    if (gCmp != 0) return gCmp;
+                }
+                return a.CompareTo(b);
+            });
         }
     }
 }

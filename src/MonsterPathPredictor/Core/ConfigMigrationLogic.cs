@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace MonsterPathPredictor.Core
 {
@@ -96,6 +97,125 @@ namespace MonsterPathPredictor.Core
             }
 
             return new MigrationPlan(true, setClearFalse, targetPicker, 3);
+        }
+
+        /// <summary>
+        /// Resolves effective ClearHotkey, PickerHotkey, and registered default PickerHotkey cleanly,
+        /// guaranteeing PickerHotkey never collides with ClearHotkey even on sparse v3 configs.
+        /// </summary>
+        public static void ResolveEffectiveHotkeys(
+            string rawClearKey,
+            string rawPickerKey,
+            Func<string, string> normalizeHotkeyOrNull,
+            out string effectiveClear,
+            out string effectivePicker,
+            out string registeredPickerDefault)
+        {
+            string normClear = normalizeHotkeyOrNull != null ? normalizeHotkeyOrNull(rawClearKey) : null;
+            effectiveClear = !string.IsNullOrEmpty(normClear) ? normClear : "Escape";
+            registeredPickerDefault = string.Equals(effectiveClear, "F10", StringComparison.OrdinalIgnoreCase) ? "F8" : "F10";
+
+            string normPicker = normalizeHotkeyOrNull != null ? normalizeHotkeyOrNull(rawPickerKey) : null;
+            effectivePicker = !string.IsNullOrEmpty(normPicker) ? normPicker : registeredPickerDefault;
+            if (string.Equals(effectivePicker, effectiveClear, StringComparison.OrdinalIgnoreCase))
+            {
+                effectivePicker = registeredPickerDefault;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Tracks unsaved per-key in-game style edits so a transient disk write failure followed by an
+    /// external config edit never loses the user's pending edit or overwrites unrelated disk keys.
+    /// </summary>
+    public sealed class StylePendingPatch
+    {
+        private readonly Dictionary<string, object> _values = new Dictionary<string, object>(StringComparer.Ordinal);
+
+        public bool HasPending => _values.Count > 0;
+        public IReadOnlyDictionary<string, object> Entries => _values;
+
+        public void Clear() => _values.Clear();
+
+        public void RecordDiff(PredictorSettings before, PredictorSettings after)
+        {
+            if (after == null) return;
+            after.ClampInPlace();
+            if (before == null)
+            {
+                RecordAllStyleKeys(after);
+                return;
+            }
+
+            if (before.PreviewSteps != after.PreviewSteps) _values["previewSteps"] = after.PreviewSteps;
+            if (Math.Abs(before.DashLength - after.DashLength) >= 0.001f) _values["dashLength"] = after.DashLength;
+            if (Math.Abs(before.GapLength - after.GapLength) >= 0.001f) _values["gapLength"] = after.GapLength;
+            if (Math.Abs(before.DashSpeed - after.DashSpeed) >= 0.001f) _values["dashSpeed"] = after.DashSpeed;
+            if (Math.Abs(before.LineWidth - after.LineWidth) >= 0.001f) _values["lineWidth"] = after.LineWidth;
+            if (Math.Abs(before.HeightOffset - after.HeightOffset) >= 0.001f) _values["heightOffset"] = after.HeightOffset;
+            if (before.FontSize != after.FontSize) _values["fontSize"] = after.FontSize;
+            if (before.ShowReasonTag != after.ShowReasonTag) _values["showReasonTag"] = after.ShowReasonTag;
+            if (before.ShowStepNumbers != after.ShowStepNumbers) _values["showStepNumbers"] = after.ShowStepNumbers;
+            if (before.ShowDeterministicPercent != after.ShowDeterministicPercent) _values["showDeterministicPercent"] = after.ShowDeterministicPercent;
+            if (before.PostCombatMode != after.PostCombatMode) _values["postCombatMode"] = PredictorSettings.FormatPostCombatMode(after.PostCombatMode);
+            if (!string.Equals(before.DeterministicColorHex, after.DeterministicColorHex, StringComparison.Ordinal)) _values["deterministicColor"] = after.DeterministicColorHex;
+            if (!string.Equals(before.MajorBranchColorHex, after.MajorBranchColorHex, StringComparison.Ordinal)) _values["majorBranchColor"] = after.MajorBranchColorHex;
+            if (!string.Equals(before.MinorBranchColorHex, after.MinorBranchColorHex, StringComparison.Ordinal)) _values["minorBranchColor"] = after.MinorBranchColorHex;
+            if (!string.Equals(before.PostCombatColorHex, after.PostCombatColorHex, StringComparison.Ordinal)) _values["postCombatColor"] = after.PostCombatColorHex;
+            if (!string.Equals(before.GuideRedColorHex, after.GuideRedColorHex, StringComparison.Ordinal)) _values["guideRedColor"] = after.GuideRedColorHex;
+            if (!string.Equals(before.GuideBlueColorHex, after.GuideBlueColorHex, StringComparison.Ordinal)) _values["guideBlueColor"] = after.GuideBlueColorHex;
+        }
+
+        public void RecordAllStyleKeys(PredictorSettings settings)
+        {
+            if (settings == null) return;
+            settings.ClampInPlace();
+            _values["previewSteps"] = settings.PreviewSteps;
+            _values["dashLength"] = settings.DashLength;
+            _values["gapLength"] = settings.GapLength;
+            _values["dashSpeed"] = settings.DashSpeed;
+            _values["lineWidth"] = settings.LineWidth;
+            _values["heightOffset"] = settings.HeightOffset;
+            _values["fontSize"] = settings.FontSize;
+            _values["showReasonTag"] = settings.ShowReasonTag;
+            _values["showStepNumbers"] = settings.ShowStepNumbers;
+            _values["showDeterministicPercent"] = settings.ShowDeterministicPercent;
+            _values["postCombatMode"] = PredictorSettings.FormatPostCombatMode(settings.PostCombatMode);
+            _values["deterministicColor"] = settings.DeterministicColorHex;
+            _values["majorBranchColor"] = settings.MajorBranchColorHex;
+            _values["minorBranchColor"] = settings.MinorBranchColorHex;
+            _values["postCombatColor"] = settings.PostCombatColorHex;
+            _values["guideRedColor"] = settings.GuideRedColorHex;
+            _values["guideBlueColor"] = settings.GuideBlueColorHex;
+        }
+
+        public void ApplyTo(PredictorSettings target)
+        {
+            if (target == null || _values.Count == 0) return;
+            foreach (var kv in _values)
+            {
+                switch (kv.Key)
+                {
+                    case "previewSteps": target.PreviewSteps = (int)kv.Value; break;
+                    case "dashLength": target.DashLength = (float)kv.Value; break;
+                    case "gapLength": target.GapLength = (float)kv.Value; break;
+                    case "dashSpeed": target.DashSpeed = (float)kv.Value; break;
+                    case "lineWidth": target.LineWidth = (float)kv.Value; break;
+                    case "heightOffset": target.HeightOffset = (float)kv.Value; break;
+                    case "fontSize": target.FontSize = (int)kv.Value; break;
+                    case "showReasonTag": target.ShowReasonTag = (bool)kv.Value; break;
+                    case "showStepNumbers": target.ShowStepNumbers = (bool)kv.Value; break;
+                    case "showDeterministicPercent": target.ShowDeterministicPercent = (bool)kv.Value; break;
+                    case "postCombatMode": target.PostCombatMode = PredictorSettings.ParsePostCombatMode((string)kv.Value); break;
+                    case "deterministicColor": target.DeterministicColorHex = (string)kv.Value; break;
+                    case "majorBranchColor": target.MajorBranchColorHex = (string)kv.Value; break;
+                    case "minorBranchColor": target.MinorBranchColorHex = (string)kv.Value; break;
+                    case "postCombatColor": target.PostCombatColorHex = (string)kv.Value; break;
+                    case "guideRedColor": target.GuideRedColorHex = (string)kv.Value; break;
+                    case "guideBlueColor": target.GuideBlueColorHex = (string)kv.Value; break;
+                }
+            }
+            target.ClampInPlace();
         }
     }
 }

@@ -89,6 +89,28 @@ namespace MonsterPathPredictor.Tests
             var mixed = new List<MonsterState> { unset, explicit1 };
             MonsterActionOrder.SortAndAssign(mixed, m => m);
             Assert.Equal(new[] { "史莱姆 1", "史莱姆 2" }, mixed.ConvertAll(m => m.DisplayName));
+
+            // Duplicate explicit ordinals (e.g. provisional nickname resolved into bucket already owning ordinal 1)
+            // must be deduplicated cleanly so no two monsters ever display the same suffix!
+            var dupA = new MonsterState { MonsterId = 10, Name = "史莱姆", ActionWeight = 20, SpawnSequence = 1, NameOrdinal = 1 };
+            var dupB = new MonsterState { MonsterId = 11, Name = "史莱姆", ActionWeight = 20, SpawnSequence = 2, NameOrdinal = 1 };
+            var dupList = new List<MonsterState> { dupB, dupA };
+            MonsterActionOrder.SortAndAssign(dupList, m => m);
+            Assert.Equal(new[] { "史莱姆 1", "史莱姆 2" }, dupList.ConvertAll(m => m.DisplayName));
+        }
+
+        [Fact]
+        public void OrderBatchedNewSpawnIdsHandlesReversedEnumerationAnd100kWraparound()
+        {
+            // Normal reversed enumeration batch
+            var normal = new List<long> { 105, 102, 104 };
+            MonsterActionOrder.OrderBatchedNewSpawnIds(normal);
+            Assert.Equal(new long[] { 102, 104, 105 }, normal);
+
+            // Batched first observation across 100,000 -> 1 wraparound
+            var wrapped = new List<long> { 3996, 94126, 3995, 94124 };
+            MonsterActionOrder.OrderBatchedNewSpawnIds(wrapped);
+            Assert.Equal(new long[] { 94124, 94126, 3995, 3996 }, wrapped);
         }
     }
 }

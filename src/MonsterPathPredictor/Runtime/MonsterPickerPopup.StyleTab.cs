@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using FairyGUI;
 using UnityEngine;
@@ -8,182 +9,66 @@ namespace MonsterPathPredictor.Runtime
 {
     internal sealed partial class MonsterPickerPopup
     {
-        private static int ComputeStyleTabPageCount(float stageHeight, float contentW, bool hasSaveWarn)
+        private static void ComputeStyleTabLayout(
+            float stageHeight,
+            float contentW,
+            bool hasSaveWarn,
+            out CompactLayout layout,
+            out List<PopupPagination.StyleRowItem> rows,
+            out List<PageSlice> pages,
+            out float rowGap)
         {
-            float warnExtra = hasSaveWarn ? 20f : 0f;
-            // Spacious single page (all 6 steppers + toggles + color roles + presets + RGBA + reset)
-            float singleMin = (contentW < 210f ? 620f : 560f) + warnExtra;
-            if (stageHeight >= singleMin) return 1;
-            // Two pages (Page 0: 6 steppers + toggles ~200px; Page 1: roles + presets + RGBA + reset ~210px)
-            float twoMin = (contentW < 210f ? 420f : 365f) + warnExtra;
-            if (stageHeight >= twoMin) return 2;
-            // Compact 4 pages (guarantees every single control is reachable even at 220-300px height with save warning!)
-            return 4;
+            var singleLayout = ComputeCompactLayout(stageHeight, showPager: false);
+            var singleRows = PopupPagination.BuildStyleRows(singleLayout.MaxContentHeight, contentW, hasSaveWarn, out float singleGap);
+            var singlePages = PopupPagination.PaginateStyleRows(singleRows, singleGap, singleLayout.MaxContentHeight);
+            if (singlePages.Count <= 1)
+            {
+                layout = singleLayout;
+                rows = singleRows;
+                pages = singlePages;
+                rowGap = singleGap;
+                return;
+            }
+
+            layout = ComputeCompactLayout(stageHeight, showPager: true);
+            rows = PopupPagination.BuildStyleRows(layout.MaxContentHeight, contentW, hasSaveWarn, out rowGap);
+            pages = PopupPagination.PaginateStyleRows(rows, rowGap, layout.MaxContentHeight);
         }
 
-        private float BuildStyleTab(PredictorSettings settings, CompactLayout layout, float contentW, int pageIndex, int totalPages)
+        private float BuildStyleTab(
+            PredictorSettings settings,
+            CompactLayout layout,
+            float contentW,
+            IReadOnlyList<PopupPagination.StyleRowItem> rows,
+            PageSlice slice,
+            float rowGap)
         {
             float y = 0f;
             float maxH = layout.MaxContentHeight;
-            float rowH = maxH < 220f ? 21f : (maxH < 360f ? 23f : 25f);
-            float gap = 3f;
+            if (rows == null || slice.Count == 0) return Math.Min(maxH, 32f);
 
-            bool showMetricsA = totalPages == 1 || (totalPages == 2 && pageIndex == 0) || (totalPages == 4 && pageIndex == 0);
-            bool showMetricsB = totalPages == 1 || (totalPages == 2 && pageIndex == 0) || (totalPages == 4 && pageIndex == 1);
-            bool showColorRolesAndPresets = totalPages == 1 || (totalPages == 2 && pageIndex == 1) || (totalPages == 4 && pageIndex == 2);
-            bool showRgbaAndReset = totalPages == 1 || (totalPages == 2 && pageIndex == 1) || (totalPages == 4 && pageIndex == 3);
-
-            if (_styleSaveFailed && y + 18f <= maxH)
-            {
-                var warn = new GTextField
-                {
-                    touchable = false,
-                    autoSize = AutoSizeType.None,
-                    singleLine = true,
-                    textFormat = new TextFormat { size = 11, bold = true, color = new Color(1f, 0.42f, 0.36f, 1f) },
-                    text = "⚠ 样式写入 config.json 失败（仅本局临时生效）"
-                };
-                warn.SetXY(2f, y);
-                warn.SetSize(contentW - 4f, 18f);
-                _contentHost.AddChild(warn);
-                y += 19f;
-            }
-
-            void AddStepper(string label, string valueText, Action onMinus, Action onPlus)
-            {
-                if (y + rowH > maxH) return;
-                var row = BuildStyleStepperRow(label, valueText, contentW, rowH, onMinus, onPlus);
-                row.SetXY(0f, y);
-                _contentHost.AddChild(row);
-                y += rowH + gap;
-            }
-
-            if (showMetricsA)
-            {
-                AddStepper(
-                    "线条宽度",
-                    settings.LineWidth.ToString("0.0", CultureInfo.InvariantCulture) + " px",
-                    () => StyleMutationRequested?.Invoke(s => s.LineWidth = (float)Math.Round(s.LineWidth - 0.5f, 1)),
-                    () => StyleMutationRequested?.Invoke(s => s.LineWidth = (float)Math.Round(s.LineWidth + 0.5f, 1)));
-
-                AddStepper(
-                    "行进速度",
-                    settings.DashSpeed <= 0.01f ? "静态 (0)" : ((int)Math.Round(settings.DashSpeed) + " px/s"),
-                    () => StyleMutationRequested?.Invoke(s => s.DashSpeed = Math.Max(0f, (float)Math.Round(s.DashSpeed - 6f))),
-                    () => StyleMutationRequested?.Invoke(s => s.DashSpeed = Math.Min(150f, (float)Math.Round(s.DashSpeed + 6f))));
-
-                AddStepper(
-                    "虚线长度",
-                    ((int)Math.Round(settings.DashLength)) + " px",
-                    () => StyleMutationRequested?.Invoke(s => s.DashLength = (float)Math.Round(s.DashLength - 2f)),
-                    () => StyleMutationRequested?.Invoke(s => s.DashLength = (float)Math.Round(s.DashLength + 2f)));
-            }
-
-            if (showMetricsB)
-            {
-                AddStepper(
-                    "虚线间距",
-                    ((int)Math.Round(settings.GapLength)) + " px",
-                    () => StyleMutationRequested?.Invoke(s => s.GapLength = (float)Math.Round(s.GapLength - 2f)),
-                    () => StyleMutationRequested?.Invoke(s => s.GapLength = (float)Math.Round(s.GapLength + 2f)));
-
-                AddStepper(
-                    "标签字号",
-                    settings.FontSize + " pt",
-                    () => StyleMutationRequested?.Invoke(s => s.FontSize -= 2),
-                    () => StyleMutationRequested?.Invoke(s => s.FontSize += 2));
-
-                AddStepper(
-                    "悬浮高度",
-                    settings.HeightOffset.ToString("0.00", CultureInfo.InvariantCulture),
-                    () => StyleMutationRequested?.Invoke(s => s.HeightOffset = (float)Math.Round(s.HeightOffset - 0.1f, 2)),
-                    () => StyleMutationRequested?.Invoke(s => s.HeightOffset = (float)Math.Round(s.HeightOffset + 0.1f, 2)));
-
-                // Toggles + PostCombatMode row
-                if (y + rowH <= maxH)
-                {
-                    float tGap = 3f;
-                    float tW = (contentW - tGap * 3f) / 4f;
-                    string pcLabel = settings.PostCombatMode == PostCombatMode.StopAtFirstCombat
-                        ? "战后:截断"
-                        : (settings.PostCombatMode == PostCombatMode.RedBlueAfterCombat ? "战后:红蓝" : "战后:续行");
-
-                    var pcBtn = CreateStyledButton(pcLabel, tW, rowH, BtnBg, AccentCyan, AccentCyan, () =>
-                    {
-                        StyleMutationRequested?.Invoke(s =>
-                        {
-                            s.PostCombatMode = (PostCombatMode)(((int)s.PostCombatMode + 1) % 3);
-                        });
-                    }, fontSize: 11);
-                    pcBtn.SetXY(0f, y);
-                    _contentHost.AddChild(pcBtn);
-
-                    AddToggleChip("步数", settings.ShowStepNumbers, tW + tGap, y, tW, rowH, () => StyleMutationRequested?.Invoke(s => s.ShowStepNumbers = !s.ShowStepNumbers));
-                    AddToggleChip("依据", settings.ShowReasonTag, (tW + tGap) * 2f, y, tW, rowH, () => StyleMutationRequested?.Invoke(s => s.ShowReasonTag = !s.ShowReasonTag));
-                    AddToggleChip("100%", settings.ShowDeterministicPercent, (tW + tGap) * 3f, y, tW, rowH, () => StyleMutationRequested?.Invoke(s => s.ShowDeterministicPercent = !s.ShowDeterministicPercent));
-
-                    y += rowH + gap + 3f;
-                }
-            }
-
-            if (!showColorRolesAndPresets && !showRgbaAndReset)
-            {
-                return Math.Min(maxH, Math.Max(32f, y));
-            }
-
-            // Color customization header + true-alpha live preview swatch over contrasting dark/light backing
             var activeRole = _selectedColorRole;
             var activeRgba = StyleColor.GetRoleColor(settings, activeRole);
             var activeUnityCol = new Color(activeRgba.Rf, activeRgba.Gf, activeRgba.Bf, 1f);
+            int alphaPct = (int)Math.Round(activeRgba.A * 100.0 / 255.0);
 
-            if (y + 20f <= maxH)
+            void AddStepper(string label, string valueText, float h, Action onMinus, Action onPlus)
             {
-                var colTitle = new GTextField
-                {
-                    touchable = false,
-                    autoSize = AutoSizeType.None,
-                    singleLine = true,
-                    verticalAlign = VertAlignType.Middle,
-                    textFormat = new TextFormat { size = 12, bold = true, color = AccentCyan },
-                    text = "配色：" + StyleColor.GetRoleLabel(activeRole) + " " + activeRgba.ToHex()
-                };
-                colTitle.SetXY(2f, y);
-                colTitle.SetSize(Math.Max(60f, contentW - 44f), 20f);
-                _contentHost.AddChild(colTitle);
-
-                // Contrasting half-dark/half-light backing so true low alpha is accurately visible
-                var swBackDark = new GGraph { touchable = false };
-                swBackDark.SetXY(contentW - 38f, y + 2f);
-                swBackDark.SetSize(18f, 16f);
-                swBackDark.DrawRect(18f, 16f, 0, Color.clear, new Color(0.10f, 0.12f, 0.16f, 1f));
-                _contentHost.AddChild(swBackDark);
-
-                var swBackLight = new GGraph { touchable = false };
-                swBackLight.SetXY(contentW - 20f, y + 2f);
-                swBackLight.SetSize(18f, 16f);
-                swBackLight.DrawRect(18f, 16f, 0, Color.clear, new Color(0.75f, 0.78f, 0.84f, 1f));
-                _contentHost.AddChild(swBackLight);
-
-                var previewSwatch = new GGraph { touchable = false };
-                previewSwatch.SetXY(contentW - 38f, y + 2f);
-                previewSwatch.SetSize(36f, 16f);
-                previewSwatch.DrawRect(36f, 16f, 1, TextPrimary, new Color(activeRgba.Rf, activeRgba.Gf, activeRgba.Bf, activeRgba.Af));
-                _contentHost.AddChild(previewSwatch);
-                y += 22f;
+                var row = BuildStyleStepperRow(label, valueText, contentW, h, onMinus, onPlus);
+                row.SetXY(0f, y);
+                _contentHost.AddChild(row);
             }
 
-            // 6 color role selector chips (2 rows x 3 cols)
-            float chipH = Math.Min(rowH, 23f);
-            if (showColorRolesAndPresets && y + chipH * 2f + gap <= maxH)
+            void AddColorRoleRow(int startRoleIndex, float chipH)
             {
                 float cGap = 3f;
                 float cW = (contentW - cGap * 2f) / 3f;
-                for (int i = 0; i < 6; i++)
+                for (int c = 0; c < 3; c++)
                 {
-                    var role = (RouteColorRole)i;
+                    int roleIdx = startRoleIndex + c;
+                    if (roleIdx >= 6) break;
+                    var role = (RouteColorRole)roleIdx;
                     bool sel = role == activeRole;
-                    int colIdx = i % 3;
-                    int rowIdx = i / 3;
                     var roleCol = StyleColor.GetRoleColor(settings, role);
 
                     var chip = CreateStyledButton(
@@ -202,90 +87,223 @@ namespace MonsterPathPredictor.Runtime
                     dot.DrawRect(10f, 10f, 1, Color.black, new Color(roleCol.Rf, roleCol.Gf, roleCol.Bf, 1f));
                     chip.AddChild(dot);
 
-                    chip.SetXY(colIdx * (cW + cGap), y + rowIdx * (chipH + gap));
+                    chip.SetXY(c * (cW + cGap), y);
                     _contentHost.AddChild(chip);
                 }
-                y += (chipH + gap) * 2f + 2f;
             }
 
-            // 8 vivid 1-click preset swatches
-            float swatchH = Math.Min(rowH, 22f);
-            if (showColorRolesAndPresets && y + swatchH <= maxH)
+            int end = Math.Min(rows.Count, slice.StartIndex + slice.Count);
+            for (int idx = slice.StartIndex; idx < end; idx++)
             {
-                int count = StyleColor.Presets.Length;
-                float sGap = 3f;
-                float sW = (contentW - sGap * (count - 1)) / count;
-                for (int i = 0; i < count; i++)
+                var item = rows[idx];
+                if (idx > slice.StartIndex) y += rowGap;
+
+                switch (item.Kind)
                 {
-                    var preset = StyleColor.Presets[i];
-                    var pc = preset.Color;
-                    bool matches = pc == activeRgba;
-                    var sw = CreateStyledButton(
-                        preset.Name,
-                        sW,
-                        swatchH,
-                        new Color(pc.Rf * 0.72f, pc.Gf * 0.72f, pc.Bf * 0.72f, 0.95f),
-                        matches ? Color.white : new Color(pc.Rf, pc.Gf, pc.Bf, 0.95f),
-                        (pc.R + pc.G + pc.B > 500) ? Color.black : Color.white,
-                        () =>
+                    case PopupPagination.StyleRowKind.SaveWarning:
+                    {
+                        var warn = new GTextField
                         {
-                            var capturedHex = preset.Hex;
-                            var capturedRole = activeRole;
-                            StyleMutationRequested?.Invoke(s => StyleColor.SetRoleHex(s, capturedRole, capturedHex));
-                        },
-                        fontSize: 11);
-                    sw.SetXY(i * (sW + sGap), y);
-                    _contentHost.AddChild(sw);
-                }
-                y += swatchH + gap + 2f;
-            }
+                            touchable = false,
+                            autoSize = AutoSizeType.None,
+                            singleLine = true,
+                            textFormat = new TextFormat { size = 11, bold = true, color = new Color(1f, 0.42f, 0.36f, 1f) },
+                            text = "⚠ 样式写入 config.json 失败（仅本局临时生效）"
+                        };
+                        warn.SetXY(2f, y);
+                        warn.SetSize(contentW - 4f, item.Height);
+                        _contentHost.AddChild(warn);
+                        break;
+                    }
+                    case PopupPagination.StyleRowKind.LineWidth:
+                        AddStepper(
+                            "线条宽度",
+                            settings.LineWidth.ToString("0.0", CultureInfo.InvariantCulture) + " px",
+                            item.Height,
+                            () => StyleMutationRequested?.Invoke(s => s.LineWidth = (float)Math.Round(s.LineWidth - 0.5f, 1)),
+                            () => StyleMutationRequested?.Invoke(s => s.LineWidth = (float)Math.Round(s.LineWidth + 0.5f, 1)));
+                        break;
+                    case PopupPagination.StyleRowKind.DashSpeed:
+                        AddStepper(
+                            "行进速度",
+                            settings.DashSpeed <= 0.01f ? "静态 (0)" : ((int)Math.Round(settings.DashSpeed) + " px/s"),
+                            item.Height,
+                            () => StyleMutationRequested?.Invoke(s => s.DashSpeed = Math.Max(0f, (float)Math.Round(s.DashSpeed - 6f))),
+                            () => StyleMutationRequested?.Invoke(s => s.DashSpeed = Math.Min(150f, (float)Math.Round(s.DashSpeed + 6f))));
+                        break;
+                    case PopupPagination.StyleRowKind.DashLength:
+                        AddStepper(
+                            "虚线长度",
+                            ((int)Math.Round(settings.DashLength)) + " px",
+                            item.Height,
+                            () => StyleMutationRequested?.Invoke(s => s.DashLength = (float)Math.Round(s.DashLength - 2f)),
+                            () => StyleMutationRequested?.Invoke(s => s.DashLength = (float)Math.Round(s.DashLength + 2f)));
+                        break;
+                    case PopupPagination.StyleRowKind.GapLength:
+                        AddStepper(
+                            "虚线间距",
+                            ((int)Math.Round(settings.GapLength)) + " px",
+                            item.Height,
+                            () => StyleMutationRequested?.Invoke(s => s.GapLength = (float)Math.Round(s.GapLength - 2f)),
+                            () => StyleMutationRequested?.Invoke(s => s.GapLength = (float)Math.Round(s.GapLength + 2f)));
+                        break;
+                    case PopupPagination.StyleRowKind.FontSize:
+                        AddStepper(
+                            "标签字号",
+                            settings.FontSize + " pt",
+                            item.Height,
+                            () => StyleMutationRequested?.Invoke(s => s.FontSize -= 2),
+                            () => StyleMutationRequested?.Invoke(s => s.FontSize += 2));
+                        break;
+                    case PopupPagination.StyleRowKind.HeightOffset:
+                        AddStepper(
+                            "悬浮高度",
+                            settings.HeightOffset.ToString("0.00", CultureInfo.InvariantCulture),
+                            item.Height,
+                            () => StyleMutationRequested?.Invoke(s => s.HeightOffset = (float)Math.Round(s.HeightOffset - 0.1f, 2)),
+                            () => StyleMutationRequested?.Invoke(s => s.HeightOffset = (float)Math.Round(s.HeightOffset + 0.1f, 2)));
+                        break;
+                    case PopupPagination.StyleRowKind.Toggles:
+                    {
+                        float tGap = 3f;
+                        float tW = (contentW - tGap * 3f) / 4f;
+                        string pcLabel = settings.PostCombatMode == PostCombatMode.StopAtFirstCombat
+                            ? "战后:截断"
+                            : (settings.PostCombatMode == PostCombatMode.RedBlueAfterCombat ? "战后:红蓝" : "战后:续行");
 
-            if (showRgbaAndReset)
-            {
-                // R/G/B/A fine-tune steppers (2x2 on normal widths, 1 per row on narrow viewports so value never overlaps '+')
-                int alphaPct = (int)Math.Round(activeRgba.A * 100.0 / 255.0);
-                if (contentW >= 210f)
-                {
-                    if (y + chipH * 2f + gap <= maxH)
+                        var pcBtn = CreateStyledButton(pcLabel, tW, item.Height, BtnBg, AccentCyan, AccentCyan, () =>
+                        {
+                            StyleMutationRequested?.Invoke(s =>
+                            {
+                                s.PostCombatMode = (PostCombatMode)(((int)s.PostCombatMode + 1) % 3);
+                            });
+                        }, fontSize: 11);
+                        pcBtn.SetXY(0f, y);
+                        _contentHost.AddChild(pcBtn);
+
+                        AddToggleChip("步数", settings.ShowStepNumbers, tW + tGap, y, tW, item.Height, () => StyleMutationRequested?.Invoke(s => s.ShowStepNumbers = !s.ShowStepNumbers));
+                        AddToggleChip("依据", settings.ShowReasonTag, (tW + tGap) * 2f, y, tW, item.Height, () => StyleMutationRequested?.Invoke(s => s.ShowReasonTag = !s.ShowReasonTag));
+                        AddToggleChip("100%", settings.ShowDeterministicPercent, (tW + tGap) * 3f, y, tW, item.Height, () => StyleMutationRequested?.Invoke(s => s.ShowDeterministicPercent = !s.ShowDeterministicPercent));
+                        break;
+                    }
+                    case PopupPagination.StyleRowKind.ColorHeader:
+                    {
+                        var colTitle = new GTextField
+                        {
+                            touchable = false,
+                            autoSize = AutoSizeType.None,
+                            singleLine = true,
+                            verticalAlign = VertAlignType.Middle,
+                            textFormat = new TextFormat { size = 12, bold = true, color = AccentCyan },
+                            text = "配色：" + StyleColor.GetRoleLabel(activeRole) + " " + activeRgba.ToHex()
+                        };
+                        colTitle.SetXY(2f, y);
+                        colTitle.SetSize(Math.Max(40f, contentW - 44f), item.Height);
+                        _contentHost.AddChild(colTitle);
+
+                        var swBackDark = new GGraph { touchable = false };
+                        swBackDark.SetXY(contentW - 38f, y + 2f);
+                        swBackDark.SetSize(18f, 16f);
+                        swBackDark.DrawRect(18f, 16f, 0, Color.clear, new Color(0.10f, 0.12f, 0.16f, 1f));
+                        _contentHost.AddChild(swBackDark);
+
+                        var swBackLight = new GGraph { touchable = false };
+                        swBackLight.SetXY(contentW - 20f, y + 2f);
+                        swBackLight.SetSize(18f, 16f);
+                        swBackLight.DrawRect(18f, 16f, 0, Color.clear, new Color(0.75f, 0.78f, 0.84f, 1f));
+                        _contentHost.AddChild(swBackLight);
+
+                        var previewSwatch = new GGraph { touchable = false };
+                        previewSwatch.SetXY(contentW - 38f, y + 2f);
+                        previewSwatch.SetSize(36f, 16f);
+                        previewSwatch.DrawRect(36f, 16f, 1, TextPrimary, new Color(activeRgba.Rf, activeRgba.Gf, activeRgba.Bf, activeRgba.Af));
+                        _contentHost.AddChild(previewSwatch);
+                        break;
+                    }
+                    case PopupPagination.StyleRowKind.ColorRolesRow1:
+                        AddColorRoleRow(0, item.Height);
+                        break;
+                    case PopupPagination.StyleRowKind.ColorRolesRow2:
+                        AddColorRoleRow(3, item.Height);
+                        break;
+                    case PopupPagination.StyleRowKind.Presets:
+                    {
+                        int count = StyleColor.Presets.Length;
+                        float sGap = 3f;
+                        float sW = (contentW - sGap * (count - 1)) / count;
+                        for (int i = 0; i < count; i++)
+                        {
+                            var preset = StyleColor.Presets[i];
+                            var pc = preset.Color;
+                            bool matches = pc == activeRgba;
+                            var sw = CreateStyledButton(
+                                preset.Name,
+                                sW,
+                                item.Height,
+                                new Color(pc.Rf * 0.72f, pc.Gf * 0.72f, pc.Bf * 0.72f, 0.95f),
+                                matches ? Color.white : new Color(pc.Rf, pc.Gf, pc.Bf, 0.95f),
+                                (pc.R + pc.G + pc.B > 500) ? Color.black : Color.white,
+                                () =>
+                                {
+                                    var capturedHex = preset.Hex;
+                                    var capturedRole = activeRole;
+                                    StyleMutationRequested?.Invoke(s => StyleColor.SetRoleHex(s, capturedRole, capturedHex));
+                                },
+                                fontSize: 11);
+                            sw.SetXY(i * (sW + sGap), y);
+                            _contentHost.AddChild(sw);
+                        }
+                        break;
+                    }
+                    case PopupPagination.StyleRowKind.RgbaPairRG:
                     {
                         float halfGap = 4f;
                         float halfW = (contentW - halfGap) * 0.5f;
-                        AddChannelControl("R", activeRgba.R.ToString(CultureInfo.InvariantCulture), 0, 16, 0, 0f, y, halfW, chipH, activeRole, new Color(1f, 0.48f, 0.48f, 1f));
-                        AddChannelControl("G", activeRgba.G.ToString(CultureInfo.InvariantCulture), 1, 16, 0, halfW + halfGap, y, halfW, chipH, activeRole, new Color(0.48f, 1f, 0.62f, 1f));
-                        y += chipH + gap;
-
-                        AddChannelControl("B", activeRgba.B.ToString(CultureInfo.InvariantCulture), 2, 16, 0, 0f, y, halfW, chipH, activeRole, new Color(0.48f, 0.78f, 1f, 1f));
-                        AddChannelControl("透", alphaPct + "%", 3, 15, 0, halfW + halfGap, y, halfW, chipH, activeRole, activeUnityCol);
-                        y += chipH + gap + 3f;
+                        AddChannelControl("R", activeRgba.R.ToString(CultureInfo.InvariantCulture), 0, 16, 0, 0f, y, halfW, item.Height, activeRole, new Color(1f, 0.48f, 0.48f, 1f));
+                        AddChannelControl("G", activeRgba.G.ToString(CultureInfo.InvariantCulture), 1, 16, 0, halfW + halfGap, y, halfW, item.Height, activeRole, new Color(0.48f, 1f, 0.62f, 1f));
+                        break;
+                    }
+                    case PopupPagination.StyleRowKind.RgbaPairBA:
+                    {
+                        float halfGap = 4f;
+                        float halfW = (contentW - halfGap) * 0.5f;
+                        AddChannelControl("B", activeRgba.B.ToString(CultureInfo.InvariantCulture), 2, 16, 0, 0f, y, halfW, item.Height, activeRole, new Color(0.48f, 0.78f, 1f, 1f));
+                        AddChannelControl("透", alphaPct + "%", 3, 15, 0, halfW + halfGap, y, halfW, item.Height, activeRole, activeUnityCol);
+                        break;
+                    }
+                    case PopupPagination.StyleRowKind.RgbaSingleR:
+                        AddChannelControl("R", activeRgba.R.ToString(CultureInfo.InvariantCulture), 0, 16, 0, 0f, y, contentW, item.Height, activeRole, new Color(1f, 0.48f, 0.48f, 1f));
+                        break;
+                    case PopupPagination.StyleRowKind.RgbaSingleG:
+                        AddChannelControl("G", activeRgba.G.ToString(CultureInfo.InvariantCulture), 1, 16, 0, 0f, y, contentW, item.Height, activeRole, new Color(0.48f, 1f, 0.62f, 1f));
+                        break;
+                    case PopupPagination.StyleRowKind.RgbaSingleB:
+                        AddChannelControl("B", activeRgba.B.ToString(CultureInfo.InvariantCulture), 2, 16, 0, 0f, y, contentW, item.Height, activeRole, new Color(0.48f, 0.78f, 1f, 1f));
+                        break;
+                    case PopupPagination.StyleRowKind.RgbaSingleA:
+                        AddChannelControl("透", alphaPct + "%", 3, 15, 0, 0f, y, contentW, item.Height, activeRole, activeUnityCol);
+                        break;
+                    case PopupPagination.StyleRowKind.ResetDefaults:
+                    {
+                        var resetBtn = CreateStyledButton(
+                            "恢复默认路线样式",
+                            contentW,
+                            item.Height,
+                            BtnBg,
+                            new Color(0.55f, 0.42f, 0.30f, 0.9f),
+                            AccentGold,
+                            () => StyleResetRequested?.Invoke(),
+                            fontSize: 12);
+                        resetBtn.SetXY(0f, y);
+                        _contentHost.AddChild(resetBtn);
+                        break;
                     }
                 }
-                else
-                {
-                    if (y + chipH <= maxH) { AddChannelControl("R", activeRgba.R.ToString(CultureInfo.InvariantCulture), 0, 16, 0, 0f, y, contentW, chipH, activeRole, new Color(1f, 0.48f, 0.48f, 1f)); y += chipH + gap; }
-                    if (y + chipH <= maxH) { AddChannelControl("G", activeRgba.G.ToString(CultureInfo.InvariantCulture), 1, 16, 0, 0f, y, contentW, chipH, activeRole, new Color(0.48f, 1f, 0.62f, 1f)); y += chipH + gap; }
-                    if (y + chipH <= maxH) { AddChannelControl("B", activeRgba.B.ToString(CultureInfo.InvariantCulture), 2, 16, 0, 0f, y, contentW, chipH, activeRole, new Color(0.48f, 0.78f, 1f, 1f)); y += chipH + gap; }
-                    if (y + chipH <= maxH) { AddChannelControl("透", alphaPct + "%", 3, 15, 0, 0f, y, contentW, chipH, activeRole, activeUnityCol); y += chipH + gap + 3f; }
-                }
 
-                // Reset to default style button
-                if (y + rowH <= maxH)
-                {
-                    var resetBtn = CreateStyledButton(
-                        "恢复默认路线样式",
-                        contentW,
-                        rowH,
-                        BtnBg,
-                        new Color(0.55f, 0.42f, 0.30f, 0.9f),
-                        AccentGold,
-                        () => StyleResetRequested?.Invoke(),
-                        fontSize: 12);
-                    resetBtn.SetXY(0f, y);
-                    _contentHost.AddChild(resetBtn);
-                    y += rowH + 2f;
-                }
+                y += item.Height;
             }
 
-            return Math.Min(maxH, Math.Max(32f, y));
+            return Math.Min(maxH, Math.Max(24f, y + 2f));
         }
 
         private void AddToggleChip(string label, bool isOn, float x, float y, float w, float h, Action onClick)

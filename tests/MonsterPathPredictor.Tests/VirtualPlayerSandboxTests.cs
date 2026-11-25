@@ -165,14 +165,23 @@ namespace MonsterPathPredictor.Tests
             Assert.True(sandbox.TryGetVirtualLand(1001, out int afterSecond));
             Assert.Equal(2, afterSecond);
 
-            // Board-pick arming must fail when no living selected player exists
+            // Board-pick arming must reject an explicitly selected nonzero DEAD owner (not merely SelectedPlayerId == 0!)
             var deadPlayers = new List<TrackedPlayer>
             {
                 new TrackedPlayer { PlayerId = 1001, Slot = 0, Name = "Dead", LandId = 5, IsAlive = false }
             };
-            sandbox.Reconcile(deadPlayers, board, localPlayerId: 1001);
+            sandbox.SelectPlayer(1001);
+            Assert.Equal(1001, sandbox.SelectedPlayerId);
             Assert.False(sandbox.SetBoardPickArmed(true, deadPlayers));
             Assert.False(sandbox.BoardPickArmed);
+
+            // Board-pick arming succeeds for a living selected owner
+            var alivePlayers = new List<TrackedPlayer>
+            {
+                new TrackedPlayer { PlayerId = 1001, Slot = 0, Name = "Alive", LandId = 5, IsAlive = true }
+            };
+            Assert.True(sandbox.SetBoardPickArmed(true, alivePlayers));
+            Assert.True(sandbox.BoardPickArmed);
         }
 
         [Fact]

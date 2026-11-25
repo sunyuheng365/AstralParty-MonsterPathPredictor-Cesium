@@ -74,5 +74,69 @@ namespace MonsterPathPredictor.Tests
             var v3 = ConfigMigrationLogic.PlanMigration(true, 3, true, "F8", "Escape", FakeNormalizeKey);
             Assert.False(v3.NeedsMigration);
         }
+
+        [Fact]
+        public void SparseV3WithClearHotkeyF10NeverCollidesPickerHotkey()
+        {
+            ConfigMigrationLogic.ResolveEffectiveHotkeys(
+                rawClearKey: "F10",
+                rawPickerKey: null,
+                FakeNormalizeKey,
+                out string effectiveClear,
+                out string effectivePicker,
+                out string registeredDefault);
+
+            Assert.Equal("F10", effectiveClear);
+            Assert.Equal("F8", registeredDefault);
+            Assert.Equal("F8", effectivePicker);
+
+            // Explicit same-key collision F10/F10 also resolves cleanly
+            ConfigMigrationLogic.ResolveEffectiveHotkeys(
+                rawClearKey: "F10",
+                rawPickerKey: "F10",
+                FakeNormalizeKey,
+                out effectiveClear,
+                out effectivePicker,
+                out registeredDefault);
+            Assert.Equal("F10", effectiveClear);
+            Assert.Equal("F8", effectivePicker);
+        }
+
+        [Fact]
+        public void StylePendingPatchPreservesUnsavedLocalEditsAcrossExternalReloadAndFullReset()
+        {
+            var patch = new StylePendingPatch();
+            var initial = new PredictorSettings();
+            var afterLocalWidthEdit = initial.Clone();
+            afterLocalWidthEdit.LineWidth = 6.5f;
+
+            // Local LineWidth edit fails to save -> recorded in patch
+            patch.RecordDiff(initial, afterLocalWidthEdit);
+            Assert.True(patch.HasPending);
+            Assert.Single(patch.Entries);
+            Assert.Equal(6.5f, patch.Entries["lineWidth"]);
+
+            // External disk edit changes FontSize=24 while disk still has LineWidth=4.5
+            var reloadedFromDisk = new PredictorSettings { FontSize = 24, LineWidth = 4.5f };
+            patch.ApplyTo(reloadedFromDisk);
+            Assert.Equal(24, reloadedFromDisk.FontSize);
+            Assert.Equal(6.5f, reloadedFromDisk.LineWidth);
+
+            // Second local edit changes DashSpeed=40 before retry
+            var beforeSecond = reloadedFromDisk.Clone();
+            reloadedFromDisk.DashSpeed = 40f;
+            patch.RecordDiff(beforeSecond, reloadedFromDisk);
+            Assert.Equal(2, patch.Entries.Count);
+            Assert.Equal(6.5f, patch.Entries["lineWidth"]);
+            Assert.Equal(40f, patch.Entries["dashSpeed"]);
+            Assert.False(patch.Entries.ContainsKey("fontSize")); // External edit NOT overwritten!
+
+            // Explicit full reset queues all style keys even if memory already matches defaults
+            patch.Clear();
+            Assert.False(patch.HasPending);
+            patch.RecordAllStyleKeys(new PredictorSettings());
+            Assert.True(patch.HasPending);
+            Assert.Equal(17, patch.Entries.Count);
+        }
     }
 }

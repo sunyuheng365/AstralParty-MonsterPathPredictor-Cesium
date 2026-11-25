@@ -56,9 +56,19 @@ namespace MonsterPathPredictor.Config
             bool migrated = ApplyMigrationsIfNeeded(config);
             if (migrated) _pendingMigrationSave = true;
 
+            string rawClearBefore = config.GetString("clearHotkey", "Escape");
+            string rawPickerBefore = config.Has("pickerHotkey") ? config.GetString("pickerHotkey", "") : null;
+            ConfigMigrationLogic.ResolveEffectiveHotkeys(
+                rawClearBefore,
+                rawPickerBefore,
+                NormalizeHotkeyOrNull,
+                out _,
+                out _,
+                out string pickerDefault);
+
             if (isInitial)
             {
-                ApplyDefaultsAndDocs(config);
+                ApplyDefaultsAndDocs(config, pickerDefault);
             }
 
             settings.Enabled = config.GetBool("enabled", settings.Enabled);
@@ -77,9 +87,15 @@ namespace MonsterPathPredictor.Config
             settings.SimulateCombatOnFork = config.GetBool("simulateCombatOnFork", settings.SimulateCombatOnFork);
             settings.PostCombatMode = PredictorSettings.ParsePostCombatMode(config.GetString("postCombatMode", "continue"));
             settings.AllowNonAggressiveMonsters = config.GetBool("allowNonAggressiveMonsters", settings.AllowNonAggressiveMonsters);
-            settings.ClearHotkey = NormalizeHotkey(config.GetString("clearHotkey", settings.ClearHotkey), "Escape");
-            string pickerFallback = string.Equals(settings.ClearHotkey, "F10", StringComparison.OrdinalIgnoreCase) ? "F8" : "F10";
-            settings.PickerHotkey = NormalizeHotkey(config.GetString("pickerHotkey", pickerFallback), pickerFallback);
+            ConfigMigrationLogic.ResolveEffectiveHotkeys(
+                config.GetString("clearHotkey", settings.ClearHotkey),
+                config.Has("pickerHotkey") ? config.GetString("pickerHotkey", "") : null,
+                NormalizeHotkeyOrNull,
+                out string effectiveClear,
+                out string effectivePicker,
+                out _);
+            settings.ClearHotkey = effectiveClear;
+            settings.PickerHotkey = effectivePicker;
             settings.ClosePickerOnSelect = config.GetBool("closePickerOnSelect", settings.ClosePickerOnSelect);
             settings.ExcludedPlayerBuffIds = PredictorSettings.ParseIdCsv(config.GetString("excludedPlayerBuffIds", ""));
             settings.DeterministicColorHex = config.GetString("deterministicColor", settings.DeterministicColorHex);
@@ -96,11 +112,12 @@ namespace MonsterPathPredictor.Config
                 try
                 {
                     saveOk = _pendingMigrationSave ? config.Save() : config.SaveIfDirty();
-                    if (saveOk) _pendingMigrationSave = false;
+                    _pendingMigrationSave = !saveOk;
                 }
                 catch
                 {
                     saveOk = false;
+                    _pendingMigrationSave = true;
                 }
             }
 
@@ -131,29 +148,20 @@ namespace MonsterPathPredictor.Config
             return true;
         }
 
-        public static bool SaveChangedStyleKeys(ModConfig config, PredictorSettings before, PredictorSettings after, bool writeAllStyleKeys = false)
+        public static bool SaveStylePatch(ModConfig config, StylePendingPatch patch)
         {
-            if (config == null || after == null) return false;
-            after.ClampInPlace();
-
+            if (config == null) return false;
             bool dirty = false;
-            if (writeAllStyleKeys || before == null || before.PreviewSteps != after.PreviewSteps) { config.Set("previewSteps", after.PreviewSteps); dirty = true; }
-            if (writeAllStyleKeys || before == null || Math.Abs(before.DashLength - after.DashLength) >= 0.001f) { config.Set("dashLength", after.DashLength); dirty = true; }
-            if (writeAllStyleKeys || before == null || Math.Abs(before.GapLength - after.GapLength) >= 0.001f) { config.Set("gapLength", after.GapLength); dirty = true; }
-            if (writeAllStyleKeys || before == null || Math.Abs(before.DashSpeed - after.DashSpeed) >= 0.001f) { config.Set("dashSpeed", after.DashSpeed); dirty = true; }
-            if (writeAllStyleKeys || before == null || Math.Abs(before.LineWidth - after.LineWidth) >= 0.001f) { config.Set("lineWidth", after.LineWidth); dirty = true; }
-            if (writeAllStyleKeys || before == null || Math.Abs(before.HeightOffset - after.HeightOffset) >= 0.001f) { config.Set("heightOffset", after.HeightOffset); dirty = true; }
-            if (writeAllStyleKeys || before == null || before.FontSize != after.FontSize) { config.Set("fontSize", after.FontSize); dirty = true; }
-            if (writeAllStyleKeys || before == null || before.ShowReasonTag != after.ShowReasonTag) { config.Set("showReasonTag", after.ShowReasonTag); dirty = true; }
-            if (writeAllStyleKeys || before == null || before.ShowStepNumbers != after.ShowStepNumbers) { config.Set("showStepNumbers", after.ShowStepNumbers); dirty = true; }
-            if (writeAllStyleKeys || before == null || before.ShowDeterministicPercent != after.ShowDeterministicPercent) { config.Set("showDeterministicPercent", after.ShowDeterministicPercent); dirty = true; }
-            if (writeAllStyleKeys || before == null || before.PostCombatMode != after.PostCombatMode) { config.Set("postCombatMode", PredictorSettings.FormatPostCombatMode(after.PostCombatMode)); dirty = true; }
-            if (writeAllStyleKeys || before == null || !string.Equals(before.DeterministicColorHex, after.DeterministicColorHex, StringComparison.Ordinal)) { config.Set("deterministicColor", after.DeterministicColorHex); dirty = true; }
-            if (writeAllStyleKeys || before == null || !string.Equals(before.MajorBranchColorHex, after.MajorBranchColorHex, StringComparison.Ordinal)) { config.Set("majorBranchColor", after.MajorBranchColorHex); dirty = true; }
-            if (writeAllStyleKeys || before == null || !string.Equals(before.MinorBranchColorHex, after.MinorBranchColorHex, StringComparison.Ordinal)) { config.Set("minorBranchColor", after.MinorBranchColorHex); dirty = true; }
-            if (writeAllStyleKeys || before == null || !string.Equals(before.PostCombatColorHex, after.PostCombatColorHex, StringComparison.Ordinal)) { config.Set("postCombatColor", after.PostCombatColorHex); dirty = true; }
-            if (writeAllStyleKeys || before == null || !string.Equals(before.GuideRedColorHex, after.GuideRedColorHex, StringComparison.Ordinal)) { config.Set("guideRedColor", after.GuideRedColorHex); dirty = true; }
-            if (writeAllStyleKeys || before == null || !string.Equals(before.GuideBlueColorHex, after.GuideBlueColorHex, StringComparison.Ordinal)) { config.Set("guideBlueColor", after.GuideBlueColorHex); dirty = true; }
+            if (patch != null && patch.HasPending)
+            {
+                foreach (var kv in patch.Entries)
+                {
+                    if (kv.Value is int iv) { config.Set(kv.Key, iv); dirty = true; }
+                    else if (kv.Value is float fv) { config.Set(kv.Key, fv); dirty = true; }
+                    else if (kv.Value is bool bv) { config.Set(kv.Key, bv); dirty = true; }
+                    else if (kv.Value is string sv) { config.Set(kv.Key, sv); dirty = true; }
+                }
+            }
 
             if (!dirty && !_pendingMigrationSave) return true;
             bool ok = config.Save();
@@ -161,7 +169,7 @@ namespace MonsterPathPredictor.Config
             return ok;
         }
 
-        private static void ApplyDefaultsAndDocs(ModConfig cfg)
+        private static void ApplyDefaultsAndDocs(ModConfig cfg, string pickerDefault = "F10")
         {
             cfg.SetDefault("enabled", true, ConfigDoc.Of(
                 "是否启用怪物寻路预测模组",
@@ -248,7 +256,7 @@ namespace MonsterPathPredictor.Config
                 "允許點擊小偷等非普通主動攻擊怪（會在頂部提示非主動怪）",
                 "Allow selecting non-aggressive monsters (with an informational banner note)"));
 
-            cfg.SetDefault("pickerHotkey", "F10", ConfigDoc.Of(
+            cfg.SetDefault("pickerHotkey", pickerDefault, ConfigDoc.Of(
                 "打开/关闭怪物寻路面板的热键（Unity KeyCode 名称，默认 F10）",
                 "開啟/關閉怪物尋路面板的熱鍵（Unity KeyCode 名稱，預設 F10）",
                 "Hotkey to toggle the monster path predictor popup (Unity KeyCode name, default F10)"));

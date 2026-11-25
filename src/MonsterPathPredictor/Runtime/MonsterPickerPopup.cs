@@ -78,6 +78,8 @@ namespace MonsterPathPredictor.Runtime
         private bool _positioned;
         private bool _closeOnSelect;
         private bool _styleSaveFailed;
+        private bool _pointerPressedOnPopup;
+        private bool _hasRenderedContent;
         private PickerPopupTab _activeTab = PickerPopupTab.Monsters;
         private RouteColorRole _selectedColorRole = RouteColorRole.Deterministic;
         private int _monsterPageIndex;
@@ -105,7 +107,7 @@ namespace MonsterPathPredictor.Runtime
         public event Action<long> VirtualUndoRequested;
         public event Action<long> VirtualResetPlayerRequested;
         public event Action VirtualResetAllRequested;
-        public event Action<bool> VirtualBoardPickToggled;
+        public event Action<long, bool, int> VirtualBoardPickToggled;
 
         public event Action<Action<PredictorSettings>> StyleMutationRequested;
         public event Action StyleResetRequested;
@@ -207,9 +209,10 @@ namespace MonsterPathPredictor.Runtime
             float padX = panelW < 220f ? 4f : Padding;
             float contentW = Math.Max(40f, panelW - padX * 2f);
 
-            // Defer destructive content rebuild while the user is actively pressing inside our popup
-            // so a live HP/position tick never disposes a pressed row/button before MouseUp fires onClick.
-            if (!string.IsNullOrEmpty(_lastSignature) && IsPrimaryPointerHeldInsidePopup())
+            // Defer destructive content rebuild while a pointer press that began inside our popup
+            // is still active — independent of _lastSignature so Invalidate() or briefly dragging
+            // outside the popup never disposes a pressed row/button before MouseUp fires onClick.
+            if (_hasRenderedContent && IsPopupPressActive())
             {
                 if (_positioned) ClampToStage();
                 return;
@@ -219,21 +222,37 @@ namespace MonsterPathPredictor.Runtime
             int rowsPerPage = ComputeRowsPerPage(stageHeight, hasVirtualOverrides);
             int totalPages;
             int activePageIndex;
+            CompactLayout layout;
+            List<PopupPagination.VirtualRowItem> virtualRows = null;
+            List<PageSlice> virtualPages = null;
+            float virtualRowGap = 3f;
+            int virtualNeighborCols = 1;
+            List<PopupPagination.StyleRowItem> styleRows = null;
+            List<PageSlice> stylePages = null;
+            float styleRowGap = 3f;
+
             if (_activeTab == PickerPopupTab.Monsters)
             {
                 totalPages = Math.Max(1, (_visibleMonstersBuf.Count + rowsPerPage - 1) / rowsPerPage);
                 _monsterPageIndex = ClampPage(_monsterPageIndex, totalPages);
                 activePageIndex = _monsterPageIndex;
+                layout = ComputeCompactLayout(stageHeight, totalPages > 1);
             }
             else if (_activeTab == PickerPopupTab.VirtualMove)
             {
-                totalPages = ComputeVirtualTabPageCount(stageHeight, players != null ? players.Count : 0);
+                ComputeVirtualTabLayout(
+                    players, board, sandbox, stageHeight, contentW,
+                    out layout, out virtualRows, out virtualPages, out virtualRowGap, out virtualNeighborCols);
+                totalPages = Math.Max(1, virtualPages.Count);
                 _virtualPageIndex = ClampPage(_virtualPageIndex, totalPages);
                 activePageIndex = _virtualPageIndex;
             }
             else
             {
-                totalPages = ComputeStyleTabPageCount(stageHeight, contentW, _styleSaveFailed);
+                ComputeStyleTabLayout(
+                    stageHeight, contentW, _styleSaveFailed,
+                    out layout, out styleRows, out stylePages, out styleRowGap);
+                totalPages = Math.Max(1, stylePages.Count);
                 _stylePageIndex = ClampPage(_stylePageIndex, totalPages);
                 activePageIndex = _stylePageIndex;
             }
@@ -244,7 +263,6 @@ namespace MonsterPathPredictor.Runtime
             if (sig == _lastSignature) return;
 
             bool showPager = totalPages > 1;
-            var layout = ComputeCompactLayout(stageHeight, showPager);
 
             _titleText.text = "怪物寻路 [" + settings.PickerHotkey + "]";
             _stepsLabel.text = "延伸 " + settings.PreviewSteps + " 格";
@@ -263,11 +281,15 @@ namespace MonsterPathPredictor.Runtime
             }
             else if (_activeTab == PickerPopupTab.VirtualMove)
             {
-                contentHeight = BuildVirtualTab(players, board, sandbox, localPlayerId, layout, contentW, activePageIndex, totalPages);
+                contentHeight = BuildVirtualTab(
+                    players, board, sandbox, localPlayerId, layout, contentW,
+                    virtualRows, virtualPages[activePageIndex], virtualRowGap, virtualNeighborCols);
             }
             else
             {
-                contentHeight = BuildStyleTab(settings, layout, contentW, activePageIndex, totalPages);
+                contentHeight = BuildStyleTab(
+                    settings, layout, contentW,
+                    styleRows, stylePages[activePageIndex], styleRowGap);
             }
 
             if (_pagerHost != null)
@@ -305,6 +327,7 @@ namespace MonsterPathPredictor.Runtime
             ClampToStage();
 
             // Commit signature only AFTER full tab construction and layout succeed.
+            _hasRenderedContent = true;
             _lastSignature = sig;
         }
 
@@ -327,20 +350,40 @@ namespace MonsterPathPredictor.Runtime
             _lastSignature = string.Empty;
         }
 
-        private bool IsPrimaryPointerHeldInsidePopup()
+        private void OnPopupTouchBegin()
         {
-            if (_root == null || _root.isDisposed || !_root.visible) return false;
+            _pointerPressedOnPopup = true;
+        }
+
+        private void OnStageTouchEnd()
+        {
+            _pointerPressedOnPopup = false;
+        }
+
+        private bool IsPopupPressActive()
+        {
+            if (_root == null || _root.isDisposed || !_root.visible)
+            {
+                _pointerPressedOnPopup = false;
+                return false;
+            }
             try
             {
-                if (!InputService.IsMouseButtonHeld(0) && !InputService.IsMouseButtonPressed(0))
-                    return false;
-                if (Stage.inst != null)
+                bool mouseDown = InputService.IsMouseButtonHeld(0) || InputService.IsMouseButtonPressed(0);
+                if (!mouseDown)
                 {
-                    return ContainsStagePoint(Stage.inst.touchPosition);
+                    _pointerPressedOnPopup = false;
+                    return false;
+                }
+                if (_pointerPressedOnPopup) return true;
+                if (Stage.inst != null && ContainsStagePoint(Stage.inst.touchPosition))
+                {
+                    _pointerPressedOnPopup = true;
+                    return true;
                 }
             }
             catch { }
-            return false;
+            return _pointerPressedOnPopup;
         }
 
         private void SwitchTab(PickerPopupTab tab)

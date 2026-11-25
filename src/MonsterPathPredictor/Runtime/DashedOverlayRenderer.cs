@@ -74,9 +74,10 @@ namespace MonsterPathPredictor.Runtime
         private readonly Dictionary<int, float> _forkTagNextTopY = new Dictionary<int, float>();
         private readonly Dictionary<long, int> _forkExitLabelStack = new Dictionary<long, int>();
         private readonly Dictionary<long, float> _forkExitNextTopY = new Dictionary<long, float>();
-        private readonly Dictionary<int, int> _ghostTileStack = new Dictionary<int, int>();
         private readonly HashSet<int> _drawnGhostRingTiles = new HashSet<int>();
         private readonly HashSet<long> _multiBranchEdgeKeys = new HashSet<long>();
+        private readonly HashSet<int> _roundedSplitTiles = new HashSet<int>();
+        private readonly Queue<int> _splitBfsQueue = new Queue<int>();
         private readonly HashSet<int> _combatLandSet = new HashSet<int>();
         private readonly List<DashQuad> _dashQuadBuf = new List<DashQuad>(32);
         private readonly List<Vector2> _vertBuf = new List<Vector2>(4);
@@ -153,9 +154,9 @@ namespace MonsterPathPredictor.Runtime
             return _layer;
         }
 
-        public void HideAll()
+        public void HideAll(bool force = false)
         {
-            if (!_hasVisibleWidgets) return;
+            if (!force && !_hasVisibleWidgets) return;
             for (int i = 0; i < _lineGraphPool.Count; i++)
             {
                 try
@@ -176,7 +177,6 @@ namespace MonsterPathPredictor.Runtime
             }
             _usedLineGraphs = 0;
             _usedPills = 0;
-            _hasVisibleWidgets = false;
             _placedPillRects.Clear();
             _hasVisibleWidgets = false;
         }
@@ -198,12 +198,13 @@ namespace MonsterPathPredictor.Runtime
                 return;
             }
 
+            // Keep _hasVisibleWidgets true throughout rendering so any mid-frame exception
+            // still allows HideAll() to unconditionally hide previously or partially drawn widgets.
+            _hasVisibleWidgets = true;
             _usedLineGraphs = 0;
             _usedPills = 0;
-            _hasVisibleWidgets = false;
             _placedPillRects.Clear();
             _forkTagNextTopY.Clear();
-            _placedPillRects.Clear();
 
             var palette = GetPalette(settings);
             var camTr = UnityObject.GetTransform(camera);
@@ -276,13 +277,34 @@ namespace MonsterPathPredictor.Runtime
             if (hasMonsterPlan)
             {
                 _multiBranchEdgeKeys.Clear();
+                _roundedSplitTiles.Clear();
+                _splitBfsQueue.Clear();
                 for (int fi = 0; fi < plan.Forks.Count; fi++)
                 {
                     var fk = plan.Forks[fi];
                     if (!fk.HasMultipleBranches) continue;
                     for (int ei = 0; ei < fk.Exits.Count; ei++)
                     {
-                        _multiBranchEdgeKeys.Add(((long)fk.ForkLandId << 32) ^ (uint)fk.Exits[ei].NextLandId);
+                        var ex = fk.Exits[ei];
+                        _multiBranchEdgeKeys.Add(((long)fk.ForkLandId << 32) ^ (uint)ex.NextLandId);
+                        // If a multi-branch fork has a dominant branch whose probability rounds to ~1.0,
+                        // propagate non-deterministic split styling downstream along its 1.0-rounded continuation.
+                        if (ex.ConditionalProbability >= 1.0 - 1e-12 && _roundedSplitTiles.Add(ex.NextLandId))
+                        {
+                            _splitBfsQueue.Enqueue(ex.NextLandId);
+                        }
+                    }
+                }
+                while (_splitBfsQueue.Count > 0)
+                {
+                    int curTile = _splitBfsQueue.Dequeue();
+                    for (int ei = 0; ei < plan.Edges.Count; ei++)
+                    {
+                        var pe = plan.Edges[ei];
+                        if (pe.FromLandId == curTile && pe.Probability >= 1.0 - 1e-12 && _roundedSplitTiles.Add(pe.ToLandId))
+                        {
+                            _splitBfsQueue.Enqueue(pe.ToLandId);
+                        }
                     }
                 }
 
@@ -333,7 +355,7 @@ namespace MonsterPathPredictor.Runtime
                     continue;
 
                 long edgeKey = ((long)edge.FromLandId << 32) ^ (uint)edge.ToLandId;
-                bool edgeIsSplit = _multiBranchEdgeKeys.Contains(edgeKey);
+                bool edgeIsSplit = _multiBranchEdgeKeys.Contains(edgeKey) || _roundedSplitTiles.Contains(edge.FromLandId);
                 Color color = PickEdgeColor(palette, edge.Probability, edge.IsAfterCombat, edgeIsSplit);
                 float baseWidth = edge.IsAfterCombat ? Math.Max(2.2f, settings.LineWidth * 0.78f) : settings.LineWidth;
                 float width = edge.Probability >= 0.999
@@ -410,11 +432,13 @@ namespace MonsterPathPredictor.Runtime
                             : exit.FormatConditionalPercent();
 
                         // Fixed edge base anchor per (ForkLandId, NextLandId), independent of visit-local exit index,
-                        // stacked strictly upward by measured pill height so repeated visits can never collide.
+                        // placed with unified viewport-clamped non-overlapping collision avoidance.
                         var baseAnchor = DashGeometry.ComputeEdgeLabelAnchor(forkPt, exitPt, alongRatio: 0.56f, lateralOffset: 0f);
                         bool hasPriorTop = _forkExitNextTopY.TryGetValue(exitKey, out float prevTopY);
-                        float nextTopY = DrawStackedPillLabel(baseAnchor, hasPriorTop, prevTopY, StackGapPx, pctText, settings.FontSize, exitColor);
-                        _forkExitNextTopY[exitKey] = nextTopY;
+                        if (DrawStackedPillLabel(baseAnchor, hasPriorTop, prevTopY, StackGapPx, pctText, settings.FontSize, exitColor, layer.width, layer.height, out float nextTopY))
+                        {
+                            _forkExitNextTopY[exitKey] = nextTopY;
+                        }
                     }
                 }
 
@@ -425,8 +449,10 @@ namespace MonsterPathPredictor.Runtime
                         : fork.SummaryLabel;
                     var baseTagPos = new Point2(forkPt.X, forkPt.Y - settings.FontSize - 14f);
                     bool hasPriorTagTop = _forkTagNextTopY.TryGetValue(fork.ForkLandId, out float prevTagTopY);
-                    float nextTagTopY = DrawStackedPillLabel(baseTagPos, hasPriorTagTop, prevTagTopY, StackGapPx, reasonText, Math.Max(12, settings.FontSize - 3), forkAccent);
-                    _forkTagNextTopY[fork.ForkLandId] = nextTagTopY;
+                    if (DrawStackedPillLabel(baseTagPos, hasPriorTagTop, prevTagTopY, StackGapPx, reasonText, Math.Max(12, settings.FontSize - 3), forkAccent, layer.width, layer.height, out float nextTagTopY))
+                    {
+                        _forkTagNextTopY[fork.ForkLandId] = nextTagTopY;
+                    }
                 }
 
                 _forkTagStack[fork.ForkLandId] = visitIndex + 1;
@@ -458,7 +484,7 @@ namespace MonsterPathPredictor.Runtime
 
                     Color stepColor = ts.StepIndex == 0
                         ? RingColor
-                        : PickEdgeColor(palette, ts.Probability, ts.IsAfterCombat);
+                        : PickEdgeColor(palette, ts.Probability, ts.IsAfterCombat, _roundedSplitTiles.Contains(ts.LandId));
 
                     if (ts.IsEndpoint)
                     {
@@ -483,7 +509,7 @@ namespace MonsterPathPredictor.Runtime
                     if (ep.StoppedAtCombat && _combatLandSet.Contains(ep.LandId)) continue;
                     if (!TryProjectTile(ep.LandId, out var epPt)) continue;
 
-                    Color epColor = PickEdgeColor(palette, ep.Probability, ep.IsAfterCombat);
+                    Color epColor = PickEdgeColor(palette, ep.Probability, ep.IsAfterCombat, _roundedSplitTiles.Contains(ep.LandId));
                     DrawDot(epPt, 6.5f, epColor);
 
                     string epLabel = ep.IsDeadEnd ? ("终点(" + ep.StepIndex + "格)") : (ep.StepIndex + "格");
@@ -569,7 +595,6 @@ namespace MonsterPathPredictor.Runtime
             const double TetherPeriod = TetherDashLen + TetherGapLen;
             const float StackGapPx = 4f;
             int labelFont = Math.Max(12, settings.FontSize - 3);
-            _ghostTileStack.Clear();
             _drawnGhostRingTiles.Clear();
 
             // First determine which virtual tiles have the currently edited player so their gold ring wins on shared tiles.
@@ -650,7 +675,7 @@ namespace MonsterPathPredictor.Runtime
                 string selfTag = ghost.IsLocalPlayer ? "(我)" : string.Empty;
                 string badge = "虚·" + ghost.SeatTag + selfTag + " #" + ghost.VirtualLandId;
                 var basePos = new Point2(vPt.X, vPt.Y - 24f);
-                DrawNonOverlappingPillLabel(basePos, StackGapPx, badge, labelFont, accent);
+                DrawNonOverlappingPillLabel(basePos, StackGapPx, badge, labelFont, accent, layer.width, layer.height);
             }
         }
 
@@ -864,50 +889,135 @@ namespace MonsterPathPredictor.Runtime
 
         private void DrawPillLabel(Point2 center, string text, int fontSize, Color textColor, bool compact = false)
         {
-            if (textColor.a <= 0.004f) return;
+            if (textColor.a <= 0f) return;
             var pill = PreparePill(text, fontSize, textColor, compact);
             PlacePill(pill, center);
         }
 
-        private float DrawStackedPillLabel(Point2 baseCenter, bool hasPriorTop, float priorTopY, float gapPx, string text, int fontSize, Color textColor)
+        private bool DrawStackedPillLabel(
+            Point2 baseCenter,
+            bool hasPriorTop,
+            float priorTopY,
+            float gapPx,
+            string text,
+            int fontSize,
+            Color textColor,
+            float viewW,
+            float viewH,
+            out float placedTopY)
         {
-            if (textColor.a <= 0.004f) return hasPriorTop ? priorTopY : baseCenter.Y;
+            placedTopY = hasPriorTop ? priorTopY : baseCenter.Y;
+            if (textColor.a <= 0f) return false;
             var pill = PreparePill(text, fontSize, textColor, compact: false);
-            float centerY = hasPriorTop
+            float prefY = hasPriorTop
                 ? (priorTopY - gapPx - pill.Height * 0.5f)
                 : baseCenter.Y;
-            PlacePill(pill, new Point2(baseCenter.X, centerY));
-            return centerY - pill.Height * 0.5f;
+            var chosen = FindNonOverlappingPillCenter(
+                new Point2(baseCenter.X, prefY),
+                pill.Width,
+                pill.Height,
+                gapPx,
+                viewW,
+                viewH);
+            PlacePill(pill, chosen);
+            placedTopY = chosen.Y - pill.Height * 0.5f;
+            return true;
         }
 
-        private void DrawNonOverlappingPillLabel(Point2 baseCenter, float gapPx, string text, int fontSize, Color textColor)
+        private void DrawNonOverlappingPillLabel(
+            Point2 baseCenter,
+            float gapPx,
+            string text,
+            int fontSize,
+            Color textColor,
+            float viewW,
+            float viewH)
         {
-            if (textColor.a <= 0.004f) return;
+            if (textColor.a <= 0f) return;
             var pill = PreparePill(text, fontSize, textColor, compact: false);
-            float centerY = baseCenter.Y;
-            float left = (float)Math.Round(baseCenter.X - pill.Width * 0.5f);
+            var chosen = FindNonOverlappingPillCenter(baseCenter, pill.Width, pill.Height, gapPx, viewW, viewH);
+            PlacePill(pill, chosen);
+        }
 
-            // Push upward past any overlapping fork/combat/endpoint/step/ghost pill rect on screen.
-            for (int iter = 0; iter < 12; iter++)
+        private Point2 FindNonOverlappingPillCenter(
+            Point2 prefCenter,
+            float w,
+            float h,
+            float gapPx,
+            float viewW,
+            float viewH)
+        {
+            const float Pad = 4f;
+            float halfW = w * 0.5f;
+            float halfH = h * 0.5f;
+            float minX = Pad + halfW;
+            float maxX = Math.Max(minX, viewW - Pad - halfW);
+            float minY = Pad + halfH;
+            float maxY = Math.Max(minY, viewH - Pad - halfH);
+
+            Point2 ClampCenter(float cx, float cy)
             {
-                float top = (float)Math.Round(centerY - pill.Height * 0.5f);
-                var cand = new Rect(left, top, pill.Width, pill.Height);
-                bool overlapped = false;
-                for (int i = 0; i < _placedPillRects.Count; i++)
-                {
-                    var r = _placedPillRects[i];
-                    if (cand.xMin < r.xMax + 2f && cand.xMax > r.xMin - 2f &&
-                        cand.yMin < r.yMax + gapPx && cand.yMax > r.yMin - gapPx)
-                    {
-                        centerY = r.yMin - gapPx - pill.Height * 0.5f;
-                        overlapped = true;
-                        break;
-                    }
-                }
-                if (!overlapped) break;
+                return new Point2(
+                    Math.Max(minX, Math.Min(maxX, cx)),
+                    Math.Max(minY, Math.Min(maxY, cy)));
             }
 
-            PlacePill(pill, new Point2(baseCenter.X, centerY));
+            float OverlapScore(Point2 c)
+            {
+                float l = (float)Math.Round(c.X - halfW);
+                float t = (float)Math.Round(c.Y - halfH);
+                float r = l + w;
+                float b = t + h;
+                float total = 0f;
+                for (int i = 0; i < _placedPillRects.Count; i++)
+                {
+                    var pr = _placedPillRects[i];
+                    float ox = Math.Min(r, pr.xMax + 2f) - Math.Max(l, pr.xMin - 2f);
+                    if (ox <= 0f) continue;
+                    float oy = Math.Min(b, pr.yMax + gapPx) - Math.Max(t, pr.yMin - gapPx);
+                    if (oy <= 0f) continue;
+                    total += ox * oy;
+                }
+                return total;
+            }
+
+            float stepY = h + gapPx;
+            float stepX = w + 6f;
+            Point2 bestCenter = ClampCenter(prefCenter.X, prefCenter.Y);
+            float bestScore = OverlapScore(bestCenter);
+            if (bestScore <= 0f) return bestCenter;
+
+            // Evaluate in-viewport candidates in deterministic priority order:
+            // upward stack -> below anchor -> right/left beside anchor -> diagonal offsets.
+            bool TryCandidate(float cx, float cy)
+            {
+                var cand = ClampCenter(cx, cy);
+                float sc = OverlapScore(cand);
+                if (sc < bestScore)
+                {
+                    bestScore = sc;
+                    bestCenter = cand;
+                    if (sc <= 0f) return true;
+                }
+                return false;
+            }
+
+            for (int k = 1; k <= 5; k++)
+            {
+                if (TryCandidate(prefCenter.X, prefCenter.Y - k * stepY)) return bestCenter;
+            }
+            for (int k = 1; k <= 4; k++)
+            {
+                if (TryCandidate(prefCenter.X, prefCenter.Y + k * stepY)) return bestCenter;
+            }
+            if (TryCandidate(prefCenter.X + stepX, prefCenter.Y)) return bestCenter;
+            if (TryCandidate(prefCenter.X - stepX, prefCenter.Y)) return bestCenter;
+            if (TryCandidate(prefCenter.X + stepX, prefCenter.Y - stepY)) return bestCenter;
+            if (TryCandidate(prefCenter.X - stepX, prefCenter.Y - stepY)) return bestCenter;
+            if (TryCandidate(prefCenter.X + stepX, prefCenter.Y + stepY)) return bestCenter;
+            if (TryCandidate(prefCenter.X - stepX, prefCenter.Y + stepY)) return bestCenter;
+
+            return bestCenter;
         }
 
         private static bool ColorsEqual(Color a, Color b)
@@ -928,8 +1038,18 @@ namespace MonsterPathPredictor.Runtime
                     _usedLineGraphs++;
                     return existing;
                 }
+                int insertIdx = Math.Min(_usedLineGraphs, _lineLayer.numChildren);
+                if (existing != null && !existing.isDisposed)
+                {
+                    if (existing.parent == _lineLayer)
+                    {
+                        try { insertIdx = _lineLayer.GetChildIndex(existing); } catch { }
+                    }
+                    try { existing.RemoveFromParent(); } catch { }
+                    try { existing.Dispose(); } catch { }
+                }
                 var replacement = new GGraph { touchable = false };
-                _lineLayer.AddChild(replacement);
+                _lineLayer.AddChildAt(replacement, Math.Max(0, Math.Min(insertIdx, _lineLayer.numChildren)));
                 _lineGraphPool[_usedLineGraphs] = replacement;
                 _usedLineGraphs++;
                 return replacement;
@@ -949,25 +1069,35 @@ namespace MonsterPathPredictor.Runtime
                 var existing = _pillPool[_usedPills];
                 if (existing != null &&
                     existing.Root != null && !existing.Root.isDisposed && existing.Root.parent == _pillLayer &&
-                    existing.Bg != null && !existing.Bg.isDisposed &&
-                    existing.Text != null && !existing.Text.isDisposed)
+                    existing.Bg != null && !existing.Bg.isDisposed && existing.Bg.parent == existing.Root &&
+                    existing.Text != null && !existing.Text.isDisposed && existing.Text.parent == existing.Root)
                 {
                     _usedPills++;
                     return existing;
                 }
-                var replacement = CreatePooledPill();
+                int insertIdx = Math.Min(_usedPills, _pillLayer.numChildren);
+                if (existing != null && existing.Root != null && !existing.Root.isDisposed)
+                {
+                    if (existing.Root.parent == _pillLayer)
+                    {
+                        try { insertIdx = _pillLayer.GetChildIndex(existing.Root); } catch { }
+                    }
+                    try { existing.Root.RemoveFromParent(); } catch { }
+                    try { existing.Root.Dispose(); } catch { }
+                }
+                var replacement = CreatePooledPill(insertIdx);
                 _pillPool[_usedPills] = replacement;
                 _usedPills++;
                 return replacement;
             }
 
-            var pill = CreatePooledPill();
+            var pill = CreatePooledPill(-1);
             _pillPool.Add(pill);
             _usedPills++;
             return pill;
         }
 
-        private PooledPill CreatePooledPill()
+        private PooledPill CreatePooledPill(int insertAtIndex)
         {
             var root = new GComponent { touchable = false };
             var bg = new GGraph { touchable = false };
@@ -980,7 +1110,14 @@ namespace MonsterPathPredictor.Runtime
             // Fixed child order inside each pill container: bg (0) always beneath text (1); never mutates.
             root.AddChild(bg);
             root.AddChild(tf);
-            _pillLayer.AddChild(root);
+            if (insertAtIndex >= 0)
+            {
+                _pillLayer.AddChildAt(root, Math.Max(0, Math.Min(insertAtIndex, _pillLayer.numChildren)));
+            }
+            else
+            {
+                _pillLayer.AddChild(root);
+            }
 
             return new PooledPill
             {

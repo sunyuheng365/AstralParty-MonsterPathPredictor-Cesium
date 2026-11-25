@@ -1376,5 +1376,135 @@ namespace MonsterPathPredictor.Tests
             Assert.Equal(minX40, c23A.X);
             Assert.Equal(1f + eps23, c23A.Y);
         }
+
+        [Fact]
+        public void LinglingPushOntoFork_HonorsFrontNodeIdsEvenWhenPushFromUnknown()
+        {
+            // Verified on 5 real replays (82010/82012/82014/82017): Lingling (12802) drops hijacked monster onto fork 10
+            // with raw neighbors [11(Red), 12(Blue), 13], Back=-1, PushFrom=-1, Front=[12, 13].
+            // Engine MUST select Red/Blue priority strictly within FrontNodeIds (12), NEVER the excluded exit 11!
+            var board = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(10, new[] { 11, 12, 13 }),
+                new LandNodeSnapshot(11, new[] { 10 }),
+                new LandNodeSnapshot(12, new[] { 10 }),
+                new LandNodeSnapshot(13, new[] { 10 })
+            });
+            var m = new MonsterState
+            {
+                MonsterId = 980,
+                CurrentLandId = 10,
+                FromLandId = -1,
+                FrontNodeIds = new[] { 12, 13 },
+                SkillMoveKind = SkillMoveKind.LinglingPush,
+                SkillMovePushFromLandId = -1
+            };
+            var plan = MonsterPathEngine.Plan(board, m, new List<TrackedPlayer>(), new PlanOptions { MaxSteps = 1 });
+            var fork = plan.Forks.Single(f => f.ForkLandId == 10);
+            Assert.Single(fork.Exits);
+            Assert.Equal(12, fork.Exits[0].NextLandId);
+        }
+
+        [Fact]
+        public void BossTargetId_1018And1047_PersistsAcrossMarkExpiryDeathAndUnmarkedCombat_AndObeysRedBlueOnUnmarkedForkStart()
+        {
+            // Chain with two forks: 0-1-2(fork: 3,4,1), 3-5(fork: 6,7,3)
+            var board = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(0, new[] { 1 }),
+                new LandNodeSnapshot(1, new[] { 2, 0 }),
+                new LandNodeSnapshot(2, new[] { 3, 4, 1 }),
+                new LandNodeSnapshot(3, new[] { 5, 2 }),
+                new LandNodeSnapshot(4, new[] { 2 }),
+                new LandNodeSnapshot(5, new[] { 6, 7, 3 }),
+                new LandNodeSnapshot(6, new[] { 5 }),
+                new LandNodeSnapshot(7, new[] { 5 })
+            });
+
+            // 1. Carried-over BossTargetId=P1@0 (NO living marked player, even with P1 dead IsAlive=false!):
+            //    - At ForkStart(2) with Front=[3,4]: obeys Red arrow 3 (does NOT U-turn to 1 on ForkStart!).
+            //    - Continues 2 -> 3 -> 5 (mid-walk fork): NOW freely U-turns back to 3 toward dead locked BossTargetId P1@0!
+            var players = new List<TrackedPlayer>
+            {
+                new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = 0, IsAlive = false, IsTargetable = true },
+                new TrackedPlayer { PlayerId = 2, Slot = 1, LandId = 6, IsAlive = true, IsTargetable = true }
+            };
+            var duck = new MonsterState
+            {
+                MonsterId = 981,
+                HeroId = 1047,
+                CurrentLandId = 2,
+                FromLandId = 1,
+                FrontNodeIds = new[] { 3, 4 },
+                IsCurrentlyMovingMidTurn = false,
+                ChasesMandarinDuckMark = true,
+                BossTargetPlayerId = 1
+            };
+            var plan = MonsterPathEngine.Plan(board, duck, players, new PlanOptions { MaxSteps = 3 });
+            Assert.Equal(3, plan.Forks.Single(f => f.ForkLandId == 2).Exits.Single().NextLandId);
+            Assert.Equal(3, plan.Forks.Single(f => f.ForkLandId == 5).Exits.Single().NextLandId);
+
+            // 2. Mid-walk after fighting unmarked P2 (HasLaunchedFightThisTurn=true, BossTargetClearedThisTurn=false):
+            //    Still U-turns at fork 5 back to 3 toward P1@0.
+            var midAfterUnmarked = new MonsterState
+            {
+                MonsterId = 981,
+                HeroId = 1047,
+                CurrentLandId = 5,
+                FromLandId = 3,
+                IsCurrentlyMovingMidTurn = true,
+                HasLaunchedFightThisTurn = true,
+                ChasesMandarinDuckMark = true,
+                BossTargetPlayerId = 1,
+                BossTargetClearedThisTurn = false
+            };
+            var planUnmarked = MonsterPathEngine.Plan(board, midAfterUnmarked, players, new PlanOptions { MaxSteps = 1 });
+            Assert.Equal(3, planUnmarked.Forks.Single(f => f.ForkLandId == 5).Exits.Single().NextLandId);
+
+            // 3. Mid-walk after fighting BossTargetId (BossTargetClearedThisTurn=true):
+            //    Clears BossTargetId and suppresses even remaining marked players -> chases living P2@6 normally!
+            var playersWithOtherMark = new List<TrackedPlayer>
+            {
+                new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = 0, IsAlive = true, IsTargetable = true, HasMandarinDuckMark = true },
+                new TrackedPlayer { PlayerId = 2, Slot = 1, LandId = 6, IsAlive = true, IsTargetable = true },
+                new TrackedPlayer { PlayerId = 3, Slot = 2, LandId = 7, IsAlive = true, IsTargetable = true, HasMandarinDuckMark = true }
+            };
+            midAfterUnmarked.BossTargetPlayerId = 0;
+            midAfterUnmarked.BossTargetClearedThisTurn = true;
+            var planCleared = MonsterPathEngine.Plan(board, midAfterUnmarked, playersWithOtherMark, new PlanOptions { MaxSteps = 1 });
+            // P2@6 (Slot 0/1, dist 1) beats P3@7 (Slot 2, dist 1) because mark PriorityTier=0 is suppressed after BossTargetCleared!
+            Assert.Equal(6, planCleared.Forks.Single(f => f.ForkLandId == 5).Exits.Single().NextLandId);
+        }
+
+        [Fact]
+        public void BossTargetId_TurnStartReLocksToCloserLivingMarkedPlayer()
+        {
+            // Verified on 82012 (1795616950353775): 1018 has old BossTargetId=P2@4 (dist=2),
+            // but P1@1 (dist=1) carries mark 2101001 -> turn start re-locks onto closer marked P1@1!
+            var board = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(1, new[] { 2 }),
+                new LandNodeSnapshot(2, new[] { 3, 4, 1 }),
+                new LandNodeSnapshot(3, new[] { 4, 2 }),
+                new LandNodeSnapshot(4, new[] { 2, 3 })
+            });
+            var officer = new MonsterState
+            {
+                MonsterId = 982,
+                HeroId = 1018,
+                CurrentLandId = 2,
+                FromLandId = 1,
+                FrontNodeIds = new[] { 3, 4 },
+                ChasesProblemStudent = true,
+                BossTargetPlayerId = 2
+            };
+            var players = new List<TrackedPlayer>
+            {
+                new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = 1, IsAlive = true, IsTargetable = true, HasProblemStudentMark = true },
+                new TrackedPlayer { PlayerId = 2, Slot = 1, LandId = 4, IsAlive = true, IsTargetable = true }
+            };
+            var plan = MonsterPathEngine.Plan(board, officer, players, new PlanOptions { MaxSteps = 1 });
+            Assert.Equal(1, plan.Forks.Single(f => f.ForkLandId == 2).Exits.Single().NextLandId);
+        }
     }
 }

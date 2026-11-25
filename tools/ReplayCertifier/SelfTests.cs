@@ -36,6 +36,7 @@ namespace MonsterPathPredictor.ReplayCertifier
             public int Gold { get; set; } = 10;
             public int CrimeNum { get; set; }
             public bool NotSelect { get; set; }
+            public long BossTargetId { get; set; }
             public Dictionary<int, object> Buffs { get; set; }
         }
 
@@ -69,6 +70,7 @@ namespace MonsterPathPredictor.ReplayCertifier
         public sealed class StubAttr { public long PlayerId { get; set; } public StubCause Cause { get; set; } public List<StubEffect> EffectDatas { get; set; } = new(); }
         public sealed class StubMoveEffectBucket { public List<StubAttr> Effects { get; set; } = new(); }
         public sealed class StubSkillMoveEffect { public long PlayerId { get; set; } public Dictionary<int, StubMoveEffectBucket> EffectData { get; set; } = new(); }
+        public sealed class StubMapIndexChange { public int MapId { get; set; } public int NewIndex { get; set; } }
 
         private static byte[] MakeFrame(short cmdId, int token)
         {
@@ -2075,7 +2077,103 @@ namespace MonsterPathPredictor.ReplayCertifier
                 return 1;
             }
 
-            Console.WriteLine("ReplayCertifier self-tests PASSED (60/60).");
+            // Test 61: Dynamic-layout switch (map 82012): empty-cause 1040.Place onto new-layout tile -> non-state 1013 -> 1086
+            //          MapIndexChangeS2C, plus dead monster (Hp=0) lingering on old-layout tile in 1113 -> 0 IllegalMoveEdges!
+            var cat61 = new BoardCatalog();
+            string tmpMap61 = Path.Combine(Path.GetTempPath(), "certifier-st61-" + Guid.NewGuid().ToString("N") + ".json");
+            try
+            {
+                File.WriteAllText(tmpMap61,
+                    "{\"maps\":[{\"id\":82012,\"name\":\"Academy\",\"layouts\":{" +
+                    "\"12\":{\"nodes\":[{\"id\":1,\"neighbors\":[2]},{\"id\":2,\"neighbors\":[1]}]}," +
+                    "\"13\":{\"nodes\":[{\"id\":46,\"neighbors\":[47]},{\"id\":47,\"neighbors\":[46]}]}" +
+                    "}}]}");
+                cat61.LoadJsonFile(tmpMap61);
+            }
+            finally { try { if (File.Exists(tmpMap61)) File.Delete(tmpMap61); } catch { } }
+            var dec61 = new StubDecoder();
+            int run61 = dec61.Register(new StubRunning
+            {
+                Room = new StubRoom
+                {
+                    MapId = 82012, MapIndex = 0, Round = 1,
+                    Players = new List<StubUnit> { new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 101, NodeId = 1 } } },
+                    Monsters = new List<StubUnit> { new StubUnit { Id = 900, Hero = new StubHero { HeroId = 1018, MonsterType = 10, NodeId = 2, Hp = 0 } } }
+                }
+            });
+            int reloc61 = dec61.Register(new StubAttr
+            {
+                PlayerId = 1,
+                EffectDatas = new List<StubEffect> { new StubEffect { PlayerId = 1, Place = new StubPlace { Place = new StubPlaceInner { NodeId = 46, BackNodeId = -1, FrontNodeIds = new[] { 47 } } } } }
+            });
+            int uiGap61 = dec61.Register(new object());
+            int switch61 = dec61.Register(new StubMapIndexChange { MapId = 82012, NewIndex = 1 });
+            int snap61 = dec61.Register(new StubSnap
+            {
+                PlayerId = 1,
+                Room = new StubRoom
+                {
+                    MapId = 82012, MapIndex = 1, Round = 2,
+                    Players = new List<StubUnit> { new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 101, NodeId = 46 } } },
+                    Monsters = new List<StubUnit> { new StubUnit { Id = 900, Hero = new StubHero { HeroId = 1018, MonsterType = 10, NodeId = 2, Hp = 0 } } }
+                }
+            });
+            int mv61 = dec61.Register(new StubMove { PlayerId = 1, NodeIds = new[] { 46, 47 } });
+            int fin61 = dec61.Register(new StubFinish());
+            var r61 = ReplayEvaluator.EvaluateBytes("map-82012-switch",
+                ConcatFrames(MakeFrame(1003, run61), MakeFrame(1040, reloc61), MakeFrame(1013, uiGap61), MakeFrame(1086, switch61), MakeFrame(1113, snap61), MakeFrame(5028, mv61), MakeFrame(1016, fin61)),
+                dec61, cat61);
+            if (r61.ReplaysVerified != 1 || r61.IllegalMoveEdges != 0)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 61): 82012 cmd=1086 layout switch / dead monster snapshot produced illegal={r61.IllegalMoveEdges}, verified={r61.ReplaysVerified}.");
+                return 1;
+            }
+
+            // Test 62: 1047 Hero.BossTargetId end-to-end:
+            //   - Unmarked ForkStart obeys Red arrow (3), then at MidWalkFork (5) U-turns back (3) toward dead locked BossTargetId=P1@0.
+            //   - Fighting unmarked P2 does NOT clear BossTargetId; fighting BossTargetId P1 DOES clear it for rest of turn.
+            var cat62 = BuildTestCatalog(82015,
+                "{\"id\":0,\"neighbors\":[1]},{\"id\":1,\"neighbors\":[2,0]},{\"id\":2,\"neighbors\":[3,4,1]}," +
+                "{\"id\":3,\"neighbors\":[5,2]},{\"id\":4,\"neighbors\":[2]},{\"id\":5,\"neighbors\":[6,7,3]}," +
+                "{\"id\":6,\"neighbors\":[5]},{\"id\":7,\"neighbors\":[5]}");
+            var dec62 = new StubDecoder();
+            int run62 = dec62.Register(new StubRunning
+            {
+                Room = new StubRoom
+                {
+                    MapId = 82015, MapIndex = 0, Round = 1,
+                    Players = new List<StubUnit>
+                    {
+                        new StubUnit { Id = 1, Slot = 0, Hero = new StubHero { HeroId = 101, NodeId = 0, Hp = 0 } },
+                        new StubUnit { Id = 2, Slot = 1, Hero = new StubHero { HeroId = 102, NodeId = 3, Hp = 10 } },
+                        new StubUnit { Id = 3, Slot = 2, Hero = new StubHero { HeroId = 103, NodeId = 6, Hp = 10 } }
+                    },
+                    Monsters = new List<StubUnit>
+                    {
+                        new StubUnit { Id = 910, Hero = new StubHero { HeroId = 1047, MonsterType = 12, NodeId = 1, BackNodeId = 0, FrontNodeIds = new[] { 2 }, BossTargetId = 1 } }
+                    }
+                }
+            });
+            int roll62_0 = dec62.Register(new StubThrowDice { PlayerId = 910 });
+            int mv62_0 = dec62.Register(new StubMove { PlayerId = 910, NodeIds = new[] { 1, 2 } }); // Walks onto fork 2 and stops
+            int roll62 = dec62.Register(new StubThrowDice { PlayerId = 910 });
+            int mv62a = dec62.Register(new StubMove { PlayerId = 910, NodeIds = new[] { 2, 3 } }); // ForkStart(2) -> Red(3) (not U-turn!)
+            int btl62Unmarked = dec62.Register(new StubBattle { Battle = new StubBattleInner { Attacker = new StubBattleUnit { PlayerId = 910 }, Defender = new StubBattleUnit { PlayerId = 2 } } });
+            int mv62b = dec62.Register(new StubMove { PlayerId = 910, NodeIds = new[] { 3, 5, 3 } }); // PostNormalCombatMidFork(5) -> U-turn to 3 toward dead BossTargetId P1@0!
+            int fin62 = dec62.Register(new StubFinish());
+            var r62 = ReplayEvaluator.EvaluateBytes("boss-target-1047",
+                ConcatFrames(MakeFrame(1003, run62), MakeFrame(5022, roll62_0), MakeFrame(5028, mv62_0),
+                    MakeFrame(5022, roll62), MakeFrame(5028, mv62a), MakeFrame(1007, btl62Unmarked), MakeFrame(5028, mv62b), MakeFrame(1016, fin62)),
+                dec62, cat62);
+            if (r62.ReplaysVerified != 1 || r62.IllegalMoveEdges != 0 ||
+                r62.Buckets["ForkStart"].DetHits != 1 || r62.Buckets["ForkStart"].DetTotal != 1 ||
+                r62.Buckets["PostNormalCombatMidFork"].DetHits != 1 || r62.Buckets["PostNormalCombatMidFork"].DetTotal != 1)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 62): 1047 BossTargetId flow failed (fs={r62.Buckets["ForkStart"].DetHits}/{r62.Buckets["ForkStart"].DetTotal}, pnm={r62.Buckets["PostNormalCombatMidFork"].DetHits}/{r62.Buckets["PostNormalCombatMidFork"].DetTotal}).");
+                return 1;
+            }
+
+            Console.WriteLine("ReplayCertifier self-tests PASSED (62/62).");
             return 0;
         }
     }

@@ -109,6 +109,7 @@ namespace MonsterPathPredictor.ReplayCertifier
             Dictionary<long, UnitSim> players, Dictionary<long, UnitSim> monsters, Dictionary<long, int> spawnedAtTile,
             Dictionary<long, Dictionary<int, List<dynamic>>> pendingMoveEffects, long curTurnActor,
             bool startedOnFork, int turnStartLandId, ref bool stepped, ref bool foughtOnTile, bool foughtTurn, ref bool thiefStoleOnTile,
+            ref bool bossTargetLockedTurn, bool bossTargetClearedTurn,
             MapStats mapStat, CertificationSummary summary)
         {
             long moverId = (long)mv.PlayerId;
@@ -191,6 +192,11 @@ namespace MonsterPathPredictor.ReplayCertifier
                 }
                 else if (isKnownMonster && (isNormalAggro || isThief) && isActiveTurnMonster)
                 {
+                    if (!stepped && !bossTargetLockedTurn && !bossTargetClearedTurn && (m.HeroId == 1018 || m.HeroId == 1047))
+                    {
+                        TryLockTurnStartBossTarget(m, board, players, turnStartLandId);
+                        bossTargetLockedTurn = true;
+                    }
                     // Directed 2-exit arrival forks remain forks on mid-walk, post-combat/steal, AND
                     // Lingling directed pushes with a verified push predecessor (matching MonsterPathEngine.IsForkForFirstStep).
                     bool hasLinglingPushFrom = m.PendingSkillMoveLandId == curTile &&
@@ -202,7 +208,8 @@ namespace MonsterPathPredictor.ReplayCertifier
                     {
                         ScoreForkDecision(m, isNormalAggro, isThief, curTile, fromTile, nextTile,
                             replayId, mapId, curRound, fi, board, players, spawnedAtTile,
-                            startedOnFork, turnStartLandId, stepped, foughtOnTile, foughtTurn, thiefStoleOnTile, mapStat, summary);
+                            startedOnFork, turnStartLandId, stepped, foughtOnTile, foughtTurn, thiefStoleOnTile,
+                            bossTargetClearedTurn, mapStat, summary);
                     }
                 }
 
@@ -335,7 +342,7 @@ namespace MonsterPathPredictor.ReplayCertifier
             string replayId, int mapId, int curRound, int fi, BoardGraph board,
             Dictionary<long, UnitSim> players, Dictionary<long, int> spawnedAtTile,
             bool startedOnFork, int turnStartLandId, bool stepped, bool foughtOnTile, bool foughtTurn, bool thiefStoleOnTile,
-            MapStats mapStat, CertificationSummary summary)
+            bool bossTargetClearedTurn, MapStats mapStat, CertificationSummary summary)
         {
             bool isTurnStart = !stepped && startedOnFork;
             bool isFreshSpawn = spawnedAtTile.TryGetValue(m.Id, out int spTile) && spTile == curTile && !stepped;
@@ -396,6 +403,8 @@ namespace MonsterPathPredictor.ReplayCertifier
                 RequiresCrimeTarget = requiresCrimeTarget,
                 ChasesProblemStudent = (m.HeroId == 1018),
                 ChasesMandarinDuckMark = (m.HeroId == 1047),
+                BossTargetPlayerId = bossTargetClearedTurn ? 0L : m.BossTargetId,
+                BossTargetClearedThisTurn = bossTargetClearedTurn,
                 SkillMoveKind = m.PendingSkillMoveLandId == curTile ? m.PendingSkillMoveKind : SkillMoveKind.None,
                 SkillMovePushDirectionLandId = m.PendingSkillMoveLandId == curTile ? m.PendingSkillMovePushDirId : -1,
                 SkillMovePushFromLandId = m.PendingSkillMoveLandId == curTile ? m.PendingSkillMovePushFromId : -1

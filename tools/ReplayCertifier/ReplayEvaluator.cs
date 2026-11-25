@@ -38,6 +38,7 @@ namespace MonsterPathPredictor.ReplayCertifier
             public int PendingSkillMovePushDirId = -1;
             public int PendingSkillMovePushFromId = -1;
             public int TauntSkillId;
+            public long BossTargetId;
             public bool WardenRevealed;
             public HashSet<int> BuffIds = new();
         }
@@ -64,6 +65,7 @@ namespace MonsterPathPredictor.ReplayCertifier
             int curRound = 0;
             int turnStartLandId = -1;
             bool startedOnFork = false, stepped = false, foughtOnTile = false, foughtTurn = false, thiefStoleOnTile = false;
+            bool bossTargetLockedTurn = false, bossTargetClearedTurn = false;
             int foughtTile = -1, foughtLayoutIdx = -1;
             int thiefStoleTile = -1, thiefStoleLayoutIdx = -1;
 
@@ -116,10 +118,44 @@ namespace MonsterPathPredictor.ReplayCertifier
 
             void ValidateUnitPlacement(UnitSim u)
             {
-                if (u != null && u.NodeId >= 0 && board != null && !board.Contains(u.NodeId))
+                if (u == null || u.NodeId < 0 || board == null) return;
+                // Dead monsters (Hp <= 0) can linger in 1113 room.Monsters with old-layout tile IDs after a mid-match layout switch.
+                if (u.IsMonster && u.Hp <= 0) return;
+                if (!board.Contains(u.NodeId))
                 {
                     summary.IllegalMoveEdges++;
                 }
+            }
+
+            bool TrySwitchMapLayout(int targetMapId, int newIdx)
+            {
+                if (targetMapId != 0 && mapId != 0 && targetMapId != mapId)
+                {
+                    decodeFailed = true;
+                    return false;
+                }
+                if (board != null && newIdx == mapIndex) return true;
+                if (!catalog.TryGetGraph(mapId, newIdx, out var nb))
+                {
+                    unknownLayout = true;
+                    return false;
+                }
+                mapIndex = newIdx;
+                board = nb;
+                turnStartLandId = -1;
+                startedOnFork = false;
+                pendingMoveEffects.Clear();
+                ClearTileScopedTurnFlags();
+                foreach (var pUnit in players.Values) pUnit.PendingDisplacementHops.Clear();
+                foreach (var mUnit in monsters.Values)
+                {
+                    mUnit.PendingDisplacementHops.Clear();
+                    mUnit.PendingSkillMoveKind = SkillMoveKind.None;
+                    mUnit.PendingSkillMoveLandId = -1;
+                    mUnit.PendingSkillMovePushDirId = -1;
+                    mUnit.PendingSkillMovePushFromId = -1;
+                }
+                return true;
             }
 
             void SyncRoom(dynamic room, bool preservePendingEffects = false, bool preserveDisplacementHops = false)
@@ -343,6 +379,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                     if (!sameOngoingTurn)
                     {
                         stepped = foughtOnTile = foughtTurn = thiefStoleOnTile = false;
+                        bossTargetLockedTurn = bossTargetClearedTurn = false;
                         foughtTile = foughtLayoutIdx = thiefStoleTile = thiefStoleLayoutIdx = -1;
                         turnStartLandId = monsters.TryGetValue(curTurnActor, out var am) ? am.NodeId : -1;
                         startedOnFork = am != null && board.IsFork(am.NodeId);
@@ -433,6 +470,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                     // Always advance active turn context even when a player (non-monster) rolls dice.
                     curTurnActor = actorId;
                     stepped = foughtTurn = false;
+                    bossTargetLockedTurn = bossTargetClearedTurn = false;
                     ClearTileScopedTurnFlags();
                     if (monsters.TryGetValue(actorId, out var ma))
                     {
@@ -449,6 +487,18 @@ namespace MonsterPathPredictor.ReplayCertifier
                 {
                     dynamic attr = decoder.TryDecode("party.protocol.UpdateHeroAttrS2C", payload);
                     if (attr == null) { decodeFailed = true; break; }
+                    // On dynamic-layout maps (e.g. 82012 魔法学院), the server emits relocation 1040.Place frames
+                    // immediately before cmd=1086 MapIndexChangeS2C; switch layout ahead so new-layout tiles validate cleanly.
+                    if (HasEmptyCausePlaceEffect(attr))
+                    {
+                        int look = fi + 1;
+                        while (look < frames.Count && (frames[look].CmdId == 1040 || !IsStateFrame(frames[look].CmdId))) look++;
+                        if (look < frames.Count && frames[look].CmdId == 1086 && frames[look].Payload.Length > 0)
+                        {
+                            dynamic mic = decoder.TryDecode("party.protocol.MapIndexChangeS2C", frames[look].Payload);
+                            if (mic != null && !TrySwitchMapLayout((int)mic.MapId, (int)mic.NewIndex)) break;
+                        }
+                    }
                     bool stole = ApplyAttr(attr, board, players, monsters, false, curTurnActor, summary, out bool curActorLeftTile);
                     if (curActorLeftTile) ClearTileScopedTurnFlags();
                     if (stole)
@@ -458,6 +508,12 @@ namespace MonsterPathPredictor.ReplayCertifier
                         thiefStoleLayoutIdx = mapIndex;
                     }
                     SyncTileScopedTurnFlags();
+                }
+                else if (cmd == 1086)
+                {
+                    dynamic mic = decoder.TryDecode("party.protocol.MapIndexChangeS2C", payload);
+                    if (mic == null) { decodeFailed = true; break; }
+                    if (!TrySwitchMapLayout((int)mic.MapId, (int)mic.NewIndex)) break;
                 }
                 else if (cmd == 1096)
                 {
@@ -568,6 +624,21 @@ namespace MonsterPathPredictor.ReplayCertifier
                                 foughtTile = actorTile;
                                 foughtLayoutIdx = mapIndex;
                             }
+                            if (monsters.TryGetValue(curTurnActor, out var bm) && (bm.HeroId == 1018 || bm.HeroId == 1047))
+                            {
+                                long oppId = (atk == curTurnActor) ? def : atk;
+                                bool foughtBossTarget = (bm.BossTargetId != 0 && oppId == bm.BossTargetId);
+                                if (!foughtBossTarget && players.TryGetValue(oppId, out var oppUnit))
+                                {
+                                    foughtBossTarget = (bm.HeroId == 1018 && oppUnit.BuffIds.Contains(2101001)) ||
+                                                       (bm.HeroId == 1047 && oppUnit.BuffIds.Contains(10470101));
+                                }
+                                if (foughtBossTarget)
+                                {
+                                    bm.BossTargetId = 0;
+                                    bossTargetClearedTurn = true;
+                                }
+                            }
                         }
                     }
                 }
@@ -584,7 +655,8 @@ namespace MonsterPathPredictor.ReplayCertifier
                     dynamic mv = decoder.TryDecode("party.protocol.MoveS2C", payload);
                     if (mv == null) { decodeFailed = true; continue; }
                     if (!HandleMove(mv, replayId, mapId, curRound, fi, board, players, monsters, spawnedAtTile, pendingMoveEffects,
-                            curTurnActor, startedOnFork, turnStartLandId, ref stepped, ref foughtOnTile, foughtTurn, ref thiefStoleOnTile, mapStat, summary))
+                            curTurnActor, startedOnFork, turnStartLandId, ref stepped, ref foughtOnTile, foughtTurn, ref thiefStoleOnTile,
+                            ref bossTargetLockedTurn, bossTargetClearedTurn, mapStat, summary))
                     {
                         decodeFailed = true;
                         break;

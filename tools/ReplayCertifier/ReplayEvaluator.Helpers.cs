@@ -12,7 +12,7 @@ namespace MonsterPathPredictor.ReplayCertifier
         private static bool IsStateFrame(int cmd)
         {
             return cmd == 1003 || cmd == 1016 || cmd == 1113 || cmd == 1018 || cmd == 5022 ||
-                   cmd == 1040 || cmd == 1096 || cmd == 5214 || cmd == 1007 || cmd == 1115 || cmd == 5028;
+                   cmd == 1040 || cmd == 1086 || cmd == 1096 || cmd == 5214 || cmd == 1007 || cmd == 1115 || cmd == 5028;
         }
 
         private static (List<(int CmdId, byte[] Payload)> Frames, bool IsTruncated) ReadFrames(byte[] bytes)
@@ -141,6 +141,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                 case 1018: return decoder.TryDecode("party.protocol.MonsterRefreshS2C", payload) != null;
                 case 5022: return decoder.TryDecode("party.protocol.ThrowDiceS2C", payload) != null;
                 case 1040: return decoder.TryDecode("party.protocol.UpdateHeroAttrS2C", payload) != null;
+                case 1086: return decoder.TryDecode("party.protocol.MapIndexChangeS2C", payload) != null;
                 case 1096: return decoder.TryDecode("party.protocol.HeroSkillMoveEffectS2C", payload) != null;
                 case 5214: return decoder.TryDecode("party.protocol.MonsterPursuitS2C", payload) != null;
                 case 1007: return decoder.TryDecode("party.protocol.BattleS2C", payload) != null;
@@ -181,6 +182,10 @@ namespace MonsterPathPredictor.ReplayCertifier
                 CrimeNum = (int)h.CrimeNum,
                 NotSelect = (bool)h.NotSelect
             };
+            if (isMonster)
+            {
+                try { u.BossTargetId = (long)h.BossTargetId; } catch { }
+            }
             if (h.Buffs != null)
             {
                 foreach (dynamic kv in (IEnumerable)h.Buffs)
@@ -194,6 +199,51 @@ namespace MonsterPathPredictor.ReplayCertifier
                     }
             }
             return u;
+        }
+
+        private static bool HasEmptyCausePlaceEffect(dynamic attr)
+        {
+            if (attr?.EffectDatas == null) return false;
+            int causeId = 0;
+            try { if (attr.Cause != null) causeId = (int)attr.Cause.Id; } catch { }
+            if (causeId != 0) return false;
+            foreach (dynamic eff in (IEnumerable)attr.EffectDatas)
+            {
+                if (eff?.Place?.Place != null && (int)eff.Place.Place.NodeId >= 0) return true;
+            }
+            return false;
+        }
+
+        private static void TryLockTurnStartBossTarget(UnitSim m, BoardGraph board, Dictionary<long, UnitSim> players, int turnStartLandId)
+        {
+            if (m == null || board == null || players == null) return;
+            if (m.HeroId != 1018 && m.HeroId != 1047) return;
+            int startLand = turnStartLandId >= 0 ? turnStartLandId : m.NodeId;
+            if (!board.Contains(startLand)) return;
+
+            int requiredBuff = m.HeroId == 1018 ? 2101001 : 10470101;
+            long bestId = 0;
+            int bestDist = int.MaxValue;
+            int bestSlot = int.MaxValue;
+            foreach (var p in players.Values)
+            {
+                if (p == null || p.Hp <= 0 || p.NotSelect) continue;
+                if (!board.Contains(p.NodeId) || p.NodeId == startLand) continue;
+                if (!p.BuffIds.Contains(requiredBuff)) continue;
+                int dist = board.ComputeShortestPathsTo(p.NodeId).GetDistance(startLand);
+                if (dist == int.MaxValue || dist <= 0) continue;
+                if (dist < bestDist ||
+                    (dist == bestDist && (p.Slot < bestSlot || (p.Slot == bestSlot && p.Id < bestId))))
+                {
+                    bestDist = dist;
+                    bestSlot = p.Slot;
+                    bestId = p.Id;
+                }
+            }
+            if (bestId != 0)
+            {
+                m.BossTargetId = bestId;
+            }
         }
 
         private static SkillMoveKind IdentifyActiveDisplacementSkill(int skillId)

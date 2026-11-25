@@ -51,20 +51,23 @@ namespace MonsterPathPredictor.Core
             public int FromLandId;
             public bool HasEncounteredPlayer;
             public int ClearedMarkLandId;
+            public bool BossTargetCleared;
 
-            public WalkStateKey(int landId, int fromLandId, bool hasEncounteredPlayer, int clearedMarkLandId = -1)
+            public WalkStateKey(int landId, int fromLandId, bool hasEncounteredPlayer, int clearedMarkLandId = -1, bool bossTargetCleared = false)
             {
                 LandId = landId;
                 FromLandId = fromLandId;
                 HasEncounteredPlayer = hasEncounteredPlayer;
                 ClearedMarkLandId = clearedMarkLandId;
+                BossTargetCleared = bossTargetCleared;
             }
 
             public bool Equals(WalkStateKey other) =>
                 LandId == other.LandId &&
                 FromLandId == other.FromLandId &&
                 HasEncounteredPlayer == other.HasEncounteredPlayer &&
-                ClearedMarkLandId == other.ClearedMarkLandId;
+                ClearedMarkLandId == other.ClearedMarkLandId &&
+                BossTargetCleared == other.BossTargetCleared;
 
             public override bool Equals(object obj) => obj is WalkStateKey other && Equals(other);
 
@@ -76,6 +79,7 @@ namespace MonsterPathPredictor.Core
                     h = (h * 397) ^ FromLandId;
                     h = (h * 397) ^ (HasEncounteredPlayer ? 1 : 0);
                     h = (h * 397) ^ ClearedMarkLandId;
+                    h = (h * 397) ^ (BossTargetCleared ? 1 : 0);
                     return h;
                 }
             }
@@ -88,14 +92,16 @@ namespace MonsterPathPredictor.Core
             public int StepIndex;
             public bool AfterCombat;
             public int ClearedMarkLandId;
+            public bool BossTargetCleared;
 
-            public ForkRecordKey(int landId, int fromLandId, int stepIndex, bool afterCombat, int clearedMarkLandId)
+            public ForkRecordKey(int landId, int fromLandId, int stepIndex, bool afterCombat, int clearedMarkLandId, bool bossTargetCleared)
             {
                 LandId = landId;
                 FromLandId = fromLandId;
                 StepIndex = stepIndex;
                 AfterCombat = afterCombat;
                 ClearedMarkLandId = clearedMarkLandId;
+                BossTargetCleared = bossTargetCleared;
             }
 
             public bool Equals(ForkRecordKey other) =>
@@ -103,7 +109,8 @@ namespace MonsterPathPredictor.Core
                 FromLandId == other.FromLandId &&
                 StepIndex == other.StepIndex &&
                 AfterCombat == other.AfterCombat &&
-                ClearedMarkLandId == other.ClearedMarkLandId;
+                ClearedMarkLandId == other.ClearedMarkLandId &&
+                BossTargetCleared == other.BossTargetCleared;
 
             public override bool Equals(object obj) => obj is ForkRecordKey other && Equals(other);
 
@@ -116,6 +123,7 @@ namespace MonsterPathPredictor.Core
                     h = (h * 397) ^ StepIndex;
                     h = (h * 397) ^ (AfterCombat ? 1 : 0);
                     h = (h * 397) ^ ClearedMarkLandId;
+                    h = (h * 397) ^ (BossTargetCleared ? 1 : 0);
                     return h;
                 }
             }
@@ -180,11 +188,13 @@ namespace MonsterPathPredictor.Core
             var tileStepHasPreCombat = new HashSet<int>();
 
             bool initialCombatState = monster.HasLaunchedFightThisTurn || monster.JustFoughtOnCurrentFork;
+            long turnBossTargetId = ResolveTurnBossTargetId(board, monster, activePlayers, shortestPathCache, out bool freshMarkedAtTurnStart);
+            bool initialBossTargetCleared = monster.BossTargetClearedThisTurn;
             RecordTileStep(tileStepMap, tileStepHasPreCombat, monster.CurrentLandId, step: 0, probability: 1.0, isAfterCombat: initialCombatState);
 
             var currentLayer = new Dictionary<WalkStateKey, (double Prob, double LogProb)>
             {
-                [new WalkStateKey(monster.CurrentLandId, monster.FromLandId, initialCombatState, -1)] = (1.0, 0.0)
+                [new WalkStateKey(monster.CurrentLandId, monster.FromLandId, initialCombatState, -1, initialBossTargetCleared)] = (1.0, 0.0)
             };
 
             for (int step = 0; step < maxSteps && currentLayer.Count > 0; step++)
@@ -205,6 +215,7 @@ namespace MonsterPathPredictor.Core
 
                     bool postCombatNow = state.HasEncounteredPlayer;
                     int clearedMarkLandId = state.ClearedMarkLandId;
+                    bool bossTargetClearedNow = state.BossTargetCleared;
                     bool encounteredOnThisTile = false;
 
                     // When stepping onto a tile occupied by living player(s) during the walk (step > 0):
@@ -220,6 +231,11 @@ namespace MonsterPathPredictor.Core
                             if (monster.ChasesProblemStudent && AnyHasProblemStudentMark(targetsHere))
                             {
                                 clearedMarkLandId = state.LandId;
+                            }
+                            if ((monster.ChasesProblemStudent || monster.ChasesMandarinDuckMark) &&
+                                AnyMatchesBossTargetOrMark(monster, turnBossTargetId, targetsHere))
+                            {
+                                bossTargetClearedNow = true;
                             }
                             RecordCombat(combatMap, state.LandId, step, arrivalProb, targetsHere, isSteal: false);
 
@@ -248,16 +264,19 @@ namespace MonsterPathPredictor.Core
                     }
 
                     StepOutcome outcome = step == 0
-                        ? DecideFirstStep(board, monster, activePlayers, shortestPathCache, options.PostCombatMode)
+                        ? DecideFirstStep(board, monster, players, activePlayers, turnBossTargetId, freshMarkedAtTurnStart, bossTargetClearedNow, shortestPathCache, options.PostCombatMode)
                         : DecideMidWalkStep(
                             board,
                             monster,
                             state.LandId,
                             state.FromLandId,
+                            players,
                             activePlayers,
                             encounteredOnThisTile,
                             postCombatNow,
                             clearedMarkLandId,
+                            turnBossTargetId,
+                            bossTargetClearedNow,
                             shortestPathCache,
                             options);
 
@@ -269,7 +288,7 @@ namespace MonsterPathPredictor.Core
 
                     if (outcome.IsForkDecision)
                     {
-                        RecordFork(board, forkMap, state.LandId, state.FromLandId, step, arrivalProb, arrivalLogProb, postCombatNow, clearedMarkLandId, outcome);
+                        RecordFork(board, forkMap, state.LandId, state.FromLandId, step, arrivalProb, arrivalLogProb, postCombatNow, clearedMarkLandId, bossTargetClearedNow, outcome);
                         if (step == 0 && string.IsNullOrEmpty(plan.HeadlineNote))
                         {
                             plan.HeadlineNote = outcome.SummaryLabel;
@@ -319,7 +338,7 @@ namespace MonsterPathPredictor.Core
 
                         RecordTileStep(tileStepMap, tileStepHasPreCombat, nextId, step + 1, branchProb, postCombatNow);
 
-                        var nextKey = new WalkStateKey(nextId, state.LandId, postCombatNow, clearedMarkLandId);
+                        var nextKey = new WalkStateKey(nextId, state.LandId, postCombatNow, clearedMarkLandId, bossTargetClearedNow);
                         if (nextLayer.TryGetValue(nextKey, out var existing))
                             nextLayer[nextKey] = (existing.Prob + branchProb, BoardGraph.LogAddExp(existing.LogProb, branchLogProb));
                         else
@@ -456,7 +475,11 @@ namespace MonsterPathPredictor.Core
         private static StepOutcome DecideFirstStep(
             BoardGraph board,
             MonsterState monster,
+            IReadOnlyList<TrackedPlayer> allPlayers,
             List<TrackedPlayer> activePlayers,
+            long lockedBossTargetId,
+            bool freshMarkedAtTurnStart,
+            bool bossTargetCleared,
             Dictionary<int, ShortestPathField> cache,
             PostCombatMode postCombatMode)
         {
@@ -475,31 +498,33 @@ namespace MonsterPathPredictor.Core
                 return tauntOutcome;
             }
 
-            // 0.5 Marked-target free-direction override:
-            //   - 1018 学院安全官 (魔法学院/海选赛运动场) -> 【问题学生】 (buff 2101001)
-            //   - 1047 铜盏鸳鸯 (园林中庭) -> buff 10470101
-            //   Allows overriding facing / U-turning before combat at turn start (straight road or fork) and at mid-walk forks
-            //   (excluding players standing on the monster's turn-start tile, which monsters never engage on that turn).
+            // 0.5 BossTargetId / Marked-target free-direction override:
+            //   - 1018 学院安全官 (魔法学院/海选赛运动场) -> 【问题学生】 (buff 2101001) + Hero.BossTargetId
+            //   - 1047 铜盏鸳鸯 (园林中庭) -> buff 10470101 + Hero.BossTargetId
+            //   At turn start (!IsCurrentlyMovingMidTurn), overrides facing/ForkStart ONLY when a living marked player
+            //   triggers fresh lock-on (otherwise retains old BossTargetId for mid-walk forks while obeying Front/Red>Blue).
+            //   At mid-walk forks (IsCurrentlyMovingMidTurn && isFork), freely U-turns toward lockedBossTargetId
+            //   (including PostNormalCombatMidFork after fighting an unmarked player) until fighting the locked target.
             int excludedTurnStartLand = ResolveExcludedTurnStartLandId(monster, isMidTurn: monster.IsCurrentlyMovingMidTurn);
-            if ((!monster.IsCurrentlyMovingMidTurn || isFork) &&
-                !monster.JustFoughtOnCurrentFork && !monster.HasLaunchedFightThisTurn &&
+            bool canUseBossTargetAtStep0 = monster.IsCurrentlyMovingMidTurn ? isFork : freshMarkedAtTurnStart;
+            if (canUseBossTargetAtStep0 &&
+                !monster.JustFoughtOnCurrentFork &&
+                !bossTargetCleared &&
+                !(monster.HasLaunchedFightThisTurn && postCombatMode == PostCombatMode.RedBlueAfterCombat) &&
                 monster.SkillMoveKind == SkillMoveKind.None &&
-                (monster.ChasesProblemStudent || monster.ChasesMandarinDuckMark))
+                (monster.ChasesProblemStudent || monster.ChasesMandarinDuckMark) &&
+                lockedBossTargetId != 0 &&
+                TryDecideLockedBossTargetStep(
+                    board,
+                    cur,
+                    isFork,
+                    lockedBossTargetId,
+                    allPlayers,
+                    cache,
+                    monster.ChasesProblemStudent ? "追问题生" : "追标记",
+                    out var bossOutcome))
             {
-                var marked = GetPriorityMarkedPlayers(monster, activePlayers, clearedMarkLandId: -1, excludedTurnStartLandId: excludedTurnStartLand);
-                if (marked.Count > 0 &&
-                    TryDecideMarkedTargetTurnStartStep(
-                        board,
-                        cur,
-                        isFork,
-                        excludedTurnStartLand,
-                        marked,
-                        cache,
-                        monster.ChasesProblemStudent ? "追问题生" : "追标记",
-                        out var markOutcome))
-                {
-                    return markOutcome;
-                }
+                return bossOutcome;
             }
 
             // 1. Skill displacement rules (Bilibili video section 4)
@@ -576,6 +601,7 @@ namespace MonsterPathPredictor.Core
                     activePlayers,
                     clearedMarkLandId: -1,
                     excludedTurnStartLandId: excludedTurnStartLand,
+                    bossTargetCleared: bossTargetCleared,
                     cache: cache,
                     isAfterCombat: monster.HasLaunchedFightThisTurn);
             }
@@ -639,10 +665,22 @@ namespace MonsterPathPredictor.Core
                 case SkillMoveKind.LinglingPush:
                     if (isFork)
                     {
-                        int exclude = board.IsValidNeighbor(cur, monster.SkillMovePushFromLandId)
-                            ? monster.SkillMovePushFromLandId
-                            : -1;
-                        if (board.TryGetPriorityForwardNeighbor(cur, exclude, out int nextId, out bool isGlobalRed))
+                        var frontOnFork = FilterValidNeighbors(board, cur, monster.FrontNodeIds);
+                        bool resolved;
+                        int nextId;
+                        bool isGlobalRed;
+                        if (frontOnFork.Count > 0)
+                        {
+                            resolved = board.TryGetPriorityAmongCandidates(cur, frontOnFork, out nextId, out isGlobalRed);
+                        }
+                        else
+                        {
+                            int exclude = board.IsValidNeighbor(cur, monster.SkillMovePushFromLandId)
+                                ? monster.SkillMovePushFromLandId
+                                : -1;
+                            resolved = board.TryGetPriorityForwardNeighbor(cur, exclude, out nextId, out isGlobalRed);
+                        }
+                        if (resolved)
                         {
                             string tag = isGlobalRed ? "玲玲·红箭" : "玲玲·蓝箭";
                             return SingleTransition(nextId, isForkDecision: true, ForkReasonKind.SkillLinglingRedBlue, tag);
@@ -670,10 +708,13 @@ namespace MonsterPathPredictor.Core
             MonsterState monster,
             int landId,
             int fromLandId,
+            IReadOnlyList<TrackedPlayer> allPlayers,
             List<TrackedPlayer> activePlayers,
             bool combatHappenedOnThisTile,
             bool isAfterCombat,
             int clearedMarkLandId,
+            long lockedBossTargetId,
+            bool bossTargetCleared,
             Dictionary<int, ShortestPathField> cache,
             PlanOptions options)
         {
@@ -718,31 +759,29 @@ namespace MonsterPathPredictor.Core
                 return midTauntOutcome;
             }
 
-            // Marked-target free-direction chase at mid-walk forks BEFORE combat:
-            // 1047 铜盏鸳鸯 and 1018 学院安全官 may U-turn at a pre-combat mid-walk fork toward a still-marked player
-            // (excluding players standing on the monster's turn-start tile). Once combat occurs, no more U-turning,
-            // while turn-start exclusion remains consistent with DecideFirstStep across both pre- and post-combat forks.
+            // BossTargetId / Marked-target free-direction chase at mid-walk forks:
+            // 1047 铜盏鸳鸯 and 1018 学院安全官 freely U-turn toward their locked BossTargetId
+            // (even after fighting an unmarked player on a normal tile, or if mark expired / target died),
+            // until they engage the locked/marked target itself (bossTargetCleared == true).
             int excludedTurnStartLand = ResolveExcludedTurnStartLandId(monster, isMidTurn: true);
-            if (!isAfterCombat && monster != null && (monster.ChasesMandarinDuckMark || monster.ChasesProblemStudent))
+            if (!combatHappenedOnThisTile && !bossTargetCleared &&
+                monster != null && (monster.ChasesMandarinDuckMark || monster.ChasesProblemStudent) &&
+                lockedBossTargetId != 0 &&
+                TryDecideLockedBossTargetStep(
+                    board,
+                    landId,
+                    isForkDecision: true,
+                    lockedBossTargetId,
+                    allPlayers,
+                    cache,
+                    monster.ChasesProblemStudent ? "追问题生" : "追标记",
+                    out var bossOutcome))
             {
-                var marked = GetPriorityMarkedPlayers(monster, activePlayers, clearedMarkLandId, excludedTurnStartLand);
-                if (marked.Count > 0 &&
-                    TryDecideMarkedTargetTurnStartStep(
-                        board,
-                        landId,
-                        isForkDecision: true,
-                        excludedTurnStartLand,
-                        marked,
-                        cache,
-                        monster.ChasesProblemStudent ? "追问题生" : "追标记",
-                        out var markOutcome))
-                {
-                    return markOutcome;
-                }
+                return bossOutcome;
             }
 
             // Canonical guide rule: "之后再遇岔，看当时站位"
-            return EvaluateMidWalkFork(board, monster, landId, fromLandId, activePlayers, clearedMarkLandId, excludedTurnStartLand, cache, isAfterCombat);
+            return EvaluateMidWalkFork(board, monster, landId, fromLandId, activePlayers, clearedMarkLandId, excludedTurnStartLand, bossTargetCleared, cache, isAfterCombat);
         }
 
         private static StepOutcome EvaluateMidWalkFork(
@@ -753,6 +792,7 @@ namespace MonsterPathPredictor.Core
             List<TrackedPlayer> activePlayers,
             int clearedMarkLandId,
             int excludedTurnStartLandId,
+            bool bossTargetCleared,
             Dictionary<int, ShortestPathField> cache,
             bool isAfterCombat)
         {
@@ -781,7 +821,7 @@ namespace MonsterPathPredictor.Core
                 }
                 int d = field.GetDistance(forkLandId);
                 if (d == int.MaxValue || d <= 0) continue;
-                int tier = IsPriorityMarked(monster, p, clearedMarkLandId, excludedTurnStartLandId) ? 0 : 1;
+                int tier = !bossTargetCleared && IsPriorityMarked(monster, p, clearedMarkLandId, excludedTurnStartLandId) ? 0 : 1;
                 ranked.Add((p, tier, d, field));
             }
 
@@ -1017,9 +1057,10 @@ namespace MonsterPathPredictor.Core
             double arrivalLogProb,
             bool isAfterCombat,
             int clearedMarkLandId,
+            bool bossTargetCleared,
             StepOutcome outcome)
         {
-            var key = new ForkRecordKey(forkLandId, incomingLandId, stepIndex, isAfterCombat, clearedMarkLandId);
+            var key = new ForkRecordKey(forkLandId, incomingLandId, stepIndex, isAfterCombat, clearedMarkLandId, bossTargetCleared);
             var validAll = board.GetValidNeighbors(forkLandId);
             int globalRed = validAll.Count > 0 ? validAll[0] : -1;
 
@@ -1304,94 +1345,6 @@ namespace MonsterPathPredictor.Core
             return dict;
         }
 
-        private static bool TryDecideMarkedTargetTurnStartStep(
-            BoardGraph board,
-            int curLandId,
-            bool isForkDecision,
-            int excludeLandId,
-            List<TrackedPlayer> markedPlayers,
-            Dictionary<int, ShortestPathField> cache,
-            string labelPrefix,
-            out StepOutcome outcome)
-        {
-            outcome = default;
-            TrackedPlayer bestTarget = null;
-            ShortestPathField bestField = null;
-            int bestDist = int.MaxValue;
-
-            for (int i = 0; i < markedPlayers.Count; i++)
-            {
-                var p = markedPlayers[i];
-                if (p.LandId == curLandId) continue;
-                if (excludeLandId >= 0 && p.LandId == excludeLandId) continue;
-                if (!cache.TryGetValue(p.LandId, out var field))
-                {
-                    field = board.ComputeShortestPathsTo(p.LandId);
-                    cache[p.LandId] = field;
-                }
-                int d = field.GetDistance(curLandId);
-                if (d == int.MaxValue || d <= 0) continue;
-
-                if (d < bestDist ||
-                    (d == bestDist && bestTarget != null &&
-                     (p.Slot < bestTarget.Slot || (p.Slot == bestTarget.Slot && p.PlayerId < bestTarget.PlayerId))))
-                {
-                    bestDist = d;
-                    bestTarget = p;
-                    bestField = field;
-                }
-            }
-
-            if (bestTarget == null || bestField == null) return false;
-
-            var all = board.GetValidNeighbors(curLandId);
-            var bestExits = new List<(int NextLandId, double LogC, long ExactC)>();
-            double logTotal = double.NegativeInfinity;
-            bool exactAllEqual = true;
-            long firstExactC = -1;
-            for (int i = 0; i < all.Count; i++)
-            {
-                int nb = all[i];
-                if (bestField.GetDistance(nb) != bestDist - 1) continue;
-                double logC = bestField.GetLogPathCount(nb);
-                if (double.IsNegativeInfinity(logC)) continue;
-                long exactC = -1;
-                if (bestField.TryGetExactPathCount(nb, out long cL) && cL > 0)
-                {
-                    exactC = cL;
-                    if (firstExactC < 0) firstExactC = cL;
-                    else if (cL != firstExactC) exactAllEqual = false;
-                }
-                else
-                {
-                    exactAllEqual = false;
-                }
-                bestExits.Add((nb, logC, exactC));
-                logTotal = BoardGraph.LogAddExp(logTotal, logC);
-            }
-            if (bestExits.Count == 0 || double.IsNegativeInfinity(logTotal)) return false;
-
-            bool isExactUniform = bestExits.Count >= 2 && exactAllEqual && firstExactC > 0;
-            var transitions = new List<StepTransition>(bestExits.Count);
-            for (int i = 0; i < bestExits.Count; i++)
-            {
-                double logP = bestExits[i].LogC - logTotal;
-                double prob = isExactUniform ? (1.0 / bestExits.Count) : Math.Min(1.0, Math.Exp(logP));
-                transitions.Add(new StepTransition(bestExits[i].NextLandId, prob, logP));
-            }
-            transitions.Sort((a, b) => b.LogProb.CompareTo(a.LogProb));
-
-            outcome = new StepOutcome
-            {
-                Transitions = transitions,
-                IsForkDecision = isForkDecision,
-                Reason = ForkReasonKind.MarkedTargetChase,
-                SummaryLabel = labelPrefix + "·" + bestTarget.SeatTag + "·距" + bestDist,
-                IsExactUniformSplit = isExactUniform
-            };
-            return true;
-        }
-
         private static List<TrackedPlayer> FilterEffectivePlayers(
             BoardGraph board,
             MonsterState monster,
@@ -1449,6 +1402,156 @@ namespace MonsterPathPredictor.Core
                 if (clearedMarkLandId >= 0 && p.LandId == clearedMarkLandId) return false;
                 if (excludedTurnStartLandId >= 0 && p.LandId == excludedTurnStartLandId) return false;
                 return true;
+            }
+            return false;
+        }
+
+        private static long ResolveTurnBossTargetId(
+            BoardGraph board,
+            MonsterState monster,
+            List<TrackedPlayer> activePlayers,
+            Dictionary<int, ShortestPathField> cache,
+            out bool freshMarkedAtTurnStart)
+        {
+            freshMarkedAtTurnStart = false;
+            if (monster == null || monster.BossTargetClearedThisTurn) return 0;
+            if (!monster.ChasesProblemStudent && !monster.ChasesMandarinDuckMark) return 0;
+
+            // Mid-turn: once the server has locked BossTargetId, honor it directly until cleared by fighting it.
+            if (monster.IsCurrentlyMovingMidTurn && monster.BossTargetPlayerId != 0)
+            {
+                return monster.BossTargetPlayerId;
+            }
+
+            // Turn start (or mid-turn without an explicit server BossTargetId): pick nearest living marked player
+            // outside the monster's turn-start tile; if none exists, retain any previously locked BossTargetPlayerId
+            // (which persists across turns for mid-walk forks even after mark expiration or target death,
+            // while NOT overriding turn-start Front/ForkStart Red>Blue).
+            int excludedTurnStartLand = ResolveExcludedTurnStartLandId(monster, isMidTurn: monster.IsCurrentlyMovingMidTurn);
+            var marked = GetPriorityMarkedPlayers(monster, activePlayers, clearedMarkLandId: -1, excludedTurnStartLandId: excludedTurnStartLand);
+            if (marked.Count > 0)
+            {
+                TrackedPlayer bestTarget = null;
+                int bestDist = int.MaxValue;
+                int cur = monster.CurrentLandId;
+                for (int i = 0; i < marked.Count; i++)
+                {
+                    var p = marked[i];
+                    if (p.LandId == cur) continue;
+                    if (excludedTurnStartLand >= 0 && p.LandId == excludedTurnStartLand) continue;
+                    if (!cache.TryGetValue(p.LandId, out var field))
+                    {
+                        field = board.ComputeShortestPathsTo(p.LandId);
+                        cache[p.LandId] = field;
+                    }
+                    int d = field.GetDistance(cur);
+                    if (d == int.MaxValue || d <= 0) continue;
+                    if (d < bestDist ||
+                        (d == bestDist && bestTarget != null &&
+                         (p.Slot < bestTarget.Slot || (p.Slot == bestTarget.Slot && p.PlayerId < bestTarget.PlayerId))))
+                    {
+                        bestDist = d;
+                        bestTarget = p;
+                    }
+                }
+                if (bestTarget != null)
+                {
+                    freshMarkedAtTurnStart = !monster.IsCurrentlyMovingMidTurn;
+                    return bestTarget.PlayerId;
+                }
+            }
+
+            return monster.BossTargetPlayerId;
+        }
+
+        private static bool TryDecideLockedBossTargetStep(
+            BoardGraph board,
+            int curLandId,
+            bool isForkDecision,
+            long bossTargetPlayerId,
+            IReadOnlyList<TrackedPlayer> allPlayers,
+            Dictionary<int, ShortestPathField> cache,
+            string labelPrefix,
+            out StepOutcome outcome)
+        {
+            outcome = default;
+            if (bossTargetPlayerId == 0 || allPlayers == null) return false;
+            TrackedPlayer target = null;
+            for (int i = 0; i < allPlayers.Count; i++)
+            {
+                var p = allPlayers[i];
+                if (p != null && p.PlayerId == bossTargetPlayerId)
+                {
+                    target = p;
+                    break;
+                }
+            }
+            if (target == null || !board.Contains(target.LandId) || target.LandId == curLandId) return false;
+
+            if (!cache.TryGetValue(target.LandId, out var field))
+            {
+                field = board.ComputeShortestPathsTo(target.LandId);
+                cache[target.LandId] = field;
+            }
+            int bestDist = field.GetDistance(curLandId);
+            if (bestDist == int.MaxValue || bestDist <= 0) return false;
+
+            var all = board.GetValidNeighbors(curLandId);
+            var bestExits = new List<(int NextLandId, double LogC, long ExactC)>();
+            double logTotal = double.NegativeInfinity;
+            bool exactAllEqual = true;
+            long firstExactC = -1;
+            for (int i = 0; i < all.Count; i++)
+            {
+                int nb = all[i];
+                if (field.GetDistance(nb) != bestDist - 1) continue;
+                double logC = field.GetLogPathCount(nb);
+                if (double.IsNegativeInfinity(logC)) continue;
+                long exactC = -1;
+                if (field.TryGetExactPathCount(nb, out long cL) && cL > 0)
+                {
+                    exactC = cL;
+                    if (firstExactC < 0) firstExactC = cL;
+                    else if (cL != firstExactC) exactAllEqual = false;
+                }
+                else
+                {
+                    exactAllEqual = false;
+                }
+                bestExits.Add((nb, logC, exactC));
+                logTotal = BoardGraph.LogAddExp(logTotal, logC);
+            }
+            if (bestExits.Count == 0 || double.IsNegativeInfinity(logTotal)) return false;
+
+            bool isExactUniform = bestExits.Count >= 2 && exactAllEqual && firstExactC > 0;
+            var transitions = new List<StepTransition>(bestExits.Count);
+            for (int i = 0; i < bestExits.Count; i++)
+            {
+                double logP = bestExits[i].LogC - logTotal;
+                double prob = isExactUniform ? (1.0 / bestExits.Count) : Math.Min(1.0, Math.Exp(logP));
+                transitions.Add(new StepTransition(bestExits[i].NextLandId, prob, logP));
+            }
+            transitions.Sort((a, b) => b.LogProb.CompareTo(a.LogProb));
+
+            outcome = new StepOutcome
+            {
+                Transitions = transitions,
+                IsForkDecision = isForkDecision,
+                Reason = ForkReasonKind.MarkedTargetChase,
+                SummaryLabel = labelPrefix + "·" + target.SeatTag + "·距" + bestDist,
+                IsExactUniformSplit = isExactUniform
+            };
+            return true;
+        }
+
+        private static bool AnyMatchesBossTargetOrMark(MonsterState monster, long bossTargetPlayerId, List<TrackedPlayer> targets)
+        {
+            for (int i = 0; i < targets.Count; i++)
+            {
+                var p = targets[i];
+                if (bossTargetPlayerId != 0 && p.PlayerId == bossTargetPlayerId) return true;
+                if (monster.ChasesProblemStudent && p.HasProblemStudentMark) return true;
+                if (monster.ChasesMandarinDuckMark && p.HasMandarinDuckMark) return true;
             }
             return false;
         }

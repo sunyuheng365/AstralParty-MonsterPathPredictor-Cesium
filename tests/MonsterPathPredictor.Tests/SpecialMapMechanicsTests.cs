@@ -134,11 +134,21 @@ namespace MonsterPathPredictor.Tests
             var planSkipStart = MonsterPathEngine.Plan(board, preCombat, players, new PlanOptions { MaxSteps = 1 });
             Assert.Equal(27, planSkipStart.Forks.Single(f => f.ForkLandId == 28).Exits[0].NextLandId);
 
-            // 3. After combat this turn -> no more U-turning, continues forward to P2@26 (27)!
+            // 3a. After fighting an UNMARKED non-BossTarget player (BossTargetClearedThisTurn == false):
+            //     1047 retains locked BossTargetId and STILL U-turns back toward P1@33!
             preCombat.TurnStartLandId = 34;
             preCombat.HasLaunchedFightThisTurn = true;
-            var planPost = MonsterPathEngine.Plan(board, preCombat, players, new PlanOptions { MaxSteps = 1 });
-            Assert.Equal(27, planPost.Forks.Single(f => f.ForkLandId == 28).Exits[0].NextLandId);
+            preCombat.BossTargetPlayerId = 1;
+            preCombat.BossTargetClearedThisTurn = false;
+            var planPostUnmarked = MonsterPathEngine.Plan(board, preCombat, players, new PlanOptions { MaxSteps = 1 });
+            Assert.Equal(33, planPostUnmarked.Forks.Single(f => f.ForkLandId == 28).Exits[0].NextLandId);
+
+            // 3b. After fighting BossTargetId / a marked player (BossTargetClearedThisTurn == true):
+            //     BossTargetId is cleared for the rest of the turn -> no more U-turning, continues forward to P2@26 (27)!
+            preCombat.BossTargetPlayerId = 0;
+            preCombat.BossTargetClearedThisTurn = true;
+            var planPostCleared = MonsterPathEngine.Plan(board, preCombat, players, new PlanOptions { MaxSteps = 1 });
+            Assert.Equal(27, planPostCleared.Forks.Single(f => f.ForkLandId == 28).Exits[0].NextLandId);
         }
 
         [Fact]

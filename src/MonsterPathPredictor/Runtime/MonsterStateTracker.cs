@@ -36,6 +36,10 @@ namespace MonsterPathPredictor.Runtime
             public bool JustFoughtOnFork;
             public int CombatForkLandId = -1;
             public int CombatTurnSequence = -1;
+            public int BossTargetLockTurnSequence = -1;
+            public int BossTargetClearedTurnSequence = -1;
+            public long LastServerBossTargetId;
+            public long LastSeenBossTargetId;
             public int StolenTurnSequence = -1;
             public SkillMoveKind SkillMoveKind = SkillMoveKind.None;
             public int SkillMoveLandId = -1;
@@ -672,6 +676,34 @@ namespace MonsterPathPredictor.Runtime
                     }
                 }
 
+                int heroId = SafeHeroId(pd);
+                bool usesBossTarget = (heroId == 1018 || heroId == 1047);
+                long serverBossTargetId = usesBossTarget ? SafeBossTargetId(pd) : 0L;
+                if (usesBossTarget)
+                {
+                    if (serverBossTargetId != mem.LastServerBossTargetId)
+                    {
+                        mem.LastServerBossTargetId = serverBossTargetId;
+                        if (mem.BossTargetClearedTurnSequence != _turnSequence)
+                        {
+                            mem.LastSeenBossTargetId = serverBossTargetId;
+                        }
+                    }
+                    if (curActorId == mid &&
+                        mem.BossTargetLockTurnSequence != _turnSequence &&
+                        mem.BossTargetClearedTurnSequence != _turnSequence)
+                    {
+                        mem.BossTargetLockTurnSequence = _turnSequence;
+                        int turnStartAnchor = _activeActorStartLandId >= 0 ? _activeActorStartLandId : landId;
+                        long lockedMarkedId = FindNearestMarkedPlayerId(board, heroId, turnStartAnchor, players);
+                        if (lockedMarkedId != 0)
+                        {
+                            mem.LastSeenBossTargetId = lockedMarkedId;
+                        }
+                    }
+                }
+                long effectivePrevBossTarget = usesBossTarget ? mem.LastSeenBossTargetId : 0L;
+
                 // Stamp queued combat events ONLY when the monster is CURRENTLY still standing on the combat tile
                 // (matching current turn epoch/round). If the monster already moved past the combat tile before this
                 // snapshot, never write a stale CombatForkLandId that could fire on a later revisit to that fork.
@@ -681,6 +713,12 @@ namespace MonsterPathPredictor.Runtime
                     (combatEvt.ActiveActor == 0 || combatEvt.ActiveActor == mid) &&
                     curActorId == mid)
                 {
+                    if ((heroId == 1018 || heroId == 1047) && combatEvt.OpponentId != 0 &&
+                        DidFightBossTargetOrMark(heroId, effectivePrevBossTarget, combatEvt.OpponentId, players))
+                    {
+                        mem.BossTargetClearedTurnSequence = _turnSequence;
+                        mem.LastSeenBossTargetId = 0;
+                    }
                     int actualCombatTile = combatEvt.LandId >= 0
                         ? combatEvt.LandId
                         : ((!isNew && !movedSinceLastSnapshot) ? landId : -1);
@@ -725,13 +763,13 @@ namespace MonsterPathPredictor.Runtime
                 bool launchedFightThisTurn = (curActorId == mid) &&
                                              (SafeIsLaunchFight(pd) || (isThief && mem.StolenTurnSequence == _turnSequence));
 
-                int heroId = SafeHeroId(pd);
                 string monsterName = ResolveMonsterName(pd, heroId);
                 bool isNormalAggressive = IsNormalAggressiveMonster(pd);
                 bool isTaunted = TryReadTauntTarget(pd, heroIdToPlayerId, out long tauntTargetId);
                 bool requiresCrimeTarget = IsCrimeRestrictedMonster(pd, heroId, anyPlayerHasTrueCulprit);
                 int actionWeight = SafeActionWeight(pd);
                 SafeHp(pd, out int hp, out int maxHp);
+                bool bossTargetClearedThisTurn = (curActorId == mid) && (mem.BossTargetClearedTurnSequence == _turnSequence);
 
                 var state = new MonsterState
                 {
@@ -758,6 +796,8 @@ namespace MonsterPathPredictor.Runtime
                     RequiresCrimeTarget = requiresCrimeTarget,
                     ChasesProblemStudent = (heroId == 1018),
                     ChasesMandarinDuckMark = (heroId == 1047),
+                    BossTargetPlayerId = bossTargetClearedThisTurn ? 0L : (usesBossTarget ? mem.LastSeenBossTargetId : 0L),
+                    BossTargetClearedThisTurn = bossTargetClearedThisTurn,
                     SkillMoveKind = mem.SkillMoveLandId == landId ? mem.SkillMoveKind : SkillMoveKind.None,
                     SkillMovePushDirectionLandId = mem.SkillMoveLandId == landId ? mem.SkillMovePushDirId : -1,
                     SkillMovePushFromLandId = mem.SkillMoveLandId == landId ? mem.SkillMovePushFromId : -1
@@ -925,6 +965,7 @@ namespace MonsterPathPredictor.Runtime
         private struct PendingUnitCombat
         {
             public int LandId;
+            public long OpponentId;
             public long ActiveActor;
             public int TurnEpoch;
             public int Round;
@@ -987,6 +1028,7 @@ namespace MonsterPathPredictor.Runtime
                     combatByUnit[c.AttackerId] = new PendingUnitCombat
                     {
                         LandId = c.AttackerLandId,
+                        OpponentId = c.DefenderId,
                         ActiveActor = c.ActiveActorAtEvent,
                         TurnEpoch = c.TurnEpoch,
                         Round = c.Round
@@ -995,6 +1037,7 @@ namespace MonsterPathPredictor.Runtime
                     combatByUnit[c.DefenderId] = new PendingUnitCombat
                     {
                         LandId = c.DefenderLandId,
+                        OpponentId = c.AttackerId,
                         ActiveActor = c.ActiveActorAtEvent,
                         TurnEpoch = c.TurnEpoch,
                         Round = c.Round
@@ -1547,6 +1590,88 @@ namespace MonsterPathPredictor.Runtime
             }
             catch { }
             return 0;
+        }
+
+        private static bool _bossTargetPropResolved;
+        private static MemberInfo _bossTargetPropMember;
+
+        private static long SafeBossTargetId(BattlePlayerData pd)
+        {
+            if (pd == null) return 0;
+            try
+            {
+                var prop = pd.Property;
+                if (prop != null)
+                {
+                    if (!_bossTargetPropResolved)
+                    {
+                        _bossTargetPropResolved = true;
+                        var t = prop.GetType();
+                        _bossTargetPropMember = (MemberInfo)t.GetProperty("BossTargetId", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                            ?? (MemberInfo)t.GetProperty("bossTargetId", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                            ?? (MemberInfo)t.GetField("BossTargetId", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                            ?? t.GetField("bossTargetId", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                    }
+                    if (_bossTargetPropMember != null)
+                    {
+                        object raw = _bossTargetPropMember is PropertyInfo pi ? pi.GetValue(prop) : ((FieldInfo)_bossTargetPropMember).GetValue(prop);
+                        if (raw is long lv && lv != 0) return lv;
+                        if (raw != null)
+                        {
+                            var valProp = raw.GetType().GetProperty("Value");
+                            if (valProp != null && valProp.GetValue(raw) is long rv && rv != 0) return rv;
+                        }
+                    }
+                }
+            }
+            catch { }
+            try
+            {
+                if (pd.player != null && pd.player.Hero != null) return pd.player.Hero.BossTargetId;
+            }
+            catch { }
+            return 0;
+        }
+
+        private static long FindNearestMarkedPlayerId(BoardGraph board, int monsterHeroId, int startLandId, List<TrackedPlayer> players)
+        {
+            if (board == null || !board.Contains(startLandId) || players == null) return 0;
+            long bestId = 0;
+            int bestDist = int.MaxValue;
+            int bestSlot = int.MaxValue;
+            for (int i = 0; i < players.Count; i++)
+            {
+                var p = players[i];
+                if (p == null || !p.IsAlive || !p.IsTargetable || !board.Contains(p.LandId) || p.LandId == startLandId) continue;
+                bool marked = (monsterHeroId == 1018 && p.HasProblemStudentMark) ||
+                              (monsterHeroId == 1047 && p.HasMandarinDuckMark);
+                if (!marked) continue;
+                int dist = board.ComputeShortestPathsTo(p.LandId).GetDistance(startLandId);
+                if (dist == int.MaxValue || dist <= 0) continue;
+                if (dist < bestDist ||
+                    (dist == bestDist && (p.Slot < bestSlot || (p.Slot == bestSlot && p.PlayerId < bestId))))
+                {
+                    bestDist = dist;
+                    bestSlot = p.Slot;
+                    bestId = p.PlayerId;
+                }
+            }
+            return bestId;
+        }
+
+        private static bool DidFightBossTargetOrMark(int monsterHeroId, long trackedBossTargetId, long opponentId, List<TrackedPlayer> players)
+        {
+            if (trackedBossTargetId != 0 && opponentId == trackedBossTargetId) return true;
+            if (players == null) return false;
+            for (int i = 0; i < players.Count; i++)
+            {
+                var p = players[i];
+                if (p == null || p.PlayerId != opponentId) continue;
+                if (monsterHeroId == 1018 && p.HasProblemStudentMark) return true;
+                if (monsterHeroId == 1047 && p.HasMandarinDuckMark) return true;
+                break;
+            }
+            return false;
         }
 
         private static bool IsCrimeRestrictedMonster(BattlePlayerData pd, int heroId, bool anyPlayerHasTrueCulprit)

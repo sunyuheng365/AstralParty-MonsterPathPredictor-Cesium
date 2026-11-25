@@ -106,6 +106,19 @@ namespace MonsterPathPredictor.Core
         /// </summary>
         public bool ChasesMandarinDuckMark { get; set; }
 
+        /// <summary>
+        /// Server-synchronized Hero.BossTargetId locked onto 1018 (学院安全官) or 1047 (铜盏鸳鸯).
+        /// Once locked, persists across turns (even if mark expires or target dies) and allows U-turns
+        /// until this monster fights its locked/marked target.
+        /// </summary>
+        public long BossTargetPlayerId { get; set; }
+
+        /// <summary>
+        /// True when a 1018/1047 monster already fought its locked BossTargetId or a marked target during
+        /// the current turn, suppressing further marked/BossTargetId chasing for the remainder of the turn.
+        /// </summary>
+        public bool BossTargetClearedThisTurn { get; set; }
+
         public SkillMoveKind SkillMoveKind { get; set; } = SkillMoveKind.None;
         public int SkillMovePushDirectionLandId { get; set; } = -1;
         public int SkillMovePushFromLandId { get; set; } = -1;

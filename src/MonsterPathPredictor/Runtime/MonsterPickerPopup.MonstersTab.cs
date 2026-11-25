@@ -105,7 +105,7 @@ namespace MonsterPathPredictor.Runtime
 
             int nameFontSize = rowHeight < 30f ? 13 : 14;
             float nameY = Math.Max(1f, (rowHeight - 20f) * 0.5f);
-            float nameW = Math.Max(64f, (rowW - 14f) * 0.54f);
+            PopupPagination.ComputeSplitRowGeometry(rowW, 6f, 0.54f, out float nameX, out float nameW, out float metaX, out float metaW);
             Color nameColor = isSelected ? AccentGold : (isActing ? AccentGreen : (hasActed ? TextMuted : TextPrimary));
 
             string rankTag = st.ActionOrderRank > 0 ? ("#" + st.ActionOrderRank + " ") : string.Empty;
@@ -120,41 +120,45 @@ namespace MonsterPathPredictor.Runtime
                 textFormat = new TextFormat { size = nameFontSize, bold = isSelected || isActing, color = nameColor },
                 text = prefix + rankTag + displayName
             };
-            nameTf.SetXY(6f, nameY);
-            nameTf.SetSize(nameW, Math.Min(22f, rowHeight - 2f));
+            nameTf.SetXY(nameX, nameY);
+            nameTf.SetSize(nameW, Math.Min(22f, Math.Max(8f, rowHeight - 2f)));
             row.AddChild(nameTf);
 
             int metaFontSize = rowHeight < 30f ? 11 : 12;
             float metaY = Math.Max(1f, (rowHeight - 18f) * 0.5f);
-            float metaX = 6f + nameW + 4f;
-            float metaW = Math.Max(28f, rowW - metaX - 6f);
             Color metaColor = isActing ? AccentGreen : (!st.IsNormalAggressive ? AccentCyan : TextMuted);
 
-            string hpPart = st.MaxHp > 0 ? ("HP " + st.Hp + "/" + st.MaxHp) : string.Empty;
+            string hpPart = st.MaxHp > 0
+                ? ("HP " + (st.HasHp ? st.Hp.ToString() : "?") + "/" + st.MaxHp)
+                : string.Empty;
             string tilePart = "格" + st.CurrentLandId;
             string statusPart = isActing
                 ? " 行动中"
                 : (hasActed ? " 已动" : (!st.IsNormalAggressive ? " 非主动" : string.Empty));
 
-            var metaTf = new GTextField
+            if (metaW >= 14f)
             {
-                touchable = false,
-                autoSize = AutoSizeType.None,
-                singleLine = true,
-                align = AlignType.Right,
-                textFormat = new TextFormat { size = metaFontSize, bold = isActing, color = metaColor },
-                text = tilePart + (hpPart.Length > 0 ? " " + hpPart : string.Empty) + statusPart
-            };
-            metaTf.SetXY(metaX, metaY);
-            metaTf.SetSize(metaW, Math.Min(20f, rowHeight - 2f));
-            row.AddChild(metaTf);
+                var metaTf = new GTextField
+                {
+                    touchable = false,
+                    autoSize = AutoSizeType.None,
+                    singleLine = true,
+                    align = AlignType.Right,
+                    textFormat = new TextFormat { size = metaFontSize, bold = isActing, color = metaColor },
+                    text = tilePart + (hpPart.Length > 0 ? " " + hpPart : string.Empty) + statusPart
+                };
+                metaTf.SetXY(metaX, metaY);
+                metaTf.SetSize(metaW, Math.Min(20f, Math.Max(8f, rowHeight - 2f)));
+                row.AddChild(metaTf);
+            }
 
             long capturedId = st.MonsterId;
+            int capturedMatchGen = _currentMatchGen;
             row.onRollOver.Add(() => DrawRowBg(bg, rowW, rowHeight, isSelected, hasActed, hovered: true));
             row.onRollOut.Add(() => DrawRowBg(bg, rowW, rowHeight, isSelected, hasActed, hovered: false));
             row.onClick.Add(() =>
             {
-                MonsterSelected?.Invoke(capturedId);
+                MonsterSelected?.Invoke(capturedId, capturedMatchGen);
                 if (_closeOnSelect) Hide();
             });
             return row;

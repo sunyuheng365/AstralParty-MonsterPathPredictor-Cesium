@@ -54,6 +54,7 @@ namespace MonsterPathPredictor.Runtime
             public int LastFontSize;
             public Color LastColor;
             public bool LastCompact;
+            public float LastMaxWidth;
             public float Width;
             public float Height;
             public float LastX;
@@ -75,9 +76,6 @@ namespace MonsterPathPredictor.Runtime
         private readonly Dictionary<long, int> _forkExitLabelStack = new Dictionary<long, int>();
         private readonly Dictionary<long, float> _forkExitNextTopY = new Dictionary<long, float>();
         private readonly HashSet<int> _drawnGhostRingTiles = new HashSet<int>();
-        private readonly HashSet<long> _multiBranchEdgeKeys = new HashSet<long>();
-        private readonly HashSet<int> _roundedSplitTiles = new HashSet<int>();
-        private readonly Queue<int> _splitBfsQueue = new Queue<int>();
         private readonly HashSet<int> _combatLandSet = new HashSet<int>();
         private readonly List<DashQuad> _dashQuadBuf = new List<DashQuad>(32);
         private readonly List<Vector2> _vertBuf = new List<Vector2>(4);
@@ -115,8 +113,8 @@ namespace MonsterPathPredictor.Runtime
         public GComponent EnsureLayer()
         {
             if (_layer != null && !_layer.isDisposed && _layer.parent == GRoot.inst &&
-                _lineLayer != null && !_lineLayer.isDisposed &&
-                _pillLayer != null && !_pillLayer.isDisposed)
+                _lineLayer != null && !_lineLayer.isDisposed && _lineLayer.parent == _layer &&
+                _pillLayer != null && !_pillLayer.isDisposed && _pillLayer.parent == _layer)
             {
                 float w = GRoot.inst.width;
                 float h = GRoot.inst.height;
@@ -170,8 +168,14 @@ namespace MonsterPathPredictor.Runtime
             {
                 try
                 {
-                    var root = _pillPool[i]?.Root;
-                    if (root != null && !root.isDisposed && root.visible) root.visible = false;
+                    var p = _pillPool[i];
+                    if (p == null) continue;
+                    if (p.Root != null && !p.Root.isDisposed && p.Root.visible) p.Root.visible = false;
+                    if (force)
+                    {
+                        if (p.Bg != null && !p.Bg.isDisposed && p.Bg.parent != p.Root) p.Bg.visible = false;
+                        if (p.Text != null && !p.Text.isDisposed && p.Text.parent != p.Root) p.Text.visible = false;
+                    }
                 }
                 catch { }
             }
@@ -258,7 +262,7 @@ namespace MonsterPathPredictor.Runtime
                     string headerText = !string.IsNullOrEmpty(note)
                         ? plan.MonsterName + " (" + note + ")"
                         : plan.MonsterName;
-                    DrawPillLabel(new Point2(headerPt.X, headerPt.Y - 12f), headerText, Math.Max(13, settings.FontSize - 2), hasVirtualGhosts ? VirtualGhostColor : RingColor);
+                    DrawPillLabel(new Point2(headerPt.X, headerPt.Y - 12f), headerText, Math.Max(13, settings.FontSize - 2), hasVirtualGhosts ? VirtualGhostColor : RingColor, layer.width, layer.height);
                 }
 
                 // 1. Highlight dot on the selected monster's starting tile
@@ -276,38 +280,6 @@ namespace MonsterPathPredictor.Runtime
 
             if (hasMonsterPlan)
             {
-                _multiBranchEdgeKeys.Clear();
-                _roundedSplitTiles.Clear();
-                _splitBfsQueue.Clear();
-                for (int fi = 0; fi < plan.Forks.Count; fi++)
-                {
-                    var fk = plan.Forks[fi];
-                    if (!fk.HasMultipleBranches) continue;
-                    for (int ei = 0; ei < fk.Exits.Count; ei++)
-                    {
-                        var ex = fk.Exits[ei];
-                        _multiBranchEdgeKeys.Add(((long)fk.ForkLandId << 32) ^ (uint)ex.NextLandId);
-                        // If a multi-branch fork has a dominant branch whose probability rounds to ~1.0,
-                        // propagate non-deterministic split styling downstream along its 1.0-rounded continuation.
-                        if (ex.ConditionalProbability >= 1.0 - 1e-12 && _roundedSplitTiles.Add(ex.NextLandId))
-                        {
-                            _splitBfsQueue.Enqueue(ex.NextLandId);
-                        }
-                    }
-                }
-                while (_splitBfsQueue.Count > 0)
-                {
-                    int curTile = _splitBfsQueue.Dequeue();
-                    for (int ei = 0; ei < plan.Edges.Count; ei++)
-                    {
-                        var pe = plan.Edges[ei];
-                        if (pe.FromLandId == curTile && pe.Probability >= 1.0 - 1e-12 && _roundedSplitTiles.Add(pe.ToLandId))
-                        {
-                            _splitBfsQueue.Enqueue(pe.ToLandId);
-                        }
-                    }
-                }
-
                 for (int i = 0; i < plan.Edges.Count; i++)
             {
                 var edge = plan.Edges[i];
@@ -354,9 +326,7 @@ namespace MonsterPathPredictor.Runtime
                         out double clippedFromStartPx, out double clippedStartModPeriod, out double clippedEndPx))
                     continue;
 
-                long edgeKey = ((long)edge.FromLandId << 32) ^ (uint)edge.ToLandId;
-                bool edgeIsSplit = _multiBranchEdgeKeys.Contains(edgeKey) || _roundedSplitTiles.Contains(edge.FromLandId);
-                Color color = PickEdgeColor(palette, edge.Probability, edge.IsAfterCombat, edgeIsSplit);
+                Color color = PickEdgeColor(palette, edge.Probability, edge.IsAfterCombat, edge.HasNonCertainDominantSplit);
                 float baseWidth = edge.IsAfterCombat ? Math.Max(2.2f, settings.LineWidth * 0.78f) : settings.LineWidth;
                 float width = edge.Probability >= 0.999
                     ? baseWidth
@@ -468,7 +438,7 @@ namespace MonsterPathPredictor.Runtime
                 DrawDot(cPt, 7.5f, badgeColor);
                 string prefix = combat.IsSteal ? "偷" : "⚔遇";
                 string cLabel = prefix + combat.TargetLabel + "(第" + combat.StepIndex + "格)";
-                DrawPillLabel(new Point2(cPt.X, cPt.Y + 20f), cLabel, Math.Max(12, settings.FontSize - 3), badgeColor);
+                DrawPillLabel(new Point2(cPt.X, cPt.Y + 20f), cLabel, Math.Max(12, settings.FontSize - 3), badgeColor, layer.width, layer.height);
             }
 
             // 5. Forward step count badges along the predicted path (0 at monster -> 1, 2, ... -> X格 at endpoint)
@@ -484,16 +454,16 @@ namespace MonsterPathPredictor.Runtime
 
                     Color stepColor = ts.StepIndex == 0
                         ? RingColor
-                        : PickEdgeColor(palette, ts.Probability, ts.IsAfterCombat, _roundedSplitTiles.Contains(ts.LandId));
+                        : PickEdgeColor(palette, ts.Probability, ts.IsAfterCombat, ts.HasNonCertainDominantSplit);
 
                     if (ts.IsEndpoint)
                     {
                         DrawDot(tilePt, 6.5f, stepColor);
-                        DrawPillLabel(tilePt, ts.FormatStepBadge(), endFont, stepColor, compact: false);
+                        DrawPillLabel(tilePt, ts.FormatStepBadge(), endFont, stepColor, layer.width, layer.height, compact: false);
                     }
                     else
                     {
-                        DrawPillLabel(tilePt, ts.FormatStepBadge(), stepFont, stepColor, compact: true);
+                        DrawPillLabel(tilePt, ts.FormatStepBadge(), stepFont, stepColor, layer.width, layer.height, compact: true);
                     }
                 }
             }
@@ -509,12 +479,12 @@ namespace MonsterPathPredictor.Runtime
                     if (ep.StoppedAtCombat && _combatLandSet.Contains(ep.LandId)) continue;
                     if (!TryProjectTile(ep.LandId, out var epPt)) continue;
 
-                    Color epColor = PickEdgeColor(palette, ep.Probability, ep.IsAfterCombat, _roundedSplitTiles.Contains(ep.LandId));
+                    Color epColor = PickEdgeColor(palette, ep.Probability, ep.IsAfterCombat, ep.HasNonCertainDominantSplit);
                     DrawDot(epPt, 6.5f, epColor);
 
                     string epLabel = ep.IsDeadEnd ? ("终点(" + ep.StepIndex + "格)") : (ep.StepIndex + "格");
                     float yOff = _combatLandSet.Contains(ep.LandId) ? -22f : 16f;
-                    DrawPillLabel(new Point2(epPt.X, epPt.Y + yOff), epLabel, Math.Max(12, settings.FontSize - 4), epColor);
+                    DrawPillLabel(new Point2(epPt.X, epPt.Y + yOff), epLabel, Math.Max(12, settings.FontSize - 4), epColor, layer.width, layer.height);
                 }
             }
             }
@@ -818,7 +788,7 @@ namespace MonsterPathPredictor.Runtime
             if (!g.visible) g.visible = true;
         }
 
-        private PooledPill PreparePill(string text, int fontSize, Color textColor, bool compact)
+        private PooledPill PreparePill(string text, int fontSize, Color textColor, bool compact, float maxPillWidth = 0f)
         {
             var pill = AcquirePill();
             text = text ?? string.Empty;
@@ -826,6 +796,7 @@ namespace MonsterPathPredictor.Runtime
             bool contentChanged = !pill.HasContent ||
                 pill.LastFontSize != fontSize ||
                 pill.LastCompact != compact ||
+                Math.Abs(pill.LastMaxWidth - maxPillWidth) >= 1f ||
                 !string.Equals(pill.LastText, text, StringComparison.Ordinal) ||
                 !ColorsEqual(pill.LastColor, textColor);
 
@@ -846,11 +817,20 @@ namespace MonsterPathPredictor.Runtime
                     outline = 1.5f,
                     outlineColor = outlineCol
                 };
+                pill.Text.autoSize = AutoSizeType.Both;
                 pill.Text.text = text;
 
                 float h = (float)Math.Ceiling(Math.Max(compact ? 18f : 16f, pill.Text.height + padY * 2f));
                 float minW = compact ? h : 18f;
-                float w = (float)Math.Ceiling(Math.Max(minW, pill.Text.width + padX * 2f));
+                float maxAllowedW = maxPillWidth > 20f ? maxPillWidth : float.MaxValue;
+                float measuredW = (float)Math.Ceiling(Math.Max(minW, pill.Text.width + padX * 2f));
+                float w = Math.Min(measuredW, maxAllowedW);
+                if (measuredW > maxAllowedW)
+                {
+                    pill.Text.autoSize = AutoSizeType.None;
+                    pill.Text.singleLine = true;
+                    pill.Text.SetSize(Math.Max(8f, w - padX * 2f), pill.Text.height);
+                }
 
                 pill.Root.SetSize(w, h);
                 pill.Bg.SetSize(w, h);
@@ -865,6 +845,7 @@ namespace MonsterPathPredictor.Runtime
                 pill.LastFontSize = fontSize;
                 pill.LastColor = textColor;
                 pill.LastCompact = compact;
+                pill.LastMaxWidth = maxPillWidth;
                 pill.HasContent = true;
             }
 
@@ -887,11 +868,18 @@ namespace MonsterPathPredictor.Runtime
             _placedPillRects.Add(new Rect(left, top, pill.Width, pill.Height));
         }
 
-        private void DrawPillLabel(Point2 center, string text, int fontSize, Color textColor, bool compact = false)
+        private static bool IsAnchorNearViewport(Point2 pt, float viewW, float viewH)
         {
-            if (textColor.a <= 0f) return;
-            var pill = PreparePill(text, fontSize, textColor, compact);
-            PlacePill(pill, center);
+            return pt.X >= -48f && pt.X <= viewW + 48f && pt.Y >= -48f && pt.Y <= viewH + 48f;
+        }
+
+        private void DrawPillLabel(Point2 center, string text, int fontSize, Color textColor, float viewW, float viewH, bool compact = false)
+        {
+            if (textColor.a <= 0f || !IsAnchorNearViewport(center, viewW, viewH)) return;
+            float maxW = Math.Max(24f, viewW - 8f);
+            var pill = PreparePill(text, fontSize, textColor, compact, maxW);
+            var chosen = FindNonOverlappingPillCenter(center, pill.Width, pill.Height, compact ? 2f : 4f, viewW, viewH);
+            PlacePill(pill, chosen);
         }
 
         private bool DrawStackedPillLabel(
@@ -907,8 +895,9 @@ namespace MonsterPathPredictor.Runtime
             out float placedTopY)
         {
             placedTopY = hasPriorTop ? priorTopY : baseCenter.Y;
-            if (textColor.a <= 0f) return false;
-            var pill = PreparePill(text, fontSize, textColor, compact: false);
+            if (textColor.a <= 0f || !IsAnchorNearViewport(baseCenter, viewW, viewH)) return false;
+            float maxW = Math.Max(24f, viewW - 8f);
+            var pill = PreparePill(text, fontSize, textColor, compact: false, maxW);
             float prefY = hasPriorTop
                 ? (priorTopY - gapPx - pill.Height * 0.5f)
                 : baseCenter.Y;
@@ -933,8 +922,9 @@ namespace MonsterPathPredictor.Runtime
             float viewW,
             float viewH)
         {
-            if (textColor.a <= 0f) return;
-            var pill = PreparePill(text, fontSize, textColor, compact: false);
+            if (textColor.a <= 0f || !IsAnchorNearViewport(baseCenter, viewW, viewH)) return;
+            float maxW = Math.Max(24f, viewW - 8f);
+            var pill = PreparePill(text, fontSize, textColor, compact: false, maxW);
             var chosen = FindNonOverlappingPillCenter(baseCenter, pill.Width, pill.Height, gapPx, viewW, viewH);
             PlacePill(pill, chosen);
         }
@@ -1076,14 +1066,28 @@ namespace MonsterPathPredictor.Runtime
                     return existing;
                 }
                 int insertIdx = Math.Min(_usedPills, _pillLayer.numChildren);
-                if (existing != null && existing.Root != null && !existing.Root.isDisposed)
+                if (existing != null)
                 {
-                    if (existing.Root.parent == _pillLayer)
+                    if (existing.Root != null && !existing.Root.isDisposed && existing.Root.parent == _pillLayer)
                     {
                         try { insertIdx = _pillLayer.GetChildIndex(existing.Root); } catch { }
                     }
-                    try { existing.Root.RemoveFromParent(); } catch { }
-                    try { existing.Root.Dispose(); } catch { }
+                    // Explicitly reclaim any detached/reparented child widgets before disposing the old root.
+                    if (existing.Bg != null && !existing.Bg.isDisposed && existing.Bg.parent != existing.Root)
+                    {
+                        try { existing.Bg.RemoveFromParent(); } catch { }
+                        try { existing.Bg.Dispose(); } catch { }
+                    }
+                    if (existing.Text != null && !existing.Text.isDisposed && existing.Text.parent != existing.Root)
+                    {
+                        try { existing.Text.RemoveFromParent(); } catch { }
+                        try { existing.Text.Dispose(); } catch { }
+                    }
+                    if (existing.Root != null && !existing.Root.isDisposed)
+                    {
+                        try { existing.Root.RemoveFromParent(); } catch { }
+                        try { existing.Root.Dispose(); } catch { }
+                    }
                 }
                 var replacement = CreatePooledPill(insertIdx);
                 _pillPool[_usedPills] = replacement;

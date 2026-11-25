@@ -69,6 +69,8 @@ namespace MonsterPathPredictor.Core
         public int HeroId { get; set; }
         public int Hp { get; set; }
         public int MaxHp { get; set; }
+        /// <summary>False when current HP could not be read, preventing display of invented 0/max HP.</summary>
+        public bool HasHp { get; set; } = true;
         public bool IsNormalAggressive { get; set; } = true;
         public bool IsThief { get; set; }
         public int ActionWeight { get; set; }
@@ -240,6 +242,12 @@ namespace MonsterPathPredictor.Core
         public double Probability { get; set; }
         public int EarliestStep { get; set; }
         public bool IsAfterCombat { get; set; }
+        /// <summary>
+        /// True when this edge has no mathematically 100%-certain step traversal even if its
+        /// rounded IEEE-754 double <see cref="Probability"/> equals 1.0 (e.g. a dominant branch
+        /// with a tiny positive sibling alternative).
+        /// </summary>
+        public bool HasNonCertainDominantSplit { get; set; }
         public Dictionary<int, double> StepProbabilities { get; } = new Dictionary<int, double>();
     }
 
@@ -261,6 +269,7 @@ namespace MonsterPathPredictor.Core
         public bool IsDeadEnd { get; set; }
         public bool StoppedAtCombat { get; set; }
         public bool IsAfterCombat { get; set; }
+        public bool HasNonCertainDominantSplit { get; set; }
     }
 
     public sealed class PredictedTileStep
@@ -273,6 +282,7 @@ namespace MonsterPathPredictor.Core
         public bool IsAfterCombat { get; set; }
         public bool IsEndpoint { get; set; }
         public bool IsDeadEnd { get; set; }
+        public bool HasNonCertainDominantSplit { get; set; }
         public Dictionary<int, double> StepProbabilities { get; } = new Dictionary<int, double>();
 
         public string FormatStepBadge()

@@ -131,12 +131,59 @@ namespace MonsterPathPredictor.Tests
             Assert.Equal(40f, patch.Entries["dashSpeed"]);
             Assert.False(patch.Entries.ContainsKey("fontSize")); // External edit NOT overwritten!
 
-            // Explicit full reset queues all style keys even if memory already matches defaults
+            // Explicit full reset queues exact 16 route-style keys (deliberately EXCLUDING previewSteps so a
+            // failed style reset never overwrites an external previewSteps edit!).
             patch.Clear();
             Assert.False(patch.HasPending);
-            patch.RecordAllStyleKeys(new PredictorSettings());
+            var resetWithCustomDepth = new PredictorSettings { PreviewSteps = 20 };
+            resetWithCustomDepth.ResetStyleToDefaults();
+            patch.RecordAllStyleKeys(resetWithCustomDepth);
             Assert.True(patch.HasPending);
-            Assert.Equal(17, patch.Entries.Count);
+            Assert.Equal(16, patch.Entries.Count);
+            Assert.False(patch.Entries.ContainsKey("previewSteps"));
+
+            // Simulate failed reset followed by external previewSteps=8 edit on disk -> replay preserves 8!
+            var externalAfterFailedReset = new PredictorSettings { PreviewSteps = 8, LineWidth = 9.0f };
+            patch.ApplyTo(externalAfterFailedReset);
+            Assert.Equal(8, externalAfterFailedReset.PreviewSteps);
+            Assert.Equal(4.5f, externalAfterFailedReset.LineWidth);
+        }
+
+        [Fact]
+        public void StylePersistenceBoundaryPreservesExternalWritesAcrossFailedSaveAndRetry()
+        {
+            var disk = new System.Collections.Generic.Dictionary<string, object>
+            {
+                ["lineWidth"] = 4.5f,
+                ["fontSize"] = 18,
+                ["dashSpeed"] = 26f,
+                ["previewSteps"] = 12
+            };
+            var patch = new StylePendingPatch();
+
+            // 1. User changes lineWidth to 7.0 -> write fails (disk unchanged, patch retains lineWidth=7.0)
+            var s1 = new PredictorSettings { LineWidth = (float)disk["lineWidth"], FontSize = (int)disk["fontSize"], DashSpeed = (float)disk["dashSpeed"], PreviewSteps = (int)disk["previewSteps"] };
+            var b1 = s1.Clone();
+            s1.LineWidth = 7.0f;
+            patch.RecordDiff(b1, s1);
+
+            // 2. External editor updates fontSize=24 and previewSteps=16 on disk
+            disk["fontSize"] = 24;
+            disk["previewSteps"] = 16;
+
+            // 3. Reload from disk, merge pending patch, user edits dashSpeed=44, retry write succeeds
+            var s2 = new PredictorSettings { LineWidth = (float)disk["lineWidth"], FontSize = (int)disk["fontSize"], DashSpeed = (float)disk["dashSpeed"], PreviewSteps = (int)disk["previewSteps"] };
+            patch.ApplyTo(s2);
+            var b2 = s2.Clone();
+            s2.DashSpeed = 44f;
+            patch.RecordDiff(b2, s2);
+            foreach (var kv in patch.Entries) disk[kv.Key] = kv.Value;
+            patch.Clear();
+
+            Assert.Equal(7.0f, (float)disk["lineWidth"]);
+            Assert.Equal(44f, (float)disk["dashSpeed"]);
+            Assert.Equal(24, (int)disk["fontSize"]);
+            Assert.Equal(16, (int)disk["previewSteps"]);
         }
     }
 }

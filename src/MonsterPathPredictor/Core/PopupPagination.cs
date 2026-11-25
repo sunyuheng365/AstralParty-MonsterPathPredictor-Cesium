@@ -112,6 +112,72 @@ namespace MonsterPathPredictor.Core
             plusX = Math.Min(plusLeftLimit, stepsX + stepsW + gap);
         }
 
+        /// <summary>
+        /// Computes strictly in-bounds, non-overlapping channel-stepper geometry (tag, '-', value, '+')
+        /// inside [0, w] even at extreme narrow widths (48-100px).
+        /// </summary>
+        public static void ComputeChannelGeometry(
+            float w,
+            out float tagX,
+            out float tagW,
+            out float minusX,
+            out float btnW,
+            out float valX,
+            out float valW,
+            out float plusX)
+        {
+            float pad = w < 100f ? 2f : 4f;
+            float gap = w < 100f ? 1f : 2f;
+            float avail = Math.Max(20f, w - pad * 2f);
+
+            tagW = w < 90f ? 10f : 18f;
+            btnW = w < 90f ? 12f : Math.Min(24f, Math.Max(16f, w * 0.22f));
+            float minValW = w < 90f ? 10f : 16f;
+            float needed = tagW + btnW * 2f + minValW + gap * 3f;
+            if (needed > avail)
+            {
+                float scale = avail / needed;
+                tagW = Math.Max(4f, tagW * scale);
+                btnW = Math.Max(6f, btnW * scale);
+                gap = Math.Max(0.5f, gap * scale);
+            }
+
+            tagX = pad;
+            minusX = tagX + tagW + gap;
+            plusX = Math.Max(minusX + btnW + gap, w - pad - btnW);
+            valX = minusX + btnW + gap;
+            valW = Math.Max(0f, plusX - valX - gap);
+        }
+
+        /// <summary>
+        /// Computes strictly in-bounds, non-overlapping left/right text boxes for list rows.
+        /// </summary>
+        public static void ComputeSplitRowGeometry(
+            float rowW,
+            float padX,
+            float leftRatio,
+            out float leftX,
+            out float leftW,
+            out float rightX,
+            out float rightW)
+        {
+            float pad = Math.Min(padX, Math.Max(1f, rowW * 0.08f));
+            float gap = rowW < 100f ? 2f : 4f;
+            float usable = Math.Max(0f, rowW - pad * 2f);
+            leftX = pad;
+            if (usable <= gap + 8f)
+            {
+                leftW = usable;
+                rightX = pad + usable;
+                rightW = 0f;
+                return;
+            }
+            float avail = usable - gap;
+            leftW = Math.Max(4f, avail * leftRatio);
+            rightX = leftX + leftW + gap;
+            rightW = Math.Max(0f, avail - leftW);
+        }
+
         public enum StyleRowKind
         {
             SaveWarning,
@@ -126,6 +192,8 @@ namespace MonsterPathPredictor.Core
             ColorRolesRow1,
             ColorRolesRow2,
             Presets,
+            PresetsRow1,
+            PresetsRow2,
             RgbaPairRG,
             RgbaPairBA,
             RgbaSingleR,
@@ -144,13 +212,16 @@ namespace MonsterPathPredictor.Core
 
         public static List<StyleRowItem> BuildStyleRows(float maxContentH, float contentW, bool hasSaveWarn, out float rowGap)
         {
-            float rowH = maxContentH < 220f ? 21f : (maxContentH < 360f ? 23f : 25f);
-            float chipH = Math.Min(rowH, 23f);
-            float swatchH = Math.Min(rowH, 22f);
-            rowGap = 3f;
+            float capH = Math.Max(8f, maxContentH);
+            float rowH = Math.Min(capH, maxContentH < 220f ? 21f : (maxContentH < 360f ? 23f : 25f));
+            float chipH = Math.Min(capH, Math.Min(rowH, 23f));
+            float swatchH = Math.Min(capH, Math.Min(rowH, 22f));
+            float headerH = Math.Min(capH, 20f);
+            float warnH = Math.Min(capH, 18f);
+            rowGap = capH < 24f ? 1f : 3f;
 
-            var items = new List<StyleRowItem>(16);
-            if (hasSaveWarn) items.Add(new StyleRowItem(StyleRowKind.SaveWarning, 18f));
+            var items = new List<StyleRowItem>(18);
+            if (hasSaveWarn) items.Add(new StyleRowItem(StyleRowKind.SaveWarning, warnH));
             items.Add(new StyleRowItem(StyleRowKind.LineWidth, rowH));
             items.Add(new StyleRowItem(StyleRowKind.DashSpeed, rowH));
             items.Add(new StyleRowItem(StyleRowKind.DashLength, rowH));
@@ -158,10 +229,19 @@ namespace MonsterPathPredictor.Core
             items.Add(new StyleRowItem(StyleRowKind.FontSize, rowH));
             items.Add(new StyleRowItem(StyleRowKind.HeightOffset, rowH));
             items.Add(new StyleRowItem(StyleRowKind.Toggles, rowH));
-            items.Add(new StyleRowItem(StyleRowKind.ColorHeader, 20f));
+            items.Add(new StyleRowItem(StyleRowKind.ColorHeader, headerH));
             items.Add(new StyleRowItem(StyleRowKind.ColorRolesRow1, chipH));
             items.Add(new StyleRowItem(StyleRowKind.ColorRolesRow2, chipH));
-            items.Add(new StyleRowItem(StyleRowKind.Presets, swatchH));
+
+            if (contentW >= 160f)
+            {
+                items.Add(new StyleRowItem(StyleRowKind.Presets, swatchH));
+            }
+            else
+            {
+                items.Add(new StyleRowItem(StyleRowKind.PresetsRow1, swatchH));
+                items.Add(new StyleRowItem(StyleRowKind.PresetsRow2, swatchH));
+            }
 
             if (contentW >= 210f)
             {
@@ -214,15 +294,17 @@ namespace MonsterPathPredictor.Core
             out float rowGap,
             out int neighborCols)
         {
-            float pRowH = maxContentH < 160f ? 22f : 28f;
-            float btnH = maxContentH < 180f ? 21f : (maxContentH < 240f ? 23f : 26f);
-            rowGap = 3f;
-            neighborCols = neighborCount <= 0 ? 1 : (contentW < 180f ? 2 : Math.Min(3, neighborCount));
+            float capH = Math.Max(8f, maxContentH);
+            float pRowH = Math.Min(capH, maxContentH < 160f ? 22f : 28f);
+            float btnH = Math.Min(capH, maxContentH < 180f ? 21f : (maxContentH < 240f ? 23f : 26f));
+            float hdrH = Math.Min(capH, 18f);
+            rowGap = capH < 24f ? 1f : 3f;
+            neighborCols = neighborCount <= 0 ? 1 : (contentW < 110f ? 1 : (contentW < 180f ? 2 : Math.Min(3, neighborCount)));
 
             var items = new List<VirtualRowItem>(12);
             if (maxContentH >= 170f)
             {
-                items.Add(new VirtualRowItem(VirtualRowKind.Hint, 18f));
+                items.Add(new VirtualRowItem(VirtualRowKind.Hint, hdrH));
             }
             for (int i = 0; i < playerCount; i++)
             {
@@ -231,7 +313,7 @@ namespace MonsterPathPredictor.Core
             items.Add(new VirtualRowItem(VirtualRowKind.BoardPickToggle, btnH));
             if (hasLivingSelected)
             {
-                items.Add(new VirtualRowItem(VirtualRowKind.NeighborHeader, 18f));
+                items.Add(new VirtualRowItem(VirtualRowKind.NeighborHeader, hdrH));
                 for (int start = 0; start < neighborCount; start += neighborCols)
                 {
                     int cnt = Math.Min(neighborCols, neighborCount - start);

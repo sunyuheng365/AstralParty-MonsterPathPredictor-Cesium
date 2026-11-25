@@ -111,6 +111,11 @@ namespace MonsterPathPredictor.Tests
             var wrapped = new List<long> { 3996, 94126, 3995, 94124 };
             MonsterActionOrder.OrderBatchedNewSpawnIds(wrapped);
             Assert.Equal(new long[] { 94124, 94126, 3995, 3996 }, wrapped);
+
+            // Ambiguous mid-range pair (20,000 and 80,000) must NOT be falsely classified as wraparound
+            var midRange = new List<long> { 80000, 20000 };
+            MonsterActionOrder.OrderBatchedNewSpawnIds(midRange);
+            Assert.Equal(new long[] { 20000, 80000 }, midRange);
         }
     }
 }

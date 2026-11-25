@@ -166,11 +166,14 @@ namespace MonsterPathPredictor.Core
             if (!string.Equals(before.GuideBlueColorHex, after.GuideBlueColorHex, StringComparison.Ordinal)) _values["guideBlueColor"] = after.GuideBlueColorHex;
         }
 
+        /// <summary>
+        /// Records the exact 16 route-style keys reset by <see cref="PredictorSettings.ResetStyleToDefaults"/>
+        /// (deliberately excluding <c>previewSteps</c> so a failed style reset never overwrites an external depth edit).
+        /// </summary>
         public void RecordAllStyleKeys(PredictorSettings settings)
         {
             if (settings == null) return;
             settings.ClampInPlace();
-            _values["previewSteps"] = settings.PreviewSteps;
             _values["dashLength"] = settings.DashLength;
             _values["gapLength"] = settings.GapLength;
             _values["dashSpeed"] = settings.DashSpeed;

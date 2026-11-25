@@ -188,6 +188,8 @@ namespace MonsterPathPredictor.Runtime
                     }
                     case PopupPagination.StyleRowKind.ColorHeader:
                     {
+                        bool showSwatch = contentW >= 68f;
+                        float titleW = showSwatch ? Math.Max(12f, contentW - 44f) : Math.Max(12f, contentW - 4f);
                         var colTitle = new GTextField
                         {
                             touchable = false,
@@ -198,26 +200,31 @@ namespace MonsterPathPredictor.Runtime
                             text = "配色：" + StyleColor.GetRoleLabel(activeRole) + " " + activeRgba.ToHex()
                         };
                         colTitle.SetXY(2f, y);
-                        colTitle.SetSize(Math.Max(40f, contentW - 44f), item.Height);
+                        colTitle.SetSize(titleW, item.Height);
                         _contentHost.AddChild(colTitle);
 
-                        var swBackDark = new GGraph { touchable = false };
-                        swBackDark.SetXY(contentW - 38f, y + 2f);
-                        swBackDark.SetSize(18f, 16f);
-                        swBackDark.DrawRect(18f, 16f, 0, Color.clear, new Color(0.10f, 0.12f, 0.16f, 1f));
-                        _contentHost.AddChild(swBackDark);
+                        if (showSwatch)
+                        {
+                            float swH = Math.Max(6f, Math.Min(16f, item.Height - 4f));
+                            float swY = y + Math.Max(0f, (item.Height - swH) * 0.5f);
+                            var swBackDark = new GGraph { touchable = false };
+                            swBackDark.SetXY(contentW - 38f, swY);
+                            swBackDark.SetSize(18f, swH);
+                            swBackDark.DrawRect(18f, swH, 0, Color.clear, new Color(0.10f, 0.12f, 0.16f, 1f));
+                            _contentHost.AddChild(swBackDark);
 
-                        var swBackLight = new GGraph { touchable = false };
-                        swBackLight.SetXY(contentW - 20f, y + 2f);
-                        swBackLight.SetSize(18f, 16f);
-                        swBackLight.DrawRect(18f, 16f, 0, Color.clear, new Color(0.75f, 0.78f, 0.84f, 1f));
-                        _contentHost.AddChild(swBackLight);
+                            var swBackLight = new GGraph { touchable = false };
+                            swBackLight.SetXY(contentW - 20f, swY);
+                            swBackLight.SetSize(18f, swH);
+                            swBackLight.DrawRect(18f, swH, 0, Color.clear, new Color(0.75f, 0.78f, 0.84f, 1f));
+                            _contentHost.AddChild(swBackLight);
 
-                        var previewSwatch = new GGraph { touchable = false };
-                        previewSwatch.SetXY(contentW - 38f, y + 2f);
-                        previewSwatch.SetSize(36f, 16f);
-                        previewSwatch.DrawRect(36f, 16f, 1, TextPrimary, new Color(activeRgba.Rf, activeRgba.Gf, activeRgba.Bf, activeRgba.Af));
-                        _contentHost.AddChild(previewSwatch);
+                            var previewSwatch = new GGraph { touchable = false };
+                            previewSwatch.SetXY(contentW - 38f, swY);
+                            previewSwatch.SetSize(36f, swH);
+                            previewSwatch.DrawRect(36f, swH, 1, TextPrimary, new Color(activeRgba.Rf, activeRgba.Gf, activeRgba.Bf, activeRgba.Af));
+                            _contentHost.AddChild(previewSwatch);
+                        }
                         break;
                     }
                     case PopupPagination.StyleRowKind.ColorRolesRow1:
@@ -227,34 +234,14 @@ namespace MonsterPathPredictor.Runtime
                         AddColorRoleRow(3, item.Height);
                         break;
                     case PopupPagination.StyleRowKind.Presets:
-                    {
-                        int count = StyleColor.Presets.Length;
-                        float sGap = 3f;
-                        float sW = (contentW - sGap * (count - 1)) / count;
-                        for (int i = 0; i < count; i++)
-                        {
-                            var preset = StyleColor.Presets[i];
-                            var pc = preset.Color;
-                            bool matches = pc == activeRgba;
-                            var sw = CreateStyledButton(
-                                preset.Name,
-                                sW,
-                                item.Height,
-                                new Color(pc.Rf * 0.72f, pc.Gf * 0.72f, pc.Bf * 0.72f, 0.95f),
-                                matches ? Color.white : new Color(pc.Rf, pc.Gf, pc.Bf, 0.95f),
-                                (pc.R + pc.G + pc.B > 500) ? Color.black : Color.white,
-                                () =>
-                                {
-                                    var capturedHex = preset.Hex;
-                                    var capturedRole = activeRole;
-                                    StyleMutationRequested?.Invoke(s => StyleColor.SetRoleHex(s, capturedRole, capturedHex));
-                                },
-                                fontSize: 11);
-                            sw.SetXY(i * (sW + sGap), y);
-                            _contentHost.AddChild(sw);
-                        }
+                        AddPresetSwatchRow(0, StyleColor.Presets.Length, y, contentW, item.Height, activeRole, activeRgba);
                         break;
-                    }
+                    case PopupPagination.StyleRowKind.PresetsRow1:
+                        AddPresetSwatchRow(0, Math.Min(4, StyleColor.Presets.Length), y, contentW, item.Height, activeRole, activeRgba);
+                        break;
+                    case PopupPagination.StyleRowKind.PresetsRow2:
+                        AddPresetSwatchRow(4, Math.Max(0, StyleColor.Presets.Length - 4), y, contentW, item.Height, activeRole, activeRgba);
+                        break;
                     case PopupPagination.StyleRowKind.RgbaPairRG:
                     {
                         float halfGap = 4f;
@@ -303,7 +290,36 @@ namespace MonsterPathPredictor.Runtime
                 y += item.Height;
             }
 
-            return Math.Min(maxH, Math.Max(24f, y + 2f));
+            return Math.Min(maxH, Math.Max(0f, y));
+        }
+
+        private void AddPresetSwatchRow(int startIdx, int count, float y, float contentW, float swatchH, RouteColorRole activeRole, RgbaColor activeRgba)
+        {
+            if (count <= 0) return;
+            float sGap = contentW < 100f ? 1f : 3f;
+            float sW = Math.Max(6f, (contentW - sGap * (count - 1)) / count);
+            for (int i = 0; i < count; i++)
+            {
+                var preset = StyleColor.Presets[startIdx + i];
+                var pc = preset.Color;
+                bool matches = pc == activeRgba;
+                var sw = CreateStyledButton(
+                    sW < 18f ? string.Empty : preset.Name,
+                    sW,
+                    swatchH,
+                    new Color(pc.Rf * 0.72f, pc.Gf * 0.72f, pc.Bf * 0.72f, 0.95f),
+                    matches ? Color.white : new Color(pc.Rf, pc.Gf, pc.Bf, 0.95f),
+                    (pc.R + pc.G + pc.B > 500) ? Color.black : Color.white,
+                    () =>
+                    {
+                        var capturedHex = preset.Hex;
+                        var capturedRole = activeRole;
+                        StyleMutationRequested?.Invoke(s => StyleColor.SetRoleHex(s, capturedRole, capturedHex));
+                    },
+                    fontSize: sW < 26f ? 10 : 11);
+                sw.SetXY(i * (sW + sGap), y);
+                _contentHost.AddChild(sw);
+            }
         }
 
         private void AddToggleChip(string label, bool isOn, float x, float y, float w, float h, Action onClick)
@@ -343,21 +359,28 @@ namespace MonsterPathPredictor.Runtime
             bg.DrawRect(w, h, 1, new Color(0.24f, 0.30f, 0.40f, 0.65f), RowNormalBg);
             host.AddChild(bg);
 
-            float btnW = Math.Min(24f, Math.Max(18f, w * 0.22f));
+            PopupPagination.ComputeChannelGeometry(
+                w,
+                out float tagX, out float tagW,
+                out float minusX, out float btnW,
+                out float valX, out float valW,
+                out float plusX);
+            float btnH = Math.Max(8f, Math.Min(h - 2f, h - 4f));
+
             var tagTf = new GTextField
             {
                 touchable = false,
                 autoSize = AutoSizeType.None,
                 singleLine = true,
                 verticalAlign = VertAlignType.Middle,
-                textFormat = new TextFormat { size = 11, bold = true, color = tagColor },
+                textFormat = new TextFormat { size = w < 100f ? 10 : 11, bold = true, color = tagColor },
                 text = tag
             };
-            tagTf.SetXY(5f, 0f);
-            tagTf.SetSize(20f, h);
+            tagTf.SetXY(tagX, 0f);
+            tagTf.SetSize(tagW, h);
             host.AddChild(tagTf);
 
-            var minus = CreateMiniButton("-", btnW, Math.Max(14f, h - 4f), () =>
+            var minus = CreateMiniButton("-", btnW, btnH, () =>
             {
                 StyleMutationRequested?.Invoke(s =>
                 {
@@ -365,11 +388,11 @@ namespace MonsterPathPredictor.Runtime
                     var next = StyleColor.AdjustChannel(cur, channelIndex, -step, minAlpha);
                     StyleColor.SetRoleHex(s, role, next.ToHex());
                 });
-            }, fontSize: 12);
-            minus.SetXY(24f, (h - minus.height) * 0.5f);
+            }, fontSize: w < 100f ? 10 : 12);
+            minus.SetXY(minusX, (h - minus.height) * 0.5f);
             host.AddChild(minus);
 
-            var plus = CreateMiniButton("+", btnW, Math.Max(14f, h - 4f), () =>
+            var plus = CreateMiniButton("+", btnW, btnH, () =>
             {
                 StyleMutationRequested?.Invoke(s =>
                 {
@@ -377,25 +400,26 @@ namespace MonsterPathPredictor.Runtime
                     var next = StyleColor.AdjustChannel(cur, channelIndex, step, minAlpha);
                     StyleColor.SetRoleHex(s, role, next.ToHex());
                 });
-            }, fontSize: 12);
-            plus.SetXY(w - btnW - 3f, (h - plus.height) * 0.5f);
+            }, fontSize: w < 100f ? 10 : 12);
+            plus.SetXY(plusX, (h - plus.height) * 0.5f);
             host.AddChild(plus);
 
-            float valX = 24f + btnW + 2f;
-            float valW = Math.Max(16f, plus.x - valX - 2f);
-            var valTf = new GTextField
+            if (valW >= 8f)
             {
-                touchable = false,
-                autoSize = AutoSizeType.None,
-                singleLine = true,
-                align = AlignType.Center,
-                verticalAlign = VertAlignType.Middle,
-                textFormat = new TextFormat { size = 11, color = TextPrimary },
-                text = valText
-            };
-            valTf.SetXY(valX, 0f);
-            valTf.SetSize(valW, h);
-            host.AddChild(valTf);
+                var valTf = new GTextField
+                {
+                    touchable = false,
+                    autoSize = AutoSizeType.None,
+                    singleLine = true,
+                    align = AlignType.Center,
+                    verticalAlign = VertAlignType.Middle,
+                    textFormat = new TextFormat { size = w < 100f ? 10 : 11, color = TextPrimary },
+                    text = valText
+                };
+                valTf.SetXY(valX, 0f);
+                valTf.SetSize(valW, h);
+                host.AddChild(valTf);
+            }
 
             _contentHost.AddChild(host);
         }

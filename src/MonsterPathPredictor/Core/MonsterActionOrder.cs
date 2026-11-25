@@ -171,7 +171,7 @@ namespace MonsterPathPredictor.Core
                 if (id > maxId) maxId = id;
             }
 
-            bool isWraparound = minId >= 1 && minId <= 25000 && maxId >= 75000 && maxId <= 100000;
+            bool isWraparound = minId >= 1 && minId <= 10000 && maxId >= 90000 && maxId <= 100000;
             ids.Sort((a, b) =>
             {
                 if (isWraparound)

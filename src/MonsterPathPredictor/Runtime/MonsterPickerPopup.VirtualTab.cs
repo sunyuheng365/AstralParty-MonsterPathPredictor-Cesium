@@ -236,7 +236,7 @@ namespace MonsterPathPredictor.Runtime
                         bool selHasState = sandbox.HasPlayerState(selId);
                         bool anyState = sandbox.HasAnyState;
 
-                        var undoBtn = CreateStyledButton("撤回一步", aW, item.Height, BtnBg, canUndo ? AccentCyan : new Color(0.28f, 0.34f, 0.42f, 0.6f), canUndo ? TextPrimary : TextMuted, () => VirtualUndoRequested?.Invoke(selId), fontSize: 12);
+                        var undoBtn = CreateStyledButton("撤回一步", aW, item.Height, BtnBg, canUndo ? AccentCyan : new Color(0.28f, 0.34f, 0.42f, 0.6f), canUndo ? TextPrimary : TextMuted, () => VirtualUndoRequested?.Invoke(selId, layoutGen), fontSize: 12);
                         undoBtn.touchable = canUndo;
                         undoBtn.SetXY(0f, y);
                         _contentHost.AddChild(undoBtn);
@@ -257,7 +257,7 @@ namespace MonsterPathPredictor.Runtime
                 y += item.Height;
             }
 
-            return Math.Min(maxH, Math.Max(24f, y + 2f));
+            return Math.Min(maxH, Math.Max(0f, y));
         }
 
         private GComponent BuildVirtualPlayerRow(
@@ -281,7 +281,7 @@ namespace MonsterPathPredictor.Runtime
             bg.DrawRect(rowW, rowH, isSelected ? 2 : 1, border, fill);
             row.AddChild(bg);
 
-            float leftW = Math.Max(60f, (rowW - 14f) * 0.52f);
+            PopupPagination.ComputeSplitRowGeometry(rowW, 6f, 0.52f, out float leftX, out float leftW, out float rightX, out float rightW);
             string selfTag = isLocal ? "(我)" : string.Empty;
             string pName = string.IsNullOrEmpty(player.Name) ? player.SeatTag : (player.SeatTag + selfTag + " " + player.Name);
             var nameTf = new GTextField
@@ -298,33 +298,34 @@ namespace MonsterPathPredictor.Runtime
                 },
                 text = (isSelected ? "▶ " : "  ") + pName
             };
-            nameTf.SetXY(6f, 0f);
+            nameTf.SetXY(leftX, 0f);
             nameTf.SetSize(leftW, rowH);
             row.AddChild(nameTf);
 
-            float rightX = 6f + leftW + 4f;
-            float rightW = Math.Max(28f, rowW - rightX - 6f);
-            string posText = !player.IsAlive
-                ? "倒地"
-                : (hasVirt ? ("格" + player.LandId + " → 虚#" + virtLand) : ("格" + player.LandId));
-            var posTf = new GTextField
+            if (rightW >= 14f)
             {
-                touchable = false,
-                autoSize = AutoSizeType.None,
-                singleLine = true,
-                align = AlignType.Right,
-                verticalAlign = VertAlignType.Middle,
-                textFormat = new TextFormat
+                string posText = !player.IsAlive
+                    ? "倒地"
+                    : (hasVirt ? ("格" + player.LandId + " → 虚#" + virtLand) : ("格" + player.LandId));
+                var posTf = new GTextField
                 {
-                    size = 12,
-                    bold = hasVirt,
-                    color = hasVirt ? AccentViolet : TextMuted
-                },
-                text = posText
-            };
-            posTf.SetXY(rightX, 0f);
-            posTf.SetSize(rightW, rowH);
-            row.AddChild(posTf);
+                    touchable = false,
+                    autoSize = AutoSizeType.None,
+                    singleLine = true,
+                    align = AlignType.Right,
+                    verticalAlign = VertAlignType.Middle,
+                    textFormat = new TextFormat
+                    {
+                        size = 12,
+                        bold = hasVirt,
+                        color = hasVirt ? AccentViolet : TextMuted
+                    },
+                    text = posText
+                };
+                posTf.SetXY(rightX, 0f);
+                posTf.SetSize(rightW, rowH);
+                row.AddChild(posTf);
+            }
 
             if (player.IsAlive)
             {

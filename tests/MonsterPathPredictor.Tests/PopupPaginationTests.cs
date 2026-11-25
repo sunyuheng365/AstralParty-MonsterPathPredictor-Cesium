@@ -7,6 +7,7 @@ namespace MonsterPathPredictor.Tests
     public class PopupPaginationTests
     {
         [Theory]
+        [InlineData(16f, 52f, true)]
         [InlineData(42f, 140f, false)]
         [InlineData(42f, 140f, true)]
         [InlineData(78f, 140f, false)]
@@ -37,10 +38,8 @@ namespace MonsterPathPredictor.Tests
                     reached.Add(item.Kind);
                     totalSeen++;
                 }
-                if (slice.Count > 1)
-                {
-                    Assert.True(usedH <= maxContentH + 0.001f, $"Page {p} exceeded maxContentH ({usedH} > {maxContentH})");
-                }
+                // Even singleton pages at extreme heights (e.g. 16px) MUST stay strictly inside maxContentH!
+                Assert.True(usedH <= maxContentH + 0.001f, $"Page {p} exceeded maxContentH ({usedH} > {maxContentH})");
             }
 
             Assert.Equal(rows.Count, totalSeen);
@@ -54,8 +53,16 @@ namespace MonsterPathPredictor.Tests
             Assert.Contains(PopupPagination.StyleRowKind.ColorHeader, reached);
             Assert.Contains(PopupPagination.StyleRowKind.ColorRolesRow1, reached);
             Assert.Contains(PopupPagination.StyleRowKind.ColorRolesRow2, reached);
-            Assert.Contains(PopupPagination.StyleRowKind.Presets, reached);
             Assert.Contains(PopupPagination.StyleRowKind.ResetDefaults, reached);
+            if (contentW >= 160f)
+            {
+                Assert.Contains(PopupPagination.StyleRowKind.Presets, reached);
+            }
+            else
+            {
+                Assert.Contains(PopupPagination.StyleRowKind.PresetsRow1, reached);
+                Assert.Contains(PopupPagination.StyleRowKind.PresetsRow2, reached);
+            }
             if (hasSaveWarn) Assert.Contains(PopupPagination.StyleRowKind.SaveWarning, reached);
             if (contentW >= 210f)
             {
@@ -72,6 +79,7 @@ namespace MonsterPathPredictor.Tests
         }
 
         [Theory]
+        [InlineData(16f, 52f, 4, 4)]
         [InlineData(42f, 140f, 4, 4)]
         [InlineData(42f, 328f, 4, 6)]
         [InlineData(78f, 328f, 4, 4)]
@@ -115,10 +123,7 @@ namespace MonsterPathPredictor.Tests
                     else if (item.Kind == PopupPagination.VirtualRowKind.BoardPickToggle) sawToggle = true;
                     else if (item.Kind == PopupPagination.VirtualRowKind.ActionsRow) sawActions = true;
                 }
-                if (slice.Count > 1)
-                {
-                    Assert.True(usedH <= maxContentH + 0.001f);
-                }
+                Assert.True(usedH <= maxContentH + 0.001f);
             }
 
             Assert.Equal(playerCount, reachedPlayers.Count);
@@ -128,13 +133,14 @@ namespace MonsterPathPredictor.Tests
         }
 
         [Theory]
+        [InlineData(48f, 4f)]
         [InlineData(60f, 4f)]
         [InlineData(100f, 4f)]
         [InlineData(120f, 4f)]
         [InlineData(160f, 4f)]
         [InlineData(220f, 8f)]
         [InlineData(344f, 8f)]
-        public void NarrowStageTabsAndFooterStayStrictlyInsidePanelBounds(float panelW, float padX)
+        public void NarrowStageTabsFooterAndInnerRowsStayNonOverlappingAndInsideBounds(float panelW, float padX)
         {
             PopupPagination.ComputeThreeTabGeometry(panelW, padX, out float tabW, out float tabGap);
             float rightEdge = padX + (tabW + tabGap) * 2f + tabW;
@@ -153,6 +159,19 @@ namespace MonsterPathPredictor.Tests
             Assert.True(stepsX + stepsW <= plusX + 0.01f);
             Assert.True(plusX + stepBtnW <= clearX + 0.01f);
             Assert.True(clearX + clearW <= panelW - padX + 0.01f);
+
+            float contentW = panelW - padX * 2f;
+            PopupPagination.ComputeChannelGeometry(contentW, out float tagX, out float tagW, out float cMinusX, out float cBtnW, out float cValX, out float cValW, out float cPlusX);
+            Assert.True(tagX >= 0f);
+            Assert.True(tagX + tagW <= cMinusX + 0.01f);
+            Assert.True(cMinusX + cBtnW <= cValX + 0.01f);
+            Assert.True(cValX + cValW <= cPlusX + 0.01f);
+            Assert.True(cPlusX + cBtnW <= contentW + 0.01f);
+
+            PopupPagination.ComputeSplitRowGeometry(contentW, 6f, 0.54f, out float lX, out float lW, out float rX, out float rW);
+            Assert.True(lX >= 0f);
+            Assert.True(lX + lW <= rX + 0.01f);
+            Assert.True(rX + rW <= contentW + 0.01f);
         }
     }
 }

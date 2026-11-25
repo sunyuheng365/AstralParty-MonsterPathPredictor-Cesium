@@ -297,13 +297,15 @@ namespace MonsterPathPredictor.Runtime
         {
             _headerBg.SetSize(panelW, layout.HeaderH);
             _headerBg.DrawRect(panelW, layout.HeaderH, 0, Color.clear, HeaderBg);
-            float closeW = panelW < 200f ? 22f : 28f;
-            float closeH = Math.Min(24f, Math.Max(14f, layout.HeaderH - 4f));
+            float closeW = panelW < 100f ? 18f : (panelW < 200f ? 22f : 28f);
+            float closeH = Math.Min(24f, Math.Max(12f, layout.HeaderH - 4f));
             float closeX = Math.Max(padX, panelW - padX - closeW);
             ResizeMiniButton(_closeBtn, closeW, closeH);
             _closeBtn.SetXY(closeX, Math.Max(1f, (layout.HeaderH - closeH) * 0.5f));
+            float titleW = Math.Max(0f, closeX - padX - 4f);
             _titleText.SetXY(padX, Math.Max(1f, (layout.HeaderH - 20f) * 0.5f));
-            _titleText.SetSize(Math.Max(40f, closeX - padX - 4f), Math.Min(20f, layout.HeaderH - 2f));
+            _titleText.SetSize(titleW, Math.Min(20f, layout.HeaderH - 2f));
+            _titleText.visible = titleW >= 12f;
 
             // 3-tab bar directly under header — guaranteed strictly inside [padX, panelW - padX].
             _tabHost.SetXY(0f, layout.HeaderH);
@@ -400,6 +402,7 @@ namespace MonsterPathPredictor.Runtime
             var sb = _sigBuilder;
             sb.Clear();
             sb.Append((int)_activeTab).Append('|')
+              .Append(_currentMatchGen).Append('|')
               .Append((int)_selectedColorRole).Append('|')
               .Append(_styleSaveFailed ? 'E' : 'O').Append('|')
               .Append(selectedId).Append('|')
@@ -429,7 +432,7 @@ namespace MonsterPathPredictor.Runtime
                       .Append(st.IsCurrentlyActing ? 'C' : (st.HasActedThisRound ? 'D' : 'W')).Append(':')
                       .Append(st.DisplayName).Append(':')
                       .Append(st.CurrentLandId).Append(':')
-                      .Append(st.Hp).Append('/').Append(st.MaxHp).Append(':')
+                      .Append(st.HasHp ? st.Hp.ToString() : "?").Append('/').Append(st.MaxHp).Append(':')
                       .Append(st.ActionWeight).Append(':')
                       .Append(st.IsNormalAggressive ? 'A' : 'N').Append(';');
                 }
@@ -493,7 +496,8 @@ namespace MonsterPathPredictor.Runtime
             _lastSignature = string.Empty;
             _positioned = false;
             _temporarilyHidden = false;
-            _pointerPressedOnPopup = false;
+            _activeTouchId = int.MinValue;
+            _activePressFromMouse = false;
             _hasRenderedContent = false;
             _monsterPageIndex = 0;
             _virtualPageIndex = 0;

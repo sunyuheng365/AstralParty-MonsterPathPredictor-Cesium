@@ -46,9 +46,13 @@ namespace MonsterPathPredictor.Runtime
         private double _selectedMissingSinceSec = -1.0;
         private bool _needsUnitSync;
         private bool _awaitingPostLayoutUnitSync;
+        private bool _lastSnapshotInvalid;
         private bool _planDirty;
         private bool _savingSelfConfig;
         private int _activeBattleSceneHandle = -1;
+        private int _planInputRevision;
+        private int _cachedPlanRevision = -1;
+        private IReadOnlyList<TrackedPlayer> _cachedEffectivePlayers;
         private string _lastPlanInputSig = string.Empty;
 
         private static double MonotonicSeconds()
@@ -98,7 +102,7 @@ namespace MonsterPathPredictor.Runtime
             _needsUnitSync = true;
             if (!_settings.PlanInputsEqual(prev))
             {
-                _planDirty = true;
+                MarkPlanInputsChanged();
             }
             _popup.Invalidate();
             if (!_settings.Enabled)
@@ -163,34 +167,44 @@ namespace MonsterPathPredictor.Runtime
             _renderer.Dispose();
         }
 
-        private void OnPopupMonsterSelected(long monsterId)
+        private void MarkPlanInputsChanged()
         {
-            if (_awaitingPostLayoutUnitSync) return;
+            _planDirty = true;
+            _planInputRevision++;
+            _cachedEffectivePlayers = null;
+        }
+
+        private void OnPopupMonsterSelected(long monsterId, int expectedMatchGen)
+        {
+            if (_awaitingPostLayoutUnitSync || _lastSnapshotInvalid) return;
+            if (expectedMatchGen != _tracker.MatchGeneration) return;
             if (_selectedMonsterId == monsterId)
             {
                 _selectedMonsterId = 0;
                 _selectedMissingSinceSec = -1.0;
-                _planDirty = true;
+                MarkPlanInputsChanged();
                 return;
             }
 
-            // Revalidate monster existence and current eligibility at commit time so a press-deferred
-            // row cannot replace a valid selection with a dead or now-filtered monster.
-            var picked = FindMonster(monsterId);
-            if (picked == null || picked.State == null)
+            // Revalidate live monster existence and current eligibility (never trusting a stale 120ms cache
+            // on a press-deferred popup row!).
+            if (!MonsterStateTracker.TryIsMonsterLiveAndEligible(monsterId, _settings.AllowNonAggressiveMonsters))
             {
+                _needsUnitSync = true;
                 _popup.Invalidate();
                 return;
             }
-            if (!_settings.AllowNonAggressiveMonsters && !picked.State.IsNormalAggressive)
+            var picked = FindMonster(monsterId);
+            if (picked == null || picked.State == null)
             {
+                _needsUnitSync = true;
                 _popup.Invalidate();
                 return;
             }
 
             _selectedMonsterId = monsterId;
             _selectedMissingSinceSec = -1.0;
-            _planDirty = true;
+            MarkPlanInputsChanged();
             Log.Info("弹窗已锁定怪物：" + picked.State.DisplayName + "（地块 #" + picked.State.CurrentLandId + "）");
         }
 
@@ -213,7 +227,7 @@ namespace MonsterPathPredictor.Runtime
 
         private void OnVirtualPlayerSelected(long playerId)
         {
-            if (_awaitingPostLayoutUnitSync) return;
+            if (_awaitingPostLayoutUnitSync || _lastSnapshotInvalid) return;
             _picker.CancelRightClickOnly();
             _virtualSandbox.SelectPlayer(playerId);
             _popup.Invalidate();
@@ -221,14 +235,11 @@ namespace MonsterPathPredictor.Runtime
 
         private void OnVirtualStepNeighborRequested(long playerId, int expectedSourceLandId, int targetLandId, int expectedLayoutGen)
         {
-            if (_awaitingPostLayoutUnitSync || _board == null) return;
+            if (_awaitingPostLayoutUnitSync || _lastSnapshotInvalid || _board == null) return;
             if (expectedLayoutGen != _virtualSandbox.LayoutGeneration) return;
-            var player = FindPlayer(playerId);
-            if (player == null || !player.IsAlive) return;
 
-            // Validate against the LIVE board topology AND live unit position at commit time so neither
-            // a real player move inside the 120ms sample interval nor a layout swap inside the 500ms scan
-            // interval can commit an obsolete non-adjacent neighbor step.
+            // Validate against the LIVE board topology AND LIVE hero liveness/position at commit time
+            // (never falling back to stale cached player position or liveness when live lookup fails!).
             if (!TryGetRenderContext(out var landManager, out _)) return;
             var liveBoard = _tracker.CaptureBoard(landManager, out bool liveBoardComplete);
             if (!liveBoardComplete) return;
@@ -238,12 +249,23 @@ namespace MonsterPathPredictor.Runtime
                 return;
             }
 
-            int liveLand = MonsterStateTracker.TryReadLiveUnitLandId(playerId);
-            if (liveLand < 0 || !liveBoard.Contains(liveLand)) liveLand = player.LandId;
+            if (!_tracker.TryReadLiveHeroState(playerId, liveBoard, out bool liveIsAlive, out int liveLand) || !liveIsAlive)
+            {
+                _needsUnitSync = true;
+                _popup.Invalidate();
+                return;
+            }
 
-            int currentEffective = _virtualSandbox.TryGetVirtualLand(playerId, out int virtLand) && liveBoard.Contains(virtLand)
-                ? virtLand
-                : liveLand;
+            bool hasOverride = _virtualSandbox.TryGetVirtualLand(playerId, out int virtLand) && liveBoard.Contains(virtLand);
+            if (!hasOverride && !liveBoard.Contains(liveLand))
+            {
+                // Following live position but live position cannot be verified on board -> defer/resync!
+                _needsUnitSync = true;
+                _popup.Invalidate();
+                return;
+            }
+
+            int currentEffective = hasOverride ? virtLand : liveLand;
             if (currentEffective != expectedSourceLandId)
             {
                 _needsUnitSync = true;
@@ -254,7 +276,7 @@ namespace MonsterPathPredictor.Runtime
 
             if (_virtualSandbox.SetVirtualLand(playerId, targetLandId, liveLand, liveBoard))
             {
-                _planDirty = true;
+                MarkPlanInputsChanged();
                 _popup.Invalidate();
             }
         }
@@ -262,27 +284,42 @@ namespace MonsterPathPredictor.Runtime
         private void OnVirtualMoveRequested(long playerId, int targetLandId, BoardGraph verifiedBoard = null)
         {
             var board = verifiedBoard ?? _board;
-            if (_awaitingPostLayoutUnitSync || board == null) return;
-            var player = FindPlayer(playerId);
-            if (player == null || !player.IsAlive) return;
-            int liveLand = MonsterStateTracker.TryReadLiveUnitLandId(playerId);
-            if (liveLand < 0 || !board.Contains(liveLand)) liveLand = player.LandId;
+            if (_awaitingPostLayoutUnitSync || _lastSnapshotInvalid || board == null) return;
+            if (!_tracker.TryReadLiveHeroState(playerId, board, out bool liveIsAlive, out int liveLand) || !liveIsAlive)
+            {
+                _needsUnitSync = true;
+                _popup.Invalidate();
+                return;
+            }
             if (_virtualSandbox.SetVirtualLand(playerId, targetLandId, liveLand, board))
             {
-                _planDirty = true;
+                MarkPlanInputsChanged();
                 _popup.Invalidate();
             }
         }
 
-        private void OnVirtualUndoRequested(long playerId)
+        private void OnVirtualUndoRequested(long playerId, int expectedLayoutGen)
         {
-            if (_awaitingPostLayoutUnitSync || _board == null) return;
-            var player = FindPlayer(playerId);
-            int liveLand = MonsterStateTracker.TryReadLiveUnitLandId(playerId);
-            if (liveLand < 0 || !_board.Contains(liveLand)) liveLand = player != null ? player.LandId : -1;
-            if (_virtualSandbox.Undo(playerId, liveLand, _board))
+            if (_awaitingPostLayoutUnitSync || _lastSnapshotInvalid || _board == null) return;
+            if (expectedLayoutGen != _virtualSandbox.LayoutGeneration) return;
+            if (!TryGetRenderContext(out var landManager, out _)) return;
+            var liveBoard = _tracker.CaptureBoard(landManager, out bool liveBoardComplete);
+            if (!liveBoardComplete) return;
+            if (!_board.SameTopology(liveBoard))
             {
-                _planDirty = true;
+                HandleBoardTopologyReplaced(liveBoard);
+                return;
+            }
+
+            if (!_tracker.TryReadLiveHeroState(playerId, liveBoard, out bool liveIsAlive, out int liveLand) || !liveIsAlive)
+            {
+                _needsUnitSync = true;
+                _popup.Invalidate();
+                return;
+            }
+            if (_virtualSandbox.Undo(playerId, liveLand, liveBoard))
+            {
+                MarkPlanInputsChanged();
                 _popup.Invalidate();
             }
         }
@@ -291,7 +328,7 @@ namespace MonsterPathPredictor.Runtime
         {
             if (_virtualSandbox.ResetPlayer(playerId))
             {
-                _planDirty = true;
+                MarkPlanInputsChanged();
                 _popup.Invalidate();
             }
         }
@@ -300,18 +337,22 @@ namespace MonsterPathPredictor.Runtime
         {
             if (_virtualSandbox.ResetAll(disarmBoardPick: false))
             {
-                _planDirty = true;
+                MarkPlanInputsChanged();
                 _popup.Invalidate();
             }
         }
 
         private void OnVirtualBoardPickToggled(long expectedOwnerId, bool armed, int expectedLayoutGen)
         {
-            if (_awaitingPostLayoutUnitSync) return;
+            if (_awaitingPostLayoutUnitSync || _lastSnapshotInvalid) return;
             if (expectedLayoutGen != _virtualSandbox.LayoutGeneration) return;
             if (expectedOwnerId == 0 || expectedOwnerId != _virtualSandbox.SelectedPlayerId) return;
-            var owner = FindPlayer(expectedOwnerId);
-            if (owner == null || !owner.IsAlive) return;
+            if (!_tracker.TryReadLiveHeroState(expectedOwnerId, _board, out bool liveIsAlive, out _) || !liveIsAlive)
+            {
+                _needsUnitSync = true;
+                _popup.Invalidate();
+                return;
+            }
 
             _picker.CancelRightClickOnly();
             _virtualSandbox.SetBoardPickArmed(armed, _players);
@@ -378,7 +419,7 @@ namespace MonsterPathPredictor.Runtime
 
             if (externalChanged || !_settings.PlanInputsEqual(before))
             {
-                _planDirty = true;
+                MarkPlanInputsChanged();
             }
             if (styleChanged || externalChanged || isFullReset)
             {
@@ -432,9 +473,41 @@ namespace MonsterPathPredictor.Runtime
             _lastPlanInputSig = string.Empty;
             _awaitingPostLayoutUnitSync = true;
             _needsUnitSync = true;
-            _planDirty = true;
+            MarkPlanInputsChanged();
+            _popup.CancelPendingPress();
             _popup.SetTemporarilyHidden(true);
             _popup.Invalidate();
+        }
+
+        private void MergePartialPlayerUpdates(List<TrackedPlayer> partialPlayers)
+        {
+            if (partialPlayers == null || partialPlayers.Count == 0 || _players.Count == 0) return;
+            bool changed = false;
+            for (int i = 0; i < partialPlayers.Count; i++)
+            {
+                var upd = partialPlayers[i];
+                if (upd == null || upd.PlayerId <= 0) continue;
+                for (int j = 0; j < _players.Count; j++)
+                {
+                    if (_players[j] != null && _players[j].PlayerId == upd.PlayerId)
+                    {
+                        _players[j] = upd;
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+            if (changed)
+            {
+                long prevSelPlayer = _virtualSandbox.SelectedPlayerId;
+                bool prevArmed = _virtualSandbox.BoardPickArmed;
+                _virtualSandbox.Reconcile(_players, _board, _tracker.LocalPlayerId);
+                if (_virtualSandbox.SelectedPlayerId != prevSelPlayer || _virtualSandbox.BoardPickArmed != prevArmed)
+                {
+                    _picker.CancelRightClickOnly();
+                }
+                MarkPlanInputsChanged();
+            }
         }
 
         private void DrawAndTrack()
@@ -457,8 +530,16 @@ namespace MonsterPathPredictor.Runtime
                 }
                 if (sessionState == PveSessionState.TransientUnavailable)
                 {
-                    // Transient room/battle lookup hiccup inside Battle scene: suspend visual overlay & input
-                    // without tearing down selection, virtual undo history, or monster memories.
+                    // Even during a transient room-metadata gap, keep observing available battle turns so
+                    // A -> B -> A transitions are never missed while rendering & input stay suspended.
+                    if (battle != null)
+                    {
+                        _tracker.SetEventCollectionEnabled(true);
+                        if (_tracker.ObserveTurnBoundary(battle))
+                        {
+                            InvalidateMatchCache();
+                        }
+                    }
                     _picker.CancelPendingPointer();
                     _renderer.HideAll();
                     _popup.SetTemporarilyHidden(true);
@@ -466,19 +547,9 @@ namespace MonsterPathPredictor.Runtime
                     return;
                 }
 
-                // Record owning battle scene handle so additive UI/effect scene unloads cannot wipe active battle state.
-                if (_activeBattleSceneHandle < 0)
-                {
-                    try { _activeBattleSceneHandle = UnityEngine.SceneManagement.SceneManager.GetActiveScene().handle; } catch { }
-                }
-
                 // Enable game event ingestion only while actively inside an enabled PVE battle
                 // (stays active across FightWindow so combat events resolve accurately upon return).
                 _tracker.SetEventCollectionEnabled(true);
-
-                // Latch any Place-triggered board validation request BEFORE ObserveTurnBoundary drains _placeQueue
-                // so the first Place on a replacement layout can never lose its board-scan trigger.
-                bool placeRequestedBoardScan = _tracker.ConsumePendingPlaceBoardValidation();
 
                 // Keep authoritative turn-boundary tracking advancing even while FightWindow / settings popups
                 // or transient camera hiccups temporarily suspend visual overlay rendering (prevents A->B->A miss).
@@ -495,7 +566,7 @@ namespace MonsterPathPredictor.Runtime
                     _renderer.HideAll();
                     _popup.SetTemporarilyHidden(true);
                     _needsUnitSync = true;
-                    _planDirty = true;
+                    MarkPlanInputsChanged();
                     return;
                 }
 
@@ -510,25 +581,43 @@ namespace MonsterPathPredictor.Runtime
                     return;
                 }
 
+                // Derive owning battle scene handle from a battle-owned object (BattleSceneController),
+                // NEVER from SceneManager.GetActiveScene() which may belong to an additive UI overlay scene.
+                if (_activeBattleSceneHandle < 0)
+                {
+                    try
+                    {
+                        var sc = BattleSceneController.inst;
+                        if (sc != null && sc.gameObject != null)
+                            _activeBattleSceneHandle = sc.gameObject.scene.handle;
+                    }
+                    catch { }
+                }
+
                 double nowSec = MonotonicSeconds();
-                bool forceBoardScan = _board == null || nowSec >= _nextBoardScanSec || placeRequestedBoardScan;
+                long placeSeqSnapshot = _tracker.LatestPlaceSequence;
+                bool forceBoardScan = _board == null || nowSec >= _nextBoardScanSec || _tracker.HasUnvalidatedPlace;
 
                 if (forceBoardScan)
                 {
-                    _nextBoardScanSec = nowSec + 0.50;
                     var nextBoard = _tracker.CaptureBoard(landManager, out bool boardComplete);
-                    if (boardComplete && (_board == null || !_board.SameTopology(nextBoard)))
+                    if (boardComplete)
                     {
-                        if (_board != null)
+                        _nextBoardScanSec = nowSec + 0.50;
+                        if (_board == null)
+                        {
+                            _board = nextBoard;
+                            _awaitingPostLayoutUnitSync = true;
+                            _needsUnitSync = true;
+                            MarkPlanInputsChanged();
+                        }
+                        else if (!_board.SameTopology(nextBoard))
                         {
                             HandleBoardTopologyReplaced(nextBoard);
                         }
-                        else
-                        {
-                            _board = nextBoard;
-                            _needsUnitSync = true;
-                            _planDirty = true;
-                        }
+                        // Acknowledge ONLY up to the Place sequence captured BEFORE CaptureBoard succeeded!
+                        // Any Place arriving after placeSeqSnapshot stays unvalidated until the next complete scan.
+                        _tracker.AcknowledgeBoardValidatedUpTo(placeSeqSnapshot);
                     }
                 }
 
@@ -557,16 +646,21 @@ namespace MonsterPathPredictor.Runtime
                 {
                     _nextUnitSyncSec = nowSec + 0.12;
                     _needsUnitSync = false;
-                    _tracker.SyncAndSnapshot(_board, battle, camera, _settings, out var nextMonsters, out var nextPlayers, out bool matchChanged, out bool snapshotValid, out bool playersAuthoritative);
+                    _tracker.SyncAndSnapshot(
+                        _board, battle, camera, _settings,
+                        out var nextMonsters, out var nextPlayers,
+                        out bool matchChanged, out bool snapshotValid,
+                        out bool playersAuthoritative, out bool playerPositionsReady);
                     if (matchChanged)
                     {
                         InvalidateMatchCache();
                         return;
                     }
-                    // Never wipe virtual overrides/history or active player cache on a transient unavailable/incomplete sample.
+                    _lastSnapshotInvalid = !snapshotValid;
                     if (snapshotValid)
                     {
                         _monsters = nextMonsters;
+                        MarkPlanInputsChanged();
                         if (playersAuthoritative)
                         {
                             _players = nextPlayers;
@@ -577,14 +671,22 @@ namespace MonsterPathPredictor.Runtime
                             {
                                 _picker.CancelRightClickOnly();
                             }
-                            _awaitingPostLayoutUnitSync = false;
+                            if (playerPositionsReady)
+                            {
+                                _awaitingPostLayoutUnitSync = false;
+                            }
+                        }
+                        else if (!_awaitingPostLayoutUnitSync)
+                        {
+                            // Merge confirmed per-ID updates (e.g. hero death) without wiping temporarily absent heroes.
+                            MergePartialPlayerUpdates(nextPlayers);
                         }
                     }
                 }
 
-                // Suspend board input, popup interaction, and planning until we have an authoritative player sample
-                // on the newly switched layout (preventing forecasts against an empty player list or stale popup clicks).
-                if (_awaitingPostLayoutUnitSync)
+                // Suspend board input, popup interaction, and planning while waiting for authoritative player positions
+                // on a newly acquired/replaced board, OR while the entire unit snapshot is unavailable.
+                if (_awaitingPostLayoutUnitSync || _lastSnapshotInvalid)
                 {
                     _popup.SetTemporarilyHidden(true);
                     _renderer.HideAll();
@@ -636,7 +738,7 @@ namespace MonsterPathPredictor.Runtime
                 if (selectionChanged)
                 {
                     _selectedMissingSinceSec = -1.0;
-                    _planDirty = true;
+                    MarkPlanInputsChanged();
                     if (_selectedMonsterId != 0 && _selectedMonsterId != beforeSelection)
                     {
                         var picked = FindMonster(_selectedMonsterId);
@@ -649,7 +751,7 @@ namespace MonsterPathPredictor.Runtime
 
                 if (_popup.IsOpen)
                 {
-                    _popup.Refresh(_monsters, _players, _board, _virtualSandbox, _tracker.LocalPlayerId, _selectedMonsterId, _settings);
+                    _popup.Refresh(_monsters, _players, _board, _virtualSandbox, _tracker.LocalPlayerId, _selectedMonsterId, _settings, _tracker.MatchGeneration);
                 }
 
                 _virtualSandbox.BuildGhostsInto(_players, _board, _tracker.LocalPlayerId, _ghostBuf);
@@ -708,24 +810,33 @@ namespace MonsterPathPredictor.Runtime
                 }
                 _selectedMissingSinceSec = -1.0;
 
-                var effectivePlayers = _virtualSandbox.HasOverrides
-                    ? _virtualSandbox.ApplyOverrides(_players, _board)
-                    : _players;
-                string planInputSig = BuildPlanInputSignature(selected.State, effectivePlayers, _settings, _virtualSandbox.LayoutGeneration);
-                if (_planDirty || _cachedPlan == null || _cachedPlan.MonsterId != _selectedMonsterId || !string.Equals(planInputSig, _lastPlanInputSig, StringComparison.Ordinal))
+                // Steady-state zero-allocation fast path: skip player cloning & signature string building
+                // whenever no snapshot, sandbox, selection, or plan-option revision changed since last plan.
+                if (_planDirty || _cachedPlan == null || _cachedPlan.MonsterId != _selectedMonsterId || _cachedPlanRevision != _planInputRevision)
                 {
+                    var effectivePlayers = _cachedEffectivePlayers;
+                    if (effectivePlayers == null)
+                    {
+                        effectivePlayers = _virtualSandbox.HasOverrides
+                            ? (IReadOnlyList<TrackedPlayer>)_virtualSandbox.ApplyOverrides(_players, _board)
+                            : _players;
+                        _cachedEffectivePlayers = effectivePlayers;
+                    }
+
+                    var planOpts = new PlanOptions
+                    {
+                        MaxSteps = _settings.PreviewSteps,
+                        SimulateCombatOnFork = _settings.SimulateCombatOnFork,
+                        PostCombatMode = _settings.PostCombatMode
+                    };
+                    string planInputSig = MonsterPathEngine.ComputeInputSignature(selected.State, effectivePlayers, planOpts, _virtualSandbox.LayoutGeneration);
+                    if (_planDirty || _cachedPlan == null || _cachedPlan.MonsterId != _selectedMonsterId || !string.Equals(planInputSig, _lastPlanInputSig, StringComparison.Ordinal))
+                    {
+                        _lastPlanInputSig = planInputSig;
+                        _cachedPlan = MonsterPathEngine.Plan(_board, selected.State, effectivePlayers, planOpts);
+                    }
                     _planDirty = false;
-                    _lastPlanInputSig = planInputSig;
-                    _cachedPlan = MonsterPathEngine.Plan(
-                        _board,
-                        selected.State,
-                        effectivePlayers,
-                        new PlanOptions
-                        {
-                            MaxSteps = _settings.PreviewSteps,
-                            SimulateCombatOnFork = _settings.SimulateCombatOnFork,
-                            PostCombatMode = _settings.PostCombatMode
-                        });
+                    _cachedPlanRevision = _planInputRevision;
                 }
 
                 // Refresh live sprite bounds every frame so the header badge smoothly tracks moving monsters
@@ -739,6 +850,12 @@ namespace MonsterPathPredictor.Runtime
             catch (Exception ex)
             {
                 _cachedPlan = null;
+                _cachedEffectivePlayers = null;
+                _needsUnitSync = true;
+                MarkPlanInputsChanged();
+                try { _picker.CancelPendingPointer(); } catch { }
+                try { _popup.CancelPendingPress(); } catch { }
+                try { _popup.SetTemporarilyHidden(true); } catch { }
                 try { _renderer.HideAll(force: true); } catch { }
                 double warnNow = MonotonicSeconds();
                 if (warnNow >= _nextWarnSec)
@@ -754,15 +871,6 @@ namespace MonsterPathPredictor.Runtime
             for (int i = 0; i < _monsters.Count; i++)
             {
                 if (_monsters[i].State.MonsterId == monsterId) return _monsters[i];
-            }
-            return null;
-        }
-
-        private TrackedPlayer FindPlayer(long playerId)
-        {
-            for (int i = 0; i < _players.Count; i++)
-            {
-                if (_players[i] != null && _players[i].PlayerId == playerId) return _players[i];
             }
             return null;
         }
@@ -783,6 +891,7 @@ namespace MonsterPathPredictor.Runtime
                 return PveSessionState.TransientUnavailable;
 
             var gm = SimpleSingletonProvider<GameLogicManager>.inst;
+            battle = gm.battle;
             var room = gm.room;
             if (room == null || room.curRoomInfo == null)
                 return PveSessionState.TransientUnavailable;
@@ -790,7 +899,6 @@ namespace MonsterPathPredictor.Runtime
             if (!room.curRoomInfo.IsPVE())
                 return PveSessionState.ConfirmedExited;
 
-            battle = gm.battle;
             if (battle == null)
                 return PveSessionState.TransientUnavailable;
 
@@ -843,57 +951,6 @@ namespace MonsterPathPredictor.Runtime
             return false;
         }
 
-        private static string BuildPlanInputSignature(MonsterState m, IReadOnlyList<TrackedPlayer> players, PredictorSettings s, int layoutGen)
-        {
-            var sb = new System.Text.StringBuilder(200);
-            sb.Append(layoutGen).Append('|')
-              .Append(s.PreviewSteps).Append(':')
-              .Append(s.SimulateCombatOnFork ? '1' : '0')
-              .Append((int)s.PostCombatMode).Append('|')
-              .Append(m.MonsterId).Append(':')
-              .Append(m.Name).Append(':')
-              .Append(m.DisplayName).Append(':')
-              .Append(m.IsNormalAggressive ? '1' : '0')
-              .Append(m.IsThief ? '1' : '0')
-              .Append(m.ChasesProblemStudent ? '1' : '0')
-              .Append(m.ChasesMandarinDuckMark ? '1' : '0').Append(':')
-              .Append(m.CurrentLandId).Append(':')
-              .Append(m.FromLandId).Append(':')
-              .Append(m.TurnStartLandId).Append(':')
-              .Append(m.IsCurrentlyMovingMidTurn ? '1' : '0')
-              .Append(m.JustFoughtOnCurrentFork ? '1' : '0')
-              .Append(m.HasLaunchedFightThisTurn ? '1' : '0')
-              .Append(m.JustSpawnedOnFork ? '1' : '0')
-              .Append(m.IsTaunted ? '1' : '0').Append(':').Append(m.TauntTargetPlayerId).Append(':')
-              .Append(m.RequiresCrimeTarget ? '1' : '0').Append(':')
-              .Append(m.BossTargetPlayerId).Append(':')
-              .Append(m.BossTargetClearedThisTurn ? '1' : '0').Append(':')
-              .Append((int)m.SkillMoveKind).Append(':').Append(m.SkillMovePushDirectionLandId).Append(':').Append(m.SkillMovePushFromLandId).Append(':');
-            if (m.FrontNodeIds != null)
-            {
-                for (int i = 0; i < m.FrontNodeIds.Length; i++) sb.Append(m.FrontNodeIds[i]).Append(',');
-            }
-            sb.Append('|');
-            if (players != null)
-            {
-                for (int i = 0; i < players.Count; i++)
-                {
-                    var p = players[i];
-                    if (p == null) continue;
-                    sb.Append(p.PlayerId).Append(':')
-                      .Append(p.Slot).Append(':')
-                      .Append(p.LandId).Append(':')
-                      .Append(p.IsAlive ? '1' : '0')
-                      .Append(p.IsTargetable ? '1' : '0')
-                      .Append(p.CanBeAttacked ? '1' : '0')
-                      .Append(p.HasProblemStudentMark ? '1' : '0')
-                      .Append(p.HasMandarinDuckMark ? '1' : '0').Append(':')
-                      .Append(p.Gold).Append(':').Append(p.CrimeNum).Append(';');
-                }
-            }
-            return sb.ToString();
-        }
-
         private void ClearSelectionAndOverlay()
         {
             _selectedMonsterId = 0;
@@ -907,28 +964,36 @@ namespace MonsterPathPredictor.Runtime
         private void InvalidateMatchCache()
         {
             ClearSelectionAndOverlay();
+            _virtualSandbox.NotifyBoardLayoutChanged();
             _virtualSandbox.ResetAll(disarmBoardPick: true);
             _picker.CancelPendingPointer();
+            _popup.CancelPendingPress();
             _board = null;
             _monsters.Clear();
             _players.Clear();
+            _cachedEffectivePlayers = null;
+            _lastSnapshotInvalid = false;
             _nextBoardScanSec = 0.0;
             _nextUnitSyncSec = 0.0;
             _needsUnitSync = true;
-            _awaitingPostLayoutUnitSync = false;
-            _planDirty = true;
+            _awaitingPostLayoutUnitSync = true;
+            MarkPlanInputsChanged();
             _popup.Invalidate();
         }
 
         private void ResetBattleState()
         {
             ClearSelectionAndOverlay();
+            _virtualSandbox.NotifyBoardLayoutChanged();
             _virtualSandbox.ResetAll(disarmBoardPick: true);
             _picker.CancelPendingPointer();
+            _popup.CancelPendingPress();
             try { _popup.Hide(); } catch { }
             _board = null;
             _monsters.Clear();
             _players.Clear();
+            _cachedEffectivePlayers = null;
+            _lastSnapshotInvalid = false;
             _nextBoardScanSec = 0.0;
             _nextUnitSyncSec = 0.0;
             _needsUnitSync = false;

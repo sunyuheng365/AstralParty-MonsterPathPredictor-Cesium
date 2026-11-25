@@ -78,8 +78,10 @@ namespace MonsterPathPredictor.Runtime
         private bool _positioned;
         private bool _closeOnSelect;
         private bool _styleSaveFailed;
-        private bool _pointerPressedOnPopup;
+        private int _activeTouchId = int.MinValue;
+        private bool _activePressFromMouse;
         private bool _hasRenderedContent;
+        private int _currentMatchGen;
         private PickerPopupTab _activeTab = PickerPopupTab.Monsters;
         private RouteColorRole _selectedColorRole = RouteColorRole.Deterministic;
         private int _monsterPageIndex;
@@ -98,13 +100,20 @@ namespace MonsterPathPredictor.Runtime
             _lastSignature = string.Empty;
         }
 
-        public event Action<long> MonsterSelected;
+        public void CancelPendingPress()
+        {
+            _activeTouchId = int.MinValue;
+            _activePressFromMouse = false;
+            _lastSignature = string.Empty;
+        }
+
+        public event Action<long, int> MonsterSelected;
         public event Action ClearRequested;
         public event Action<int> StepsDeltaRequested;
 
         public event Action<long> VirtualPlayerSelected;
         public event Action<long, int, int, int> VirtualStepNeighborRequested;
-        public event Action<long> VirtualUndoRequested;
+        public event Action<long, int> VirtualUndoRequested;
         public event Action<long> VirtualResetPlayerRequested;
         public event Action VirtualResetAllRequested;
         public event Action<long, bool, int> VirtualBoardPickToggled;
@@ -141,6 +150,8 @@ namespace MonsterPathPredictor.Runtime
         {
             _isOpen = false;
             _temporarilyHidden = false;
+            _activeTouchId = int.MinValue;
+            _activePressFromMouse = false;
             if (_root != null && !_root.isDisposed)
             {
                 _root.visible = false;
@@ -183,12 +194,14 @@ namespace MonsterPathPredictor.Runtime
             VirtualPlayerSandbox sandbox,
             long localPlayerId,
             long selectedMonsterId,
-            PredictorSettings settings)
+            PredictorSettings settings,
+            int matchGeneration = 0)
         {
             if (!IsOpen) return;
             EnsureCreated();
             if (_root == null || _root.isDisposed) return;
 
+            _currentMatchGen = matchGeneration;
             _closeOnSelect = settings.ClosePickerOnSelect;
 
             _visibleMonstersBuf.Clear();
@@ -350,40 +363,72 @@ namespace MonsterPathPredictor.Runtime
             _lastSignature = string.Empty;
         }
 
-        private void OnPopupTouchBegin()
+        private void OnPopupTouchBegin(EventContext ctx)
         {
-            _pointerPressedOnPopup = true;
+            if (_activeTouchId != int.MinValue) return;
+            int touchId = (ctx != null && ctx.inputEvent != null) ? ctx.inputEvent.touchId : -1;
+            _activeTouchId = touchId;
+            try
+            {
+                _activePressFromMouse = InputService.IsMouseButtonHeld(0) || InputService.IsMouseButtonPressed(0);
+            }
+            catch
+            {
+                _activePressFromMouse = touchId < 0;
+            }
         }
 
-        private void OnStageTouchEnd()
+        private void OnStageTouchEnd(EventContext ctx)
         {
-            _pointerPressedOnPopup = false;
+            if (_activeTouchId == int.MinValue) return;
+            if (ctx == null || ctx.inputEvent == null || ctx.inputEvent.touchId == _activeTouchId)
+            {
+                _activeTouchId = int.MinValue;
+                _activePressFromMouse = false;
+            }
         }
 
         private bool IsPopupPressActive()
         {
             if (_root == null || _root.isDisposed || !_root.visible)
             {
-                _pointerPressedOnPopup = false;
+                _activeTouchId = int.MinValue;
+                _activePressFromMouse = false;
                 return false;
             }
+
+            if (_activeTouchId != int.MinValue)
+            {
+                // For mouse-originated gestures, also recover automatically if focus loss dropped Stage.onTouchEnd.
+                // For non-mouse touch gestures, track strictly by initiating touchId through Stage.onTouchEnd.
+                if (_activePressFromMouse)
+                {
+                    try
+                    {
+                        if (!InputService.IsMouseButtonHeld(0) && !InputService.IsMouseButtonPressed(0))
+                        {
+                            _activeTouchId = int.MinValue;
+                            _activePressFromMouse = false;
+                            return false;
+                        }
+                    }
+                    catch { }
+                }
+                return true;
+            }
+
             try
             {
-                bool mouseDown = InputService.IsMouseButtonHeld(0) || InputService.IsMouseButtonPressed(0);
-                if (!mouseDown)
+                if ((InputService.IsMouseButtonHeld(0) || InputService.IsMouseButtonPressed(0)) &&
+                    Stage.inst != null && ContainsStagePoint(Stage.inst.touchPosition))
                 {
-                    _pointerPressedOnPopup = false;
-                    return false;
-                }
-                if (_pointerPressedOnPopup) return true;
-                if (Stage.inst != null && ContainsStagePoint(Stage.inst.touchPosition))
-                {
-                    _pointerPressedOnPopup = true;
+                    _activeTouchId = -1;
+                    _activePressFromMouse = true;
                     return true;
                 }
             }
             catch { }
-            return _pointerPressedOnPopup;
+            return false;
         }
 
         private void SwitchTab(PickerPopupTab tab)

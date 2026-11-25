@@ -145,6 +145,70 @@ namespace MonsterPathPredictor.Core
             public override int GetHashCode() => (From * 397) ^ To;
         }
 
+        /// <summary>
+        /// Computes a canonical cache key covering every input field read by <see cref="Plan"/>.
+        /// Kept alongside the planner so differential equivalence tests detect any missing key field immediately.
+        /// </summary>
+        public static string ComputeInputSignature(
+            MonsterState m,
+            IReadOnlyList<TrackedPlayer> players,
+            PlanOptions options,
+            int layoutGen)
+        {
+            if (m == null) return string.Empty;
+            options = options ?? new PlanOptions();
+            var sb = new System.Text.StringBuilder(220);
+            sb.Append(layoutGen).Append('|')
+              .Append(options.MaxSteps).Append(':')
+              .Append(options.SimulateCombatOnFork ? '1' : '0')
+              .Append((int)options.PostCombatMode).Append(':')
+              .Append(BitConverter.DoubleToInt64Bits(options.MinBranchProbability)).Append('|')
+              .Append(m.MonsterId).Append(':')
+              .Append(m.HeroId).Append(':')
+              .Append(m.Name).Append(':')
+              .Append(m.DisplayName).Append(':')
+              .Append(m.IsNormalAggressive ? '1' : '0')
+              .Append(m.IsThief ? '1' : '0')
+              .Append(m.ChasesProblemStudent ? '1' : '0')
+              .Append(m.ChasesMandarinDuckMark ? '1' : '0').Append(':')
+              .Append(m.CurrentLandId).Append(':')
+              .Append(m.FromLandId).Append(':')
+              .Append(m.CanStep).Append(':')
+              .Append(m.TurnStartLandId).Append(':')
+              .Append(m.IsCurrentlyMovingMidTurn ? '1' : '0')
+              .Append(m.JustFoughtOnCurrentFork ? '1' : '0')
+              .Append(m.HasLaunchedFightThisTurn ? '1' : '0')
+              .Append(m.JustSpawnedOnFork ? '1' : '0')
+              .Append(m.IsTaunted ? '1' : '0').Append(':').Append(m.TauntTargetPlayerId).Append(':')
+              .Append(m.RequiresCrimeTarget ? '1' : '0').Append(':')
+              .Append(m.BossTargetPlayerId).Append(':')
+              .Append(m.BossTargetClearedThisTurn ? '1' : '0').Append(':')
+              .Append((int)m.SkillMoveKind).Append(':').Append(m.SkillMovePushDirectionLandId).Append(':').Append(m.SkillMovePushFromLandId).Append(':');
+            if (m.FrontNodeIds != null)
+            {
+                for (int i = 0; i < m.FrontNodeIds.Length; i++) sb.Append(m.FrontNodeIds[i]).Append(',');
+            }
+            sb.Append('|');
+            if (players != null)
+            {
+                for (int i = 0; i < players.Count; i++)
+                {
+                    var p = players[i];
+                    if (p == null) continue;
+                    sb.Append(p.PlayerId).Append(':')
+                      .Append(p.Slot).Append(':')
+                      .Append(p.LandId).Append(':')
+                      .Append(p.IsAlive ? '1' : '0')
+                      .Append(p.IsTargetable ? '1' : '0')
+                      .Append(p.CanBeAttacked ? '1' : '0')
+                      .Append(p.HasProblemStudentMark ? '1' : '0')
+                      .Append(p.HasMandarinDuckMark ? '1' : '0').Append(':')
+                      .Append(p.Gold).Append(':').Append(p.CrimeNum).Append(';');
+                }
+            }
+            return sb.ToString();
+        }
+
         public static PathPlan Plan(
             BoardGraph board,
             MonsterState monster,
@@ -186,11 +250,16 @@ namespace MonsterPathPredictor.Core
 
             var edgeMap = new Dictionary<EdgeKey, PredictedEdge>();
             var edgeHasPreCombat = new HashSet<EdgeKey>();
+            var edgeHasCertainStep = new HashSet<EdgeKey>();
             var forkMap = new Dictionary<ForkRecordKey, PredictedFork>();
             var combatMap = new Dictionary<int, PredictedCombat>();
             var endpointMap = new Dictionary<(int LandId, int Step, bool DeadEnd, bool StoppedAtCombat, bool AfterCombat), double>();
             var tileStepMap = new Dictionary<int, PredictedTileStep>();
             var tileStepHasPreCombat = new HashSet<int>();
+            var tileStepHasCertainStep = new HashSet<int> { monster.CurrentLandId };
+            var stepPositiveEdges = new HashSet<EdgeKey>();
+            var stepPositiveTiles = new HashSet<int>();
+            bool hasEarlyTerminationOrPruning = false;
 
             bool initialCombatState = monster.HasLaunchedFightThisTurn || monster.JustFoughtOnCurrentFork;
             long turnBossTargetId = ResolveTurnBossTargetId(board, monster, activePlayers, shortestPathCache, out bool freshMarkedAtTurnStart);
@@ -205,6 +274,8 @@ namespace MonsterPathPredictor.Core
             for (int step = 0; step < maxSteps && currentLayer.Count > 0; step++)
             {
                 var nextLayer = new Dictionary<WalkStateKey, (double Prob, double LogProb)>();
+                stepPositiveEdges.Clear();
+                stepPositiveTiles.Clear();
 
                 foreach (var entry in currentLayer)
                 {
@@ -215,6 +286,7 @@ namespace MonsterPathPredictor.Core
                     if (step > 0 && minProb > 0.0 && arrivalProb < minProb)
                     {
                         plan.PrunedProbability += arrivalProb;
+                        hasEarlyTerminationOrPruning = true;
                         continue;
                     }
 
@@ -246,6 +318,7 @@ namespace MonsterPathPredictor.Core
 
                             if (options.PostCombatMode == PostCombatMode.StopAtFirstCombat)
                             {
+                                hasEarlyTerminationOrPruning = true;
                                 AccumulateEndpoint(endpointMap, state.LandId, step, false, true, true, arrivalProb);
                                 continue;
                             }
@@ -261,6 +334,7 @@ namespace MonsterPathPredictor.Core
 
                                 if (options.PostCombatMode == PostCombatMode.StopAtFirstCombat)
                                 {
+                                    hasEarlyTerminationOrPruning = true;
                                     AccumulateEndpoint(endpointMap, state.LandId, step, false, true, true, arrivalProb);
                                     continue;
                                 }
@@ -288,6 +362,7 @@ namespace MonsterPathPredictor.Core
 
                     if (outcome.Transitions == null || outcome.Transitions.Count == 0)
                     {
+                        hasEarlyTerminationOrPruning = true;
                         AccumulateEndpoint(endpointMap, state.LandId, step, true, false, postCombatNow, arrivalProb);
                         continue;
                     }
@@ -342,6 +417,8 @@ namespace MonsterPathPredictor.Core
                         if (nextEdgeStepProb > pe.Probability) pe.Probability = nextEdgeStepProb;
                         if (step < pe.EarliestStep) pe.EarliestStep = step;
 
+                        stepPositiveEdges.Add(ek);
+                        stepPositiveTiles.Add(nextId);
                         RecordTileStep(tileStepMap, tileStepHasPreCombat, nextId, step + 1, branchProb, postCombatNow);
 
                         var nextKey = new WalkStateKey(nextId, state.LandId, postCombatNow, clearedMarkLandId, bossTargetClearedNow);
@@ -349,6 +426,18 @@ namespace MonsterPathPredictor.Core
                             nextLayer[nextKey] = (existing.Prob + branchProb, BoardGraph.LogAddExp(existing.LogProb, branchLogProb));
                         else
                             nextLayer[nextKey] = (branchProb, branchLogProb);
+                    }
+                }
+
+                if (!hasEarlyTerminationOrPruning)
+                {
+                    if (stepPositiveEdges.Count == 1)
+                    {
+                        foreach (var soleEdge in stepPositiveEdges) edgeHasCertainStep.Add(soleEdge);
+                    }
+                    if (stepPositiveTiles.Count == 1)
+                    {
+                        foreach (var soleTile in stepPositiveTiles) tileStepHasCertainStep.Add(soleTile);
                     }
                 }
 
@@ -392,7 +481,12 @@ namespace MonsterPathPredictor.Core
                 AccumulateEndpoint(endpointMap, finalState.Key.LandId, maxSteps, isDeadEnd, stoppedCombat, afterCombat, finalProb);
             }
 
-            plan.Edges.AddRange(edgeMap.Values);
+            foreach (var kv in edgeMap)
+            {
+                var pe = kv.Value;
+                pe.HasNonCertainDominantSplit = !edgeHasCertainStep.Contains(kv.Key);
+                plan.Edges.Add(pe);
+            }
             plan.Edges.Sort((a, b) =>
             {
                 int c = a.EarliestStep.CompareTo(b.EarliestStep);
@@ -409,6 +503,7 @@ namespace MonsterPathPredictor.Core
             plan.Combats.AddRange(combatMap.Values);
             plan.Combats.Sort((a, b) => a.StepIndex.CompareTo(b.StepIndex));
 
+            bool multipleEndpointsOrPruned = endpointMap.Count > 1 || plan.PrunedProbability > 0.0;
             foreach (var ep in endpointMap)
             {
                 plan.Endpoints.Add(new PredictedEndpoint
@@ -418,7 +513,8 @@ namespace MonsterPathPredictor.Core
                     IsDeadEnd = ep.Key.DeadEnd,
                     StoppedAtCombat = ep.Key.StoppedAtCombat,
                     IsAfterCombat = ep.Key.AfterCombat,
-                    Probability = Math.Min(1.0, ep.Value)
+                    Probability = Math.Min(1.0, ep.Value),
+                    HasNonCertainDominantSplit = multipleEndpointsOrPruned
                 });
 
                 if (tileStepMap.TryGetValue(ep.Key.LandId, out var ts))
@@ -433,6 +529,7 @@ namespace MonsterPathPredictor.Core
             {
                 ts.StepIndices.Sort();
                 if (ts.StepIndices.Count > 0) ts.StepIndex = ts.StepIndices[0];
+                ts.HasNonCertainDominantSplit = !tileStepHasCertainStep.Contains(ts.LandId);
                 plan.TileSteps.Add(ts);
             }
             plan.TileSteps.Sort((a, b) =>

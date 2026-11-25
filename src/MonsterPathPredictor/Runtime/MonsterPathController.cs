@@ -190,7 +190,12 @@ namespace MonsterPathPredictor.Runtime
                     var nextBoard = _tracker.CaptureBoard(landManager);
                     if (_board == null || !_board.SameTopology(nextBoard))
                     {
+                        bool layoutChanged = _board != null;
                         _board = nextBoard;
+                        if (layoutChanged)
+                        {
+                            _tracker.NotifyBoardTopologyChanged();
+                        }
                         _needsUnitSync = true;
                         _planDirty = true;
                     }

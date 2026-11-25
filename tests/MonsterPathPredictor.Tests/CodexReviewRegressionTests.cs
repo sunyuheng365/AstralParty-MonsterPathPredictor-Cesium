@@ -1242,5 +1242,139 @@ namespace MonsterPathPredictor.Tests
             float exactPhase = DashGeometry.ComputeClippedDashPhase(0.0, 10.0, trimHi, trimLo, 0.0, 16.0);
             Assert.Equal(2f, exactPhase, 3);
         }
+
+        [Fact]
+        public void Round10CoreRegressions_RationalPreReduce_ExactNearPlane_ExactModPeriod_DirectEndTrim_DirectFloatRound()
+        {
+            // Round 10 (#13): (1/3) * (2^61 / 2^62) cascade MUST pre-reduce 2^61/2^62 -> 1/2 before multiplying by 1/3,
+            // yielding exact 1/3 + 1/6 = 1/2 on both exits and IsExactUniformSplit == true!
+            var adj61 = new Dictionary<int, List<int>>
+            {
+                [0] = new List<int> { 1, 5 }, // back node -> fork 1, and U-turn path to T1 at 5
+                [1] = new List<int> { 2, 3, 0 }, // fork with forward exits 2, 3 and back 0
+                [2] = new List<int> { 4, 5, 1 },
+                [3] = new List<int> { 4, 5, 1 },
+                [5] = new List<int> { 0, 2, 3 } // 1st target T1 at distance 2 via 0, 2, 3 -> 1/3 each (1/3 U-turn!)
+            };
+            void AddE61(int u, int v) { if (!adj61.TryGetValue(u, out var l)) adj61[u] = l = new List<int>(); if (!l.Contains(v)) l.Add(v); }
+            // Shared 61-diamond chain from node 4 to T2: gives 2^61 shortest paths from 2 and 2^61 from 3!
+            int cur61 = 4;
+            int nid61 = 10;
+            for (int d = 0; d < 61; d++)
+            {
+                int l1 = nid61++, l2 = nid61++, join = nid61++;
+                AddE61(cur61, l1); AddE61(cur61, l2); AddE61(l1, join); AddE61(l2, join);
+                cur61 = join;
+            }
+            int targetT2 = cur61;
+            AddE61(targetT2, targetT2);
+            var board61 = new BoardGraph(adj61.Select(kv => new LandNodeSnapshot(kv.Key, kv.Value.ToArray())).ToArray());
+            var fieldT2 = board61.ComputeShortestPathsTo(targetT2);
+            Assert.True(fieldT2.TryGetExactPathCount(2, out long c2_61));
+            Assert.True(fieldT2.TryGetExactPathCount(3, out long c3_61));
+            Assert.Equal(1L << 61, c2_61);
+            Assert.Equal(1L << 61, c3_61);
+            var plan61 = MonsterPathEngine.Plan(
+                board61,
+                new MonsterState { MonsterId = 1013, CurrentLandId = 1, FromLandId = 0, IsCurrentlyMovingMidTurn = true },
+                new List<TrackedPlayer>
+                {
+                    new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = 5, IsAlive = true, IsTargetable = true },
+                    new TrackedPlayer { PlayerId = 2, Slot = 1, LandId = targetT2, IsAlive = true, IsTargetable = true }
+                },
+                new PlanOptions { MaxSteps = 1 });
+            var fork61 = plan61.Forks.Single(f => f.ForkLandId == 1);
+            Assert.True(fork61.IsExactUniformSplit);
+            Assert.Equal(0.5, fork61.Exits[0].ConditionalProbability);
+            Assert.Equal(0.5, fork61.Exits[1].ConditionalProbability);
+
+            // Round 10 (#18): Symmetric huge near-plane clip A=(1,0,-2^60) -> B=(1,0,2^60), near=1 -> exact z=1f!
+            float h60 = (float)Math.Pow(2.0, 60);
+            Assert.True(DashGeometry.TryClipSegmentToNearPlane(
+                1f, 0f, -h60, 1f, 0f, h60,
+                0f, 0f, 0f, 0f, 0f, 1f, 1f,
+                out float c18Ax, out float c18Ay, out float c18Az, out float c18Bx, out _, out float c18Bz,
+                out bool c18ClipS, out bool c18ClipE));
+            Assert.True(c18ClipS);
+            Assert.False(c18ClipE);
+            Assert.Equal(1f, c18Ax);
+            Assert.Equal(0f, c18Ay);
+            Assert.Equal(1f, c18Az);
+            Assert.Equal(1f, c18Bx);
+            Assert.Equal(h60, c18Bz);
+
+            // Round 10 (#19): Opposing 3-term dot product cancellation H=2^60, fwd=(0.5, float(sqrt(0.5)), 0.5), near=1
+            float sqrtHalf = (float)Math.Sqrt(0.5);
+            double exactDepthA = DashGeometry.ComputeCameraDepth(h60, 2f, -h60, 0f, 0f, 0f, 0.5f, sqrtHalf, 0.5f);
+            double exactDepthB = DashGeometry.ComputeCameraDepth(-h60, 2f, h60, 0f, 0f, 0f, 0.5f, sqrtHalf, 0.5f);
+            Assert.InRange(exactDepthA, 1.414, 1.415);
+            Assert.InRange(exactDepthB, 1.414, 1.415);
+            Assert.True(DashGeometry.TryClipSegmentToNearPlane(
+                h60, 2f, -h60, -h60, 2f, h60,
+                0f, 0f, 0f, 0.5f, sqrtHalf, 0.5f, 1f,
+                out _, out _, out _, out _, out _, out _,
+                out bool c19ClipS, out bool c19ClipE));
+            Assert.False(c19ClipS);
+            Assert.False(c19ClipE);
+
+            // Round 10 (#20): Small-denominator crossing segment fwd=(2^-42,0,1), near=1, (-1,0,1)->(1,0,1) -> (0,0,1)->(1,0,1)
+            float tinyFwdX = (float)Math.Pow(2.0, -42);
+            Assert.True(DashGeometry.TryClipSegmentToNearPlane(
+                -1f, 0f, 1f, 1f, 0f, 1f,
+                0f, 0f, 0f, tinyFwdX, 0f, 1f, 1f,
+                out float c20Ax, out float c20Ay, out float c20Az, out float c20Bx, out _, out float c20Bz,
+                out bool c20ClipS, out bool c20ClipE));
+            Assert.True(c20ClipS);
+            Assert.False(c20ClipE);
+            Assert.Equal(0f, c20Ax);
+            Assert.Equal(0f, c20Ay);
+            Assert.Equal(1f, c20Az);
+            Assert.Equal(1f, c20Bx);
+            Assert.Equal(1f, c20Bz);
+
+            // Round 10 (#21 & #22): Exact arbitrary-precision startTrimModPeriod (horizontal H=2^113 & diagonal D=2^120)
+            // and direct endTrimPx == 0 when end is unclipped (H=2^60).
+            float h113 = (float)Math.Pow(2.0, 113);
+            Assert.True(DashGeometry.TryClipSegmentToRect(
+                new Point2(-h113, 0f), new Point2(100f, 0f),
+                -40f, -40f, 800f, 100f, 16.0,
+                out var c21A, out var c21B, out _, out double startMod113, out double endTrim113));
+            Assert.Equal(-40f, c21A.X);
+            Assert.Equal(100f, c21B.X);
+            Assert.Equal(8.0, startMod113, 6);
+            Assert.Equal(0.0, endTrim113);
+            Assert.Equal(2f, DashGeometry.ComputeClippedDashPhase(0.0, 10.0, startMod113, 0.0, 16.0), 4);
+
+            float d120 = (float)Math.Pow(2.0, 120);
+            Assert.True(DashGeometry.TryClipSegmentToRect(
+                new Point2(-d120, -d120), new Point2(100f, 100f),
+                0f, 0f, 800f, 100f, 16.0,
+                out var c21dA, out var c21dB, out _, out double startModDiag, out double endTrimDiag));
+            Assert.Equal(0f, c21dA.X);
+            Assert.Equal(0f, c21dA.Y);
+            Assert.Equal(100f, c21dB.X);
+            Assert.Equal(100f, c21dB.Y);
+            Assert.Equal(0.0, endTrimDiag);
+            float diagPhase = DashGeometry.ComputeClippedDashPhase(0.0, 0.0, startModDiag, 0.0, 16.0);
+            Assert.InRange(diagPhase, 2.7568f, 2.7570f);
+
+            // #22: Unclipped end at x=200 from x=-2^60 MUST return exact endTrimPx == 0.0 (preserving origTrimEnd=3.0)
+            Assert.True(DashGeometry.TryClipSegmentToRect(
+                new Point2(-h60, 0f), new Point2(200f, 0f),
+                -40f, -40f, 800f, 100f, 16.0,
+                out _, out _, out _, out _, out double endTrim60));
+            Assert.Equal(0.0, endTrim60);
+
+            // Round 10 (#23): (-1,1)->(1, 1+2^-23) clipped at minX=2^-40 has exact y=1+2^-24+2^-64,
+            // which MUST round directly to binary32 1+2^-23 (NOT double-round through binary64 to 1f)!
+            float eps23 = (float)Math.Pow(2.0, -23);
+            float minX40 = (float)Math.Pow(2.0, -40);
+            Assert.True(DashGeometry.TryClipSegmentToRect(
+                new Point2(-1f, 1f), new Point2(1f, 1f + eps23),
+                minX40, 0f, 10f, 10f,
+                out var c23A, out _, out double _));
+            Assert.Equal(minX40, c23A.X);
+            Assert.Equal(1f + eps23, c23A.Y);
+        }
     }
 }

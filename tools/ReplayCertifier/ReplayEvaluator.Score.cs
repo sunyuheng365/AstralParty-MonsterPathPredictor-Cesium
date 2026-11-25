@@ -152,8 +152,9 @@ namespace MonsterPathPredictor.ReplayCertifier
 
             // Strip any MoveS2C prefix echoing one or more ordered (From -> To) skill displacements applied by 1040/1096.Place.
             // StripSkillDisplacementPrefix removes ONLY confirmed matched hops so split echoes (e.g. [1,2] then [2,3])
-            // keep remaining unconsumed hops for the follow-up frame.
-            int idx = StripSkillDisplacementPrefix(mover, nodeIds);
+            // keep remaining unconsumed hops, while partial echoes merged with walking from the authoritative landing tile
+            // (e.g. [1,2,4] after 1->2->3 with edge 3->4) resume walking cleanly from mover.NodeId.
+            int idx = StripSkillDisplacementPrefix(mover, nodeIds, board);
 
             if (idx >= nodeIds.Length)
             {
@@ -233,14 +234,33 @@ namespace MonsterPathPredictor.ReplayCertifier
             return true;
         }
 
-        private static int StripSkillDisplacementPrefix(UnitSim u, int[] nodeIds)
+        private static bool HasSelfMoveAwayFromTile(dynamic attr, long unitId, int currentNodeId)
+        {
+            if (attr?.EffectDatas == null) return false;
+            foreach (dynamic eff in (IEnumerable)attr.EffectDatas)
+            {
+                if (eff == null) continue;
+                if ((long)eff.PlayerId == unitId && eff.Place?.Place != null)
+                {
+                    int dst = (int)eff.Place.Place.NodeId;
+                    if (dst >= 0 && dst != currentNodeId) return true;
+                }
+            }
+            return false;
+        }
+
+        private static int StripSkillDisplacementPrefix(UnitSim u, int[] nodeIds, BoardGraph board)
         {
             var hops = u.PendingDisplacementHops;
             if (hops.Count == 0 || u.NodeId != hops[^1].To || nodeIds.Length == 0)
                 return 0;
 
-            // Match either from hop 0 (full echo [1,2,3], split prefix [1,2], or single-node [2])
-            // OR from a later hop startHop > 0 when an earlier hop echo was omitted (e.g. [2,3] when [(1,2),(2,3)] pending).
+            int bestPos = 0;
+            int bestLastMatchedHop = -1;
+
+            // Match either from hop 0 (full echo [1,2,3], split prefix [1,2], single-node [2], or partial
+            // echo merged with valid walking from authoritative landing tile [1,2,4]) OR from a later hop
+            // startHop > 0 when an earlier hop echo was omitted (e.g. [2,3] when [(1,2),(2,3)] pending).
             for (int startHop = 0; startHop < hops.Count; startHop++)
             {
                 int pos = 0;
@@ -286,11 +306,25 @@ namespace MonsterPathPredictor.ReplayCertifier
                     }
                 }
 
-                if (lastMatchedHop >= 0 && (pos == nodeIds.Length || lastMatchedHop == hops.Count - 1))
+                bool remainingWalksFromLanding =
+                    pos < nodeIds.Length &&
+                    (nodeIds[pos] == u.NodeId ||
+                     (board != null && board.Contains(u.NodeId) && board.Contains(nodeIds[pos]) && board.IsValidNeighbor(u.NodeId, nodeIds[pos])));
+
+                if (lastMatchedHop >= 0 && (pos == nodeIds.Length || lastMatchedHop == hops.Count - 1 || remainingWalksFromLanding))
                 {
-                    hops.RemoveRange(0, lastMatchedHop + 1);
-                    return pos;
+                    if (pos > bestPos || (pos == bestPos && lastMatchedHop > bestLastMatchedHop))
+                    {
+                        bestPos = pos;
+                        bestLastMatchedHop = lastMatchedHop;
+                    }
                 }
+            }
+
+            if (bestLastMatchedHop >= 0)
+            {
+                hops.RemoveRange(0, bestLastMatchedHop + 1);
+                return bestPos;
             }
 
             return 0;

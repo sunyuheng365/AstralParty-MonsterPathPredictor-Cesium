@@ -49,6 +49,7 @@ namespace MonsterPathPredictor.Runtime
             public int SkillId;
             public long MatchRoomId;
             public long MatchStartTime;
+            public int MatchGeneration;
             public DateTime TimestampUtc;
             public HashSet<long> AppliedMonsterIds = new HashSet<long>();
         }
@@ -62,6 +63,7 @@ namespace MonsterPathPredictor.Runtime
             public int BackLandId;
             public long MatchRoomId;
             public long MatchStartTime;
+            public int MatchGeneration;
             public DateTime TimestampUtc;
         }
 
@@ -76,6 +78,7 @@ namespace MonsterPathPredictor.Runtime
             public int Round;
             public long MatchRoomId;
             public long MatchStartTime;
+            public int MatchGeneration;
         }
 
         private struct ThiefStealRecord
@@ -86,6 +89,7 @@ namespace MonsterPathPredictor.Runtime
             public int Round;
             public long MatchRoomId;
             public long MatchStartTime;
+            public int MatchGeneration;
         }
 
         private const int MaxQueuedEvents = 256;
@@ -109,6 +113,8 @@ namespace MonsterPathPredictor.Runtime
 
         private long _activeActorId;
         private int _activeActorStartLandId = -1;
+        private int _activeActorLastSeenLandId = -1;
+        private bool _turnStartLayoutInvalidated;
         private bool _activeActorSteppedThisTurn;
         private int _turnSequence;
         private int _eventTurnEpoch;
@@ -117,6 +123,7 @@ namespace MonsterPathPredictor.Runtime
 
         private long _matchRoomId;
         private long _matchStartTime;
+        private int _matchGeneration;
         private bool _hooked;
         private volatile bool _acceptEvents;
 
@@ -170,13 +177,39 @@ namespace MonsterPathPredictor.Runtime
             while (_thiefStealQueue.TryDequeue(out _)) { }
             _activeActorId = 0;
             _activeActorStartLandId = -1;
+            _activeActorLastSeenLandId = -1;
+            _turnStartLayoutInvalidated = false;
             _activeActorSteppedThisTurn = false;
             _turnSequence = 0;
-            Interlocked.Exchange(ref _eventTurnEpoch, 0);
-            _lastObservedTurnEpoch = 0;
+            // Keep _eventTurnEpoch strictly monotonic across matches so new-match dice/combat events
+            // arriving before ResetForNewMatch never fail TurnEpoch equality checks.
+            _lastObservedTurnEpoch = Volatile.Read(ref _eventTurnEpoch);
             _lastObservedRound = -1;
             _matchRoomId = 0;
             _matchStartTime = 0;
+            Interlocked.Increment(ref _matchGeneration);
+        }
+
+        /// <summary>
+        /// Clears old-layout turn-start anchor and tile-scoped memory when the board topology switches mid-match,
+        /// while preserving active actor turn identity and turn-level progress.
+        /// </summary>
+        public void NotifyBoardTopologyChanged()
+        {
+            _activeActorStartLandId = -1;
+            _activeActorLastSeenLandId = -1;
+            _turnStartLayoutInvalidated = true;
+            _pendingPlaceByMonster.Clear();
+            foreach (var mem in _memories.Values)
+            {
+                mem.JustSpawnedOnFork = false;
+                mem.JustFoughtOnFork = false;
+                mem.CombatForkLandId = -1;
+                mem.SkillMoveKind = SkillMoveKind.None;
+                mem.SkillMoveLandId = -1;
+                mem.SkillMovePushDirId = -1;
+                mem.SkillMovePushFromId = -1;
+            }
         }
 
         public bool IsMonsterInAliveRoster(long monsterId)
@@ -303,6 +336,7 @@ namespace MonsterPathPredictor.Runtime
             int curRound = TryReadCurrentRound();
             int causeId = attr.Cause != null ? (int)attr.Cause.Id : 0;
             TryStampCurrentMatch(out long matchRoomId, out long matchStartTime);
+            int matchGen = Volatile.Read(ref _matchGeneration);
 
             for (int i = 0; i < attr.EffectDatas.Count; i++)
             {
@@ -320,7 +354,8 @@ namespace MonsterPathPredictor.Runtime
                         TurnEpoch = curEpoch,
                         Round = curRound,
                         MatchRoomId = matchRoomId,
-                        MatchStartTime = matchStartTime
+                        MatchStartTime = matchStartTime,
+                        MatchGeneration = matchGen
                     });
                 }
 
@@ -338,6 +373,7 @@ namespace MonsterPathPredictor.Runtime
                         BackLandId = eff.Place.Place.BackNodeId,
                         MatchRoomId = matchRoomId,
                         MatchStartTime = matchStartTime,
+                        MatchGeneration = matchGen,
                         TimestampUtc = DateTime.UtcNow
                     });
                 }
@@ -349,6 +385,7 @@ namespace MonsterPathPredictor.Runtime
             if (!_acceptEvents) return;
             if (snap.AttackerPlayerId == 0 && snap.DefenderPlayerId == 0) return;
             TryStampCurrentMatch(out long matchRoomId, out long matchStartTime);
+            int matchGen = Volatile.Read(ref _matchGeneration);
             if (_combatQueue.Count >= MaxQueuedEvents) _combatQueue.TryDequeue(out _);
             _combatQueue.Enqueue(new CombatRecord
             {
@@ -360,7 +397,8 @@ namespace MonsterPathPredictor.Runtime
                 TurnEpoch = Volatile.Read(ref _eventTurnEpoch),
                 Round = TryReadCurrentRound(),
                 MatchRoomId = matchRoomId,
-                MatchStartTime = matchStartTime
+                MatchStartTime = matchStartTime,
+                MatchGeneration = matchGen
             });
         }
 
@@ -372,6 +410,7 @@ namespace MonsterPathPredictor.Runtime
             if (atk != 0 || def != 0)
             {
                 TryStampCurrentMatch(out long matchRoomId, out long matchStartTime);
+                int matchGen = Volatile.Read(ref _matchGeneration);
                 if (_combatQueue.Count >= MaxQueuedEvents) _combatQueue.TryDequeue(out _);
                 _combatQueue.Enqueue(new CombatRecord
                 {
@@ -383,7 +422,8 @@ namespace MonsterPathPredictor.Runtime
                     TurnEpoch = Volatile.Read(ref _eventTurnEpoch),
                     Round = TryReadCurrentRound(),
                     MatchRoomId = matchRoomId,
-                    MatchStartTime = matchStartTime
+                    MatchStartTime = matchStartTime,
+                    MatchGeneration = matchGen
                 });
             }
         }
@@ -417,7 +457,9 @@ namespace MonsterPathPredictor.Runtime
                 _activeActorId = curActorId;
                 _lastObservedTurnEpoch = curEpoch;
                 if (curRound >= 0) _lastObservedRound = curRound;
+                _turnStartLayoutInvalidated = false;
                 _activeActorStartLandId = SafeLandId(currentActor);
+                _activeActorLastSeenLandId = _activeActorStartLandId;
                 _activeActorSteppedThisTurn = false;
             }
             else if (curActorId != 0)
@@ -426,13 +468,18 @@ namespace MonsterPathPredictor.Runtime
                 int nowLand = SafeLandId(currentActor);
                 if (nowLand >= 0)
                 {
-                    if (_activeActorStartLandId < 0)
+                    if (!_turnStartLayoutInvalidated && _activeActorStartLandId < 0)
                     {
                         _activeActorStartLandId = nowLand;
                     }
-                    else if (nowLand != _activeActorStartLandId)
+                    if (_activeActorLastSeenLandId < 0)
+                    {
+                        _activeActorLastSeenLandId = nowLand;
+                    }
+                    else if (nowLand != _activeActorLastSeenLandId)
                     {
                         _activeActorSteppedThisTurn = true;
+                        _activeActorLastSeenLandId = nowLand;
                     }
                 }
             }
@@ -444,6 +491,7 @@ namespace MonsterPathPredictor.Runtime
         {
             if (!_acceptEvents) return;
             TryStampCurrentMatch(out long matchRoomId, out long matchStartTime);
+            int matchGen = Volatile.Read(ref _matchGeneration);
             if (_skillQueue.Count >= MaxQueuedEvents) _skillQueue.TryDequeue(out _);
             _skillQueue.Enqueue(new SkillCastRecord
             {
@@ -451,6 +499,7 @@ namespace MonsterPathPredictor.Runtime
                 SkillId = skillId,
                 MatchRoomId = matchRoomId,
                 MatchStartTime = matchStartTime,
+                MatchGeneration = matchGen,
                 TimestampUtc = DateTime.UtcNow
             });
         }
@@ -798,32 +847,43 @@ namespace MonsterPathPredictor.Runtime
             }
         }
 
-        private bool IsMatchingEventStamp(long eventRoomId, long eventStartTime)
+        private bool IsMatchingEventStamp(long eventRoomId, long eventStartTime, int eventMatchGeneration)
         {
-            if (_matchRoomId == 0 && _matchStartTime == 0) return true;
-            if (eventRoomId == 0 && eventStartTime == 0) return true;
-            return eventRoomId == _matchRoomId && eventStartTime == _matchStartTime;
+            if (_matchRoomId == 0 && _matchStartTime == 0)
+                return eventMatchGeneration == Volatile.Read(ref _matchGeneration);
+            if (eventRoomId != 0 || eventStartTime != 0)
+                return eventRoomId == _matchRoomId && eventStartTime == _matchStartTime;
+            // Failed-stamp (0,0) events must belong to the current match generation and cannot cross a confirmed match switch.
+            return eventMatchGeneration == Volatile.Read(ref _matchGeneration);
         }
 
-        private void ResetForNewMatch(long newRoomId, long newStartTime)
+        private void ResetForNewMatch(long newRoomId, long newStartTime, bool confirmedMatchSwitch)
         {
             _memories.Clear();
             _rosterAliveMonsterIds.Clear();
             _activeActorId = 0;
             _activeActorStartLandId = -1;
+            _activeActorLastSeenLandId = -1;
+            _turnStartLayoutInvalidated = false;
             _activeActorSteppedThisTurn = false;
             _turnSequence = 0;
-            Interlocked.Exchange(ref _eventTurnEpoch, 0);
-            _lastObservedTurnEpoch = 0;
+            // Keep _eventTurnEpoch strictly monotonic across matches so new-match dice + combat events
+            // arriving before the first LateUpdate retain matching TurnEpoch values.
+            _lastObservedTurnEpoch = Volatile.Read(ref _eventTurnEpoch);
             _lastObservedRound = -1;
             _matchRoomId = newRoomId;
             _matchStartTime = newStartTime;
+            if (confirmedMatchSwitch)
+            {
+                Interlocked.Increment(ref _matchGeneration);
+            }
 
-            // Prune ONLY events belonging to previous matches; preserve events already received
-            // and stamped for the new match before the first LateUpdate observed the room switch.
+            // Prune previous-match entries from main-thread collections. Concurrent queues are NOT
+            // dequeued-and-reenqueued here so strict FIFO arrival order is never reversed; DrainPlaceQueue
+            // and DrainEventQueues filter every dequeued record via IsMatchingEventStamp in arrival order.
             for (int i = _recentSkills.Count - 1; i >= 0; i--)
             {
-                if (!IsMatchingEventStamp(_recentSkills[i].MatchRoomId, _recentSkills[i].MatchStartTime))
+                if (!IsMatchingEventStamp(_recentSkills[i].MatchRoomId, _recentSkills[i].MatchStartTime, _recentSkills[i].MatchGeneration))
                     _recentSkills.RemoveAt(i);
             }
 
@@ -833,7 +893,7 @@ namespace MonsterPathPredictor.Runtime
                 var list = kv.Value;
                 for (int i = list.Count - 1; i >= 0; i--)
                 {
-                    if (!IsMatchingEventStamp(list[i].MatchRoomId, list[i].MatchStartTime))
+                    if (!IsMatchingEventStamp(list[i].MatchRoomId, list[i].MatchStartTime, list[i].MatchGeneration))
                         list.RemoveAt(i);
                 }
                 if (list.Count == 0)
@@ -846,31 +906,6 @@ namespace MonsterPathPredictor.Runtime
             {
                 for (int i = 0; i < emptyMonsters.Count; i++) _pendingPlaceByMonster.Remove(emptyMonsters[i]);
             }
-
-            int skillCount = _skillQueue.Count;
-            for (int i = 0; i < skillCount && _skillQueue.TryDequeue(out var sk); i++)
-            {
-                if (sk != null && IsMatchingEventStamp(sk.MatchRoomId, sk.MatchStartTime))
-                    _skillQueue.Enqueue(sk);
-            }
-            int placeCount = _placeQueue.Count;
-            for (int i = 0; i < placeCount && _placeQueue.TryDequeue(out var pl); i++)
-            {
-                if (pl != null && IsMatchingEventStamp(pl.MatchRoomId, pl.MatchStartTime))
-                    _placeQueue.Enqueue(pl);
-            }
-            int combatCount = _combatQueue.Count;
-            for (int i = 0; i < combatCount && _combatQueue.TryDequeue(out var c); i++)
-            {
-                if (IsMatchingEventStamp(c.MatchRoomId, c.MatchStartTime))
-                    _combatQueue.Enqueue(c);
-            }
-            int stealCount = _thiefStealQueue.Count;
-            for (int i = 0; i < stealCount && _thiefStealQueue.TryDequeue(out var ts); i++)
-            {
-                if (IsMatchingEventStamp(ts.MatchRoomId, ts.MatchStartTime))
-                    _thiefStealQueue.Enqueue(ts);
-            }
         }
 
         private bool EnsureSameMatch()
@@ -880,7 +915,7 @@ namespace MonsterPathPredictor.Runtime
                 bool hadMatch = _matchRoomId != 0 || _matchStartTime != 0;
                 if (_matchRoomId != info.RoomId || _matchStartTime != info.StartTime)
                 {
-                    ResetForNewMatch(info.RoomId, info.StartTime);
+                    ResetForNewMatch(info.RoomId, info.StartTime, confirmedMatchSwitch: hadMatch);
                     return hadMatch;
                 }
             }
@@ -908,7 +943,7 @@ namespace MonsterPathPredictor.Runtime
             while (_placeQueue.TryDequeue(out var pl))
             {
                 if (pl == null || pl.TargetMonsterId == 0 || pl.NewLandId < 0) continue;
-                if (!IsMatchingEventStamp(pl.MatchRoomId, pl.MatchStartTime)) continue;
+                if (!IsMatchingEventStamp(pl.MatchRoomId, pl.MatchStartTime, pl.MatchGeneration)) continue;
                 if (!_pendingPlaceByMonster.TryGetValue(pl.TargetMonsterId, out var list))
                 {
                     list = new List<SkillDisplacementRecord>(4);
@@ -929,7 +964,7 @@ namespace MonsterPathPredictor.Runtime
             var now = DateTime.UtcNow;
             while (_skillQueue.TryDequeue(out var sk))
             {
-                if (sk != null && IsMatchingEventStamp(sk.MatchRoomId, sk.MatchStartTime))
+                if (sk != null && IsMatchingEventStamp(sk.MatchRoomId, sk.MatchStartTime, sk.MatchGeneration))
                     _recentSkills.Add(sk);
             }
             for (int i = _recentSkills.Count - 1; i >= 0; i--)
@@ -947,7 +982,7 @@ namespace MonsterPathPredictor.Runtime
             combatByUnit = new Dictionary<long, PendingUnitCombat>();
             while (_combatQueue.TryDequeue(out var c))
             {
-                if (!IsMatchingEventStamp(c.MatchRoomId, c.MatchStartTime)) continue;
+                if (!IsMatchingEventStamp(c.MatchRoomId, c.MatchStartTime, c.MatchGeneration)) continue;
                 if (c.AttackerId != 0)
                     combatByUnit[c.AttackerId] = new PendingUnitCombat
                     {
@@ -969,7 +1004,7 @@ namespace MonsterPathPredictor.Runtime
             thiefStealsByUnit = new Dictionary<long, PendingThiefSteal>();
             while (_thiefStealQueue.TryDequeue(out var ts))
             {
-                if (!IsMatchingEventStamp(ts.MatchRoomId, ts.MatchStartTime)) continue;
+                if (!IsMatchingEventStamp(ts.MatchRoomId, ts.MatchStartTime, ts.MatchGeneration)) continue;
                 if (ts.ThiefId != 0)
                     thiefStealsByUnit[ts.ThiefId] = new PendingThiefSteal
                     {
@@ -1034,6 +1069,9 @@ namespace MonsterPathPredictor.Runtime
                 bool hopChangedTile = (nextLand != simLand);
                 if (hopChangedTile)
                 {
+                    mem.JustSpawnedOnFork = false;
+                    mem.JustFoughtOnFork = false;
+                    mem.CombatForkLandId = -1;
                     mem.SkillMoveKind = SkillMoveKind.None;
                     mem.SkillMoveLandId = -1;
                     mem.SkillMovePushDirId = -1;

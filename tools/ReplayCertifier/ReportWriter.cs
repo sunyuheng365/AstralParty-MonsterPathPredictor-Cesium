@@ -210,37 +210,113 @@ namespace MonsterPathPredictor.ReplayCertifier
             return full.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
         }
 
-        public static string ResolveCanonicalPath(string path)
+        private static bool HasCaseVaryingLetter(string s)
         {
-            if (string.IsNullOrWhiteSpace(path)) return null;
-            string full = TrimTrailingSepPreservingRoot(Path.GetFullPath(path));
-            if (string.IsNullOrEmpty(full)) return Path.GetFullPath(path);
+            if (string.IsNullOrEmpty(s)) return false;
+            for (int i = 0; i < s.Length; i++)
+            {
+                if (char.IsLetter(s[i])) return true;
+            }
+            return false;
+        }
+
+        private static string ResolveExactOnDiskComponentName(string parentDir, string component)
+        {
+            if (string.IsNullOrEmpty(parentDir) || string.IsNullOrEmpty(component)) return component;
+            if (OperatingSystem.IsLinux() || !HasCaseVaryingLetter(component)) return component;
 
             try
             {
-                // Resolve every symlink component along the path from root toward leaf so directory aliases
-                // (e.g. alias/report or alias/sub/report where alias -> out) resolve to the exact physical path
-                // even before the target report file exists on disk.
+                string caseInsensitiveMatch = null;
+                int ciCount = 0;
+                var opts = new EnumerationOptions
+                {
+                    AttributesToSkip = 0,
+                    IgnoreInaccessible = true,
+                    RecurseSubdirectories = false
+                };
+                foreach (string entry in Directory.EnumerateFileSystemEntries(parentDir, "*", opts))
+                {
+                    string name = Path.GetFileName(entry);
+                    if (string.Equals(name, component, StringComparison.Ordinal))
+                    {
+                        // Exact-case entry exists on disk (crucial on case-sensitive APFS / NTFS where
+                        // "cache" and "CACHE" are distinct sibling directories).
+                        return component;
+                    }
+                    if (string.Equals(name, component, StringComparison.OrdinalIgnoreCase))
+                    {
+                        caseInsensitiveMatch = name;
+                        ciCount++;
+                    }
+                }
+                if (ciCount == 1 && caseInsensitiveMatch != null)
+                {
+                    return caseInsensitiveMatch;
+                }
+            }
+            catch { }
+            return component;
+        }
+
+        public static string ResolveCanonicalPath(string path)
+        {
+            return ResolveCanonicalPathCore(path, 0);
+        }
+
+        private static string ResolveCanonicalPathCore(string path, int depth)
+        {
+            if (string.IsNullOrWhiteSpace(path)) return null;
+            string full = TrimTrailingSepPreservingRoot(Path.GetFullPath(path));
+            if (string.IsNullOrEmpty(full) || depth > 16) return full;
+
+            try
+            {
+                // Resolve both symlinks AND actual on-disk component casing from root toward leaf:
+                // - On case-sensitive APFS / Linux / case-sensitive NTFS, sibling "cache" and "CACHE"
+                //   retain distinct canonical paths.
+                // - On case-insensitive APFS / NTFS, an alias like "CACHE" referencing the single
+                //   on-disk directory "cache" canonicalizes to "cache" only after verifying OS existence.
                 string root = Path.GetPathRoot(full) ?? string.Empty;
                 string remainder = full.Substring(root.Length);
+                if (OperatingSystem.IsWindows() && root.Length >= 2 && root[1] == ':')
+                {
+                    root = char.ToUpperInvariant(root[0]) + root.Substring(1);
+                }
+
                 string[] parts = remainder.Split(
                     new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar },
                     StringSplitOptions.RemoveEmptyEntries);
 
                 string cur = root;
+                bool ancestorExists = string.IsNullOrEmpty(root) || Directory.Exists(root);
                 for (int i = 0; i < parts.Length; i++)
                 {
-                    cur = string.IsNullOrEmpty(cur) ? parts[i] : Path.Combine(cur, parts[i]);
-                    if (File.Exists(cur))
+                    string part = parts[i];
+                    string candidate = string.IsNullOrEmpty(cur) ? part : Path.Combine(cur, part);
+                    if (ancestorExists)
                     {
-                        var target = new FileInfo(cur).ResolveLinkTarget(returnFinalTarget: true);
-                        if (target != null) cur = Path.GetFullPath(target.FullName);
+                        bool isFile = File.Exists(candidate);
+                        bool isDir = !isFile && Directory.Exists(candidate);
+                        if (isFile || isDir)
+                        {
+                            string exactName = ResolveExactOnDiskComponentName(cur, part);
+                            candidate = string.IsNullOrEmpty(cur) ? exactName : Path.Combine(cur, exactName);
+                            FileSystemInfo target = isFile
+                                ? new FileInfo(candidate).ResolveLinkTarget(returnFinalTarget: true)
+                                : new DirectoryInfo(candidate).ResolveLinkTarget(returnFinalTarget: true);
+                            if (target != null)
+                            {
+                                cur = ResolveCanonicalPathCore(target.FullName, depth + 1);
+                                ancestorExists = File.Exists(cur) || Directory.Exists(cur);
+                                continue;
+                            }
+                            cur = candidate;
+                            continue;
+                        }
+                        ancestorExists = false;
                     }
-                    else if (Directory.Exists(cur))
-                    {
-                        var target = new DirectoryInfo(cur).ResolveLinkTarget(returnFinalTarget: true);
-                        if (target != null) cur = Path.GetFullPath(target.FullName);
-                    }
+                    cur = candidate;
                 }
                 return TrimTrailingSepPreservingRoot(Path.GetFullPath(cur));
             }
@@ -278,17 +354,24 @@ namespace MonsterPathPredictor.ReplayCertifier
             return normFile.StartsWith(prefix, comparison);
         }
 
+        /// <summary>
+        /// Verifies whether <paramref name="filePath"/> resolves inside <paramref name="dirPath"/>
+        /// using canonical on-disk path identity and strict Ordinal comparison (fails closed on
+        /// case-sensitive volumes such as case-sensitive APFS or when directory identity cannot be confirmed).
+        /// </summary>
         public static bool IsPathInsideDirectory(string filePath, string dirPath)
+        {
+            return IsPathInsideDirectory(filePath, dirPath, StringComparison.Ordinal);
+        }
+
+        private static bool IsPathInsideDirectory(string filePath, string dirPath, StringComparison comparison)
         {
             if (string.IsNullOrWhiteSpace(filePath) || string.IsNullOrWhiteSpace(dirPath)) return false;
             try
             {
                 string normFile = ResolveCanonicalPath(filePath);
                 string normDir = ResolveCanonicalPath(dirPath);
-                var cmp = (OperatingSystem.IsWindows() || OperatingSystem.IsMacOS())
-                    ? StringComparison.OrdinalIgnoreCase
-                    : StringComparison.Ordinal;
-                return IsNormalizedPathInsideDirectory(normFile, normDir, Path.DirectorySeparatorChar, cmp);
+                return IsNormalizedPathInsideDirectory(normFile, normDir, Path.DirectorySeparatorChar, comparison);
             }
             catch
             {
@@ -299,9 +382,12 @@ namespace MonsterPathPredictor.ReplayCertifier
         public static bool HaveConflictingOutputPaths(string pathA, string pathB)
         {
             if (string.IsNullOrWhiteSpace(pathA) || string.IsNullOrWhiteSpace(pathB)) return false;
+            var conflictCmp = (OperatingSystem.IsWindows() || OperatingSystem.IsMacOS())
+                ? StringComparison.OrdinalIgnoreCase
+                : StringComparison.Ordinal;
             return AreSameOutputPath(pathA, pathB) ||
-                   IsPathInsideDirectory(pathA, pathB) ||
-                   IsPathInsideDirectory(pathB, pathA);
+                   IsPathInsideDirectory(pathA, pathB, conflictCmp) ||
+                   IsPathInsideDirectory(pathB, pathA, conflictCmp);
         }
 
         private static void ValidateWritableReportPath(string path, string label)

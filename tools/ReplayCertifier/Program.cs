@@ -399,7 +399,7 @@ namespace MonsterPathPredictor.ReplayCertifier
 
             void PublishCacheIfUnique(string savePath, byte[] bytes, CertificationSummary local)
             {
-                TryPublishCacheIfUnique(savePath, cacheDir, saveCache, bytes, local, cacheSeenSha, cacheSeenVerifiedId, cachePublishLock);
+                TryPublishCacheIfUnique(savePath, cacheDir, saveCache, bytes, local, cacheSeenSha, cacheSeenVerifiedId, cachePublishLock, decoder);
             }
 
             // Phase 1: Read and register ALL existing local cached files first (no recovery writes yet),
@@ -443,7 +443,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                 }
 
                 var local = SafeEvaluateReplay(id, bytes, decoder, catalog);
-                if (NeedsCacheRecovery(local))
+                if (ShouldEnterRecoveryPhase(local))
                 {
                     recoveryQueue.Add((id, savePath, local));
                     return;
@@ -459,30 +459,16 @@ namespace MonsterPathPredictor.ReplayCertifier
                 ReportProgress();
             }
 
-            // Phase 2: Download uncached IDs and attempt ONE automatic CDN recovery for corrupt cached files,
-            // with full semantic evaluation inside the CDN fallback loop and post-registration cache dedup.
+            // Phase 2: Download uncached IDs and attempt ONE automatic CDN recovery for corrupt or MissingMap
+            // cached files, with full semantic evaluation inside the CDN fallback loop and post-registration cache dedup.
             async ValueTask DownloadOrRecoverPhaseAsync((string Id, string SavePath, CertificationSummary CorruptLocal) item, CancellationToken ct)
             {
                 var (bytes, eval, receivedCorruptRemote) = await DownloadAndEvalAsync(item.Id, ct);
-                CertificationSummary finalLocal;
-                if (bytes != null && eval != null && ShouldAdoptRecoveryResult(eval))
+                CertificationSummary finalLocal = SelectRecoveryOutcome(
+                    item.Id, item.CorruptLocal, bytes, eval, receivedCorruptRemote, out bool shouldPublish);
+                if (shouldPublish)
                 {
-                    finalLocal = eval;
                     PublishCacheIfUnique(item.SavePath, bytes, finalLocal);
-                }
-                else if (item.CorruptLocal != null)
-                {
-                    finalLocal = item.CorruptLocal;
-                }
-                else if (eval != null)
-                {
-                    finalLocal = eval;
-                }
-                else
-                {
-                    finalLocal = receivedCorruptRemote
-                        ? new CertificationSummary { ReplaysAttempted = 1, RequestedReplayId = item.Id, TruncatedOrCorrupt = 1 }
-                        : new CertificationSummary { ReplaysAttempted = 1, RequestedReplayId = item.Id, DownloadFailed = 1 };
                 }
 
                 perReplay.Add(finalLocal);
@@ -642,6 +628,35 @@ namespace MonsterPathPredictor.ReplayCertifier
         public static bool NeedsCacheRecovery(CertificationSummary s)
         {
             return s != null && (s.TruncatedOrCorrupt > 0 || s.ParseErrors > 0 || s.IllegalMoveEdges > 0);
+        }
+
+        public static bool ShouldEnterRecoveryPhase(CertificationSummary s)
+        {
+            return NeedsCacheRecovery(s) || (s != null && s.MissingMap > 0);
+        }
+
+        public static CertificationSummary SelectRecoveryOutcome(
+            string replayId,
+            CertificationSummary localFallback,
+            byte[] remoteBytes,
+            CertificationSummary remoteEval,
+            bool receivedCorruptRemote,
+            out bool shouldPublish)
+        {
+            shouldPublish = false;
+            bool localWasMissingMapOnly = localFallback != null && localFallback.MissingMap > 0 && !NeedsCacheRecovery(localFallback);
+            bool adoptRemote = remoteBytes != null && remoteEval != null &&
+                (localWasMissingMapOnly ? IsCacheableAndClean(remoteEval) : ShouldAdoptRecoveryResult(remoteEval));
+            if (adoptRemote)
+            {
+                shouldPublish = true;
+                return remoteEval;
+            }
+            if (localFallback != null) return localFallback;
+            if (remoteEval != null) return remoteEval;
+            return receivedCorruptRemote
+                ? new CertificationSummary { ReplaysAttempted = 1, RequestedReplayId = replayId, TruncatedOrCorrupt = 1 }
+                : new CertificationSummary { ReplaysAttempted = 1, RequestedReplayId = replayId, DownloadFailed = 1 };
         }
 
         public static bool ShouldAdoptRecoveryResult(CertificationSummary s)
@@ -898,6 +913,8 @@ namespace MonsterPathPredictor.ReplayCertifier
             }
         }
 
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, Dictionary<string, (long Length, long LastWriteTicks)>> _publishDiskScanCache = new();
+
         public static bool TryPublishCacheIfUnique(
             string savePath,
             string cacheRootDir,
@@ -906,28 +923,122 @@ namespace MonsterPathPredictor.ReplayCertifier
             CertificationSummary local,
             ConcurrentDictionary<string, byte> cacheSeenSha,
             ConcurrentDictionary<string, byte> cacheSeenVerifiedId,
-            object publishLock)
+            object publishLock,
+            IProtocolDecoder decoder = null)
         {
             if (!IsCacheableAndClean(local)) return false;
+            if (saveCache && string.IsNullOrWhiteSpace(savePath)) return false;
+
             lock (publishLock)
             {
-                bool alreadySeen =
-                    (!string.IsNullOrEmpty(local.ContentSha256) && cacheSeenSha.ContainsKey(local.ContentSha256)) ||
-                    (!string.IsNullOrEmpty(local.VerifiedReplayId) && cacheSeenVerifiedId.ContainsKey(local.VerifiedReplayId));
-                if (alreadySeen) return false;
-
-                if (saveCache && savePath != null)
+                FileStream crossProcLock = null;
+                try
                 {
-                    // Commit dedup identity ONLY after atomic write succeeds inside cacheRootDir;
-                    // if publishing fails (e.g. target blocked by directory or symlink escaping cacheRootDir),
-                    // release identity so another valid target with the same replay can still publish.
-                    if (!TryWriteCacheAtomic(savePath, bytes, cacheRootDir))
-                        return false;
-                }
+                    if (saveCache && !string.IsNullOrWhiteSpace(cacheRootDir))
+                    {
+                        if (!IsCacheTargetInsideCacheRoot(savePath, cacheRootDir))
+                            return false;
+                        crossProcLock = SafeCacheWriter.AcquireCacheRootLock(cacheRootDir);
+                        if (crossProcLock == null)
+                            return false;
 
-                if (!string.IsNullOrEmpty(local.ContentSha256)) cacheSeenSha.TryAdd(local.ContentSha256, 0);
-                if (!string.IsNullOrEmpty(local.VerifiedReplayId)) cacheSeenVerifiedId.TryAdd(local.VerifiedReplayId, 0);
-                return true;
+                        RefreshDiskCacheIdentityLocked(cacheRootDir, savePath, decoder, cacheSeenSha, cacheSeenVerifiedId, publishLock);
+                    }
+
+                    bool alreadySeen =
+                        (!string.IsNullOrEmpty(local.ContentSha256) && cacheSeenSha.ContainsKey(local.ContentSha256)) ||
+                        (!string.IsNullOrEmpty(local.VerifiedReplayId) && cacheSeenVerifiedId.ContainsKey(local.VerifiedReplayId));
+                    if (alreadySeen) return false;
+
+                    if (saveCache)
+                    {
+                        // Commit dedup identity ONLY after pinned-directory atomic write succeeds inside cacheRootDir;
+                        // if publishing fails, release identity so another valid target with the same replay can publish.
+                        if (!TryWriteCacheAtomic(savePath, bytes, cacheRootDir))
+                            return false;
+
+                        if (!string.IsNullOrWhiteSpace(cacheRootDir))
+                        {
+                            RecordPublishedFileScanStateLocked(publishLock, savePath);
+                        }
+                    }
+
+                    if (!string.IsNullOrEmpty(local.ContentSha256)) cacheSeenSha.TryAdd(local.ContentSha256, 0);
+                    if (!string.IsNullOrEmpty(local.VerifiedReplayId)) cacheSeenVerifiedId.TryAdd(local.VerifiedReplayId, 0);
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"WARN: Cache publish aborted for {savePath}: {ex.Message}");
+                    return false;
+                }
+                finally
+                {
+                    try { crossProcLock?.Dispose(); } catch { }
+                }
+            }
+        }
+
+        private static void RecordPublishedFileScanStateLocked(object publishLock, string savePath)
+        {
+            try
+            {
+                string canon = ReportWriter.ResolveCanonicalPath(savePath);
+                if (string.IsNullOrEmpty(canon)) return;
+                var fi = new FileInfo(canon);
+                if (!fi.Exists) return;
+                var scanState = _publishDiskScanCache.GetOrCreateValue(publishLock);
+                scanState[canon] = (fi.Length, fi.LastWriteTimeUtc.Ticks);
+            }
+            catch { }
+        }
+
+        private static void RefreshDiskCacheIdentityLocked(
+            string cacheRootDir,
+            string currentSavePath,
+            IProtocolDecoder decoder,
+            ConcurrentDictionary<string, byte> cacheSeenSha,
+            ConcurrentDictionary<string, byte> cacheSeenVerifiedId,
+            object publishLock)
+        {
+            if (string.IsNullOrWhiteSpace(cacheRootDir) || !Directory.Exists(cacheRootDir)) return;
+            var scanState = _publishDiskScanCache.GetOrCreateValue(publishLock);
+            string canonCurrent = !string.IsNullOrWhiteSpace(currentSavePath) ? ReportWriter.ResolveCanonicalPath(currentSavePath) : null;
+
+            var diskIds = DiscoverCachedReplayIds(cacheRootDir);
+            for (int i = 0; i < diskIds.Count; i++)
+            {
+                string extId = diskIds[i];
+                string extPath = ResolveCachedReplayPath(cacheRootDir, extId);
+                if (extPath == null) continue;
+                string canonExt = ReportWriter.ResolveCanonicalPath(extPath);
+                if (string.IsNullOrEmpty(canonExt)) continue;
+                if (canonCurrent != null && string.Equals(canonExt, canonCurrent, StringComparison.Ordinal))
+                    continue;
+
+                try
+                {
+                    var fi = new FileInfo(canonExt);
+                    if (!fi.Exists || fi.Length == 0) continue;
+                    var sig = (fi.Length, fi.LastWriteTimeUtc.Ticks);
+                    if (scanState.TryGetValue(canonExt, out var prevSig) && prevSig == sig)
+                        continue;
+
+                    byte[] extBytes = File.ReadAllBytes(canonExt);
+                    if (extBytes == null || extBytes.Length == 0) continue;
+                    string extVerifiedId = null;
+                    if (decoder != null && !ReplayEvaluator.HasValidFrameStream(extBytes, decoder, extId, out extVerifiedId))
+                    {
+                        scanState[canonExt] = sig;
+                        continue;
+                    }
+                    string sha = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(extBytes));
+                    cacheSeenSha.TryAdd(sha, 0);
+                    if (!string.IsNullOrEmpty(extVerifiedId))
+                        cacheSeenVerifiedId.TryAdd(extVerifiedId, 0);
+                    scanState[canonExt] = sig;
+                }
+                catch { }
             }
         }
 
@@ -965,28 +1076,7 @@ namespace MonsterPathPredictor.ReplayCertifier
 
         public static bool TryWriteCacheAtomic(string savePath, byte[] bytes, string cacheRootDir = null)
         {
-            if (string.IsNullOrWhiteSpace(savePath) || bytes == null) return false;
-            if (!string.IsNullOrWhiteSpace(cacheRootDir) && !IsCacheTargetInsideCacheRoot(savePath, cacheRootDir))
-            {
-                Console.Error.WriteLine($"WARN: Refusing to write cache file outside cache root: {savePath}");
-                return false;
-            }
-            string tmpPath = null;
-            try
-            {
-                string parentDir = Path.GetDirectoryName(savePath);
-                if (!string.IsNullOrEmpty(parentDir)) Directory.CreateDirectory(parentDir);
-                tmpPath = savePath + ".tmp." + Guid.NewGuid().ToString("N");
-                File.WriteAllBytes(tmpPath, bytes);
-                File.Move(tmpPath, savePath, overwrite: true);
-                return true;
-            }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine($"WARN: Failed to write cache file {savePath}: {ex.Message}");
-                try { if (tmpPath != null && File.Exists(tmpPath)) File.Delete(tmpPath); } catch { }
-                return false;
-            }
+            return SafeCacheWriter.TryWriteAtomicallyInsideRoot(savePath, bytes, cacheRootDir);
         }
     }
 }

@@ -232,8 +232,11 @@ namespace MonsterPathPredictor.Runtime
                     if (!clippedNearEnd) _screenCache[edge.ToLandId] = pTo;
                 }
 
-                if (!DashGeometry.TryClipSegmentToRect(pFrom, pTo, -40f, -40f, layer.width + 40f, layer.height + 40f,
-                        out var clipFrom, out var clipTo, out double clippedFromStartHi, out double clippedFromStartLo))
+                if (!DashGeometry.TryClipSegmentToRect(
+                        pFrom, pTo, -40f, -40f, layer.width + 40f, layer.height + 40f,
+                        dashPeriod,
+                        out var clipFrom, out var clipTo,
+                        out double clippedFromStartPx, out double clippedStartModPeriod, out double clippedEndPx))
                     continue;
 
                 Color color = PickEdgeColor(edge.Probability, edge.IsAfterCombat);
@@ -242,17 +245,11 @@ namespace MonsterPathPredictor.Runtime
                     ? baseWidth
                     : Math.Max(2.0f, baseWidth * (0.65f + 0.35f * (float)edge.Probability));
 
-                double clippedFromStartPx = clippedFromStartHi + clippedFromStartLo;
                 double origTrimStart = clippedNearStart ? 0.0 : (edge.EarliestStep == 0 ? 10.0 : 3.0);
                 double origTrimEnd = clippedNearEnd ? 0.0 : 3.0;
                 double trimStart = Math.Max(0.0, origTrimStart - clippedFromStartPx);
-                double fullEdgeLen = Math.Sqrt(((double)pTo.X - pFrom.X) * ((double)pTo.X - pFrom.X) +
-                                               ((double)pTo.Y - pFrom.Y) * ((double)pTo.Y - pFrom.Y));
-                double clipLen = Math.Sqrt(((double)clipTo.X - clipFrom.X) * ((double)clipTo.X - clipFrom.X) +
-                                           ((double)clipTo.Y - clipFrom.Y) * ((double)clipTo.Y - clipFrom.Y));
-                double clippedEndPx = Math.Max(0.0, fullEdgeLen - clippedFromStartPx - clipLen);
                 double trimEnd = Math.Max(0.0, origTrimEnd - clippedEndPx);
-                float clippedPhase = DashGeometry.ComputeClippedDashPhase(phaseOffset, origTrimStart, clippedFromStartHi, clippedFromStartLo, trimStart, dashPeriod);
+                float clippedPhase = DashGeometry.ComputeClippedDashPhase(phaseOffset, origTrimStart, clippedStartModPeriod, trimStart, dashPeriod);
 
                 DashGeometry.BuildDashedSegmentsInto(
                     _dashQuadBuf,

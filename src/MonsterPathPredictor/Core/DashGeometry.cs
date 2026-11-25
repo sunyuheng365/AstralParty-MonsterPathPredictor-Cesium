@@ -380,10 +380,65 @@ namespace MonsterPathPredictor.Core
             out double startTrimHi,
             out double startTrimLo)
         {
+            return TryClipSegmentToRectCore(
+                a, b, minX, minY, maxX, maxY, 0.0,
+                out clippedA, out clippedB,
+                out startTrimHi, out startTrimLo,
+                out _, out _);
+        }
+
+        /// <summary>
+        /// Exact rational Liang-Barsky clipping that also returns:
+        /// - <paramref name="startTrimModPeriod"/>: exact clipped start length modulo <paramref name="dashPeriod"/>
+        ///   computed in arbitrary precision so huge coordinates (e.g. 2^113 horizontal, sqrt(2)*2^120 diagonal)
+        ///   never lose dash phase;
+        /// - <paramref name="endTrimPx"/>: direct clipped distance from <paramref name="b"/> to <paramref name="clippedB"/>
+        ///   (exact 0 when <paramref name="b"/> is not clipped).
+        /// </summary>
+        public static bool TryClipSegmentToRect(
+            Point2 a,
+            Point2 b,
+            float minX,
+            float minY,
+            float maxX,
+            float maxY,
+            double dashPeriod,
+            out Point2 clippedA,
+            out Point2 clippedB,
+            out double startTrimPx,
+            out double startTrimModPeriod,
+            out double endTrimPx)
+        {
+            bool ok = TryClipSegmentToRectCore(
+                a, b, minX, minY, maxX, maxY, dashPeriod,
+                out clippedA, out clippedB,
+                out double trimHi, out double trimLo,
+                out startTrimModPeriod, out endTrimPx);
+            startTrimPx = trimHi + trimLo;
+            return ok;
+        }
+
+        private static bool TryClipSegmentToRectCore(
+            Point2 a,
+            Point2 b,
+            float minX,
+            float minY,
+            float maxX,
+            float maxY,
+            double dashPeriod,
+            out Point2 clippedA,
+            out Point2 clippedB,
+            out double startTrimHi,
+            out double startTrimLo,
+            out double startTrimModPeriod,
+            out double endTrimPx)
+        {
             clippedA = a;
             clippedB = b;
             startTrimHi = 0.0;
             startTrimLo = 0.0;
+            startTrimModPeriod = 0.0;
+            endTrimPx = 0.0;
 
             if (float.IsNaN(a.X) || float.IsInfinity(a.X) || float.IsNaN(a.Y) || float.IsInfinity(a.Y) ||
                 float.IsNaN(b.X) || float.IsInfinity(b.X) || float.IsNaN(b.Y) || float.IsInfinity(b.Y) ||
@@ -465,45 +520,67 @@ namespace MonsterPathPredictor.Core
             if (!ClipExact(eDy.Negate(), ExactInt.Sub(eAy, eMinY), 3)) return false;
             if (!ClipExact(eDy, ExactInt.Sub(eMaxY, eAy), 4)) return false;
 
-            float x0 = hitStartEdge == 1 ? minX : (hitStartEdge == 2 ? maxX : (float)ExactInt.ToDoubleRatio(ExactInt.Add(ExactInt.Mul(eAx, t0D), ExactInt.Mul(eDx, t0N)), t0D, baseExp));
-            float y0 = hitStartEdge == 3 ? minY : (hitStartEdge == 4 ? maxY : (float)ExactInt.ToDoubleRatio(ExactInt.Add(ExactInt.Mul(eAy, t0D), ExactInt.Mul(eDy, t0N)), t0D, baseExp));
-            float x1 = hitEndEdge == 1 ? minX : (hitEndEdge == 2 ? maxX : (float)ExactInt.ToDoubleRatio(ExactInt.Add(ExactInt.Mul(eAx, t1D), ExactInt.Mul(eDx, t1N)), t1D, baseExp));
-            float y1 = hitEndEdge == 3 ? minY : (hitEndEdge == 4 ? maxY : (float)ExactInt.ToDoubleRatio(ExactInt.Add(ExactInt.Mul(eAy, t1D), ExactInt.Mul(eDy, t1N)), t1D, baseExp));
+            float x0 = hitStartEdge == 1 ? minX : (hitStartEdge == 2 ? maxX : ExactInt.ToFloatRatio(ExactInt.Add(ExactInt.Mul(eAx, t0D), ExactInt.Mul(eDx, t0N)), t0D, baseExp));
+            float y0 = hitStartEdge == 3 ? minY : (hitStartEdge == 4 ? maxY : ExactInt.ToFloatRatio(ExactInt.Add(ExactInt.Mul(eAy, t0D), ExactInt.Mul(eDy, t0N)), t0D, baseExp));
+            float x1 = hitEndEdge == 1 ? minX : (hitEndEdge == 2 ? maxX : ExactInt.ToFloatRatio(ExactInt.Add(ExactInt.Mul(eAx, t1D), ExactInt.Mul(eDx, t1N)), t1D, baseExp));
+            float y1 = hitEndEdge == 3 ? minY : (hitEndEdge == 4 ? maxY : ExactInt.ToFloatRatio(ExactInt.Add(ExactInt.Mul(eAy, t1D), ExactInt.Mul(eDy, t1N)), t1D, baseExp));
 
             clippedA = new Point2(x0, y0);
             clippedB = new Point2(x1, y1);
 
             if (!t0N.IsZero)
             {
-                // Exact 106-bit double-double clipped distance from A to clippedA:
-                // |clippedA - A| = sqrt((dx * t0)^2 + (dy * t0)^2) with dx*t0 = (eDx * t0N) / t0D * 2^baseExp
-                ExactInt.ToDoubleDoubleRatio(ExactInt.Mul(eDx, t0N), t0D, baseExp, out double dcxHi, out double dcxLo);
-                ExactInt.ToDoubleDoubleRatio(ExactInt.Mul(eDy, t0N), t0D, baseExp, out double dcyHi, out double dcyLo);
+                ExactInt startNumX = ExactInt.Mul(eDx, t0N);
+                ExactInt startNumY = ExactInt.Mul(eDy, t0N);
+                ExactInt.ToDoubleDoubleRatio(startNumX, t0D, baseExp, out double dcxHi, out double dcxLo);
+                ExactInt.ToDoubleDoubleRatio(startNumY, t0D, baseExp, out double dcyHi, out double dcyLo);
                 HypotDD(dcxHi, dcxLo, dcyHi, dcyLo, out startTrimHi, out startTrimLo);
+
+                if (dashPeriod > 0.0 && !double.IsNaN(dashPeriod) && !double.IsInfinity(dashPeriod))
+                {
+                    startTrimModPeriod = ComputeExactLengthModPeriod(startNumX, startNumY, t0D, baseExp, dashPeriod);
+                }
+            }
+
+            if (hitEndEdge != 0)
+            {
+                ExactInt oneMinusT1N = ExactInt.Sub(t1D, t1N);
+                if (!oneMinusT1N.IsZero)
+                {
+                    ExactInt.ToDoubleDoubleRatio(ExactInt.Mul(eDx, oneMinusT1N), t1D, baseExp, out double dexHi, out double dexLo);
+                    ExactInt.ToDoubleDoubleRatio(ExactInt.Mul(eDy, oneMinusT1N), t1D, baseExp, out double deyHi, out double deyLo);
+                    HypotDD(dexHi, dexLo, deyHi, deyLo, out double endHi, out double endLo);
+                    endTrimPx = endHi + endLo;
+                }
             }
 
             return true;
         }
 
         /// <summary>
-        /// Computes signed depth along the camera forward axis in double precision.
-        /// Shared by near-plane clipping, tile projection, and hit-box picking so endpoints that
-        /// pass clipping are never rejected by lower-precision float dot-product drift.
+        /// Computes exact signed depth along the camera forward axis over the true binary IEEE-754 float values,
+        /// eliminating catastrophic cancellation across large opposing dot-product terms (e.g. H=2^60).
         /// </summary>
         public static double ComputeCameraDepth(
             float x, float y, float z,
             float camX, float camY, float camZ,
             float fwdX, float fwdY, float fwdZ)
         {
-            return ((double)x - camX) * fwdX + ((double)y - camY) * fwdY + ((double)z - camZ) * fwdZ;
+            if (IsNonFinite(x) || IsNonFinite(y) || IsNonFinite(z) ||
+                IsNonFinite(camX) || IsNonFinite(camY) || IsNonFinite(camZ) ||
+                IsNonFinite(fwdX) || IsNonFinite(fwdY) || IsNonFinite(fwdZ))
+            {
+                return double.NaN;
+            }
+            ExactSignedDepth(x, y, z, camX, camY, camZ, fwdX, fwdY, fwdZ, 0f, out ExactInt num, out int scaleExp);
+            return ExactInt.ToDoubleRatio(num, ExactInt.One, scaleExp);
         }
 
         /// <summary>
         /// Clips a 3D world-space segment against the camera near plane defined by
-        /// <c>Dot(P - planeOrigin, planeNormal) >= nearDist</c>.
-        /// Interpolates from whichever endpoint is closer to the near plane so extreme depth disparities
-        /// (e.g. A=(0,0,-2^60), B=(0.25,0,10), near=1) never round t to 1.0 and collapse onto the camera plane.
-        /// Returns false only when both endpoints lie strictly behind the near plane.
+        /// <c>Dot(P - planeOrigin, planeNormal) >= nearDist</c> using exact rational arithmetic over
+        /// binary IEEE-754 float inputs. Eliminates cancellation in depth evaluation, handles symmetric
+        /// huge endpoints (e.g. +/-2^60), and never rejects genuinely crossing segments due to small denominators.
         /// </summary>
         public static bool TryClipSegmentToNearPlane(
             float ax, float ay, float az,
@@ -516,56 +593,57 @@ namespace MonsterPathPredictor.Core
             out bool clippedStart,
             out bool clippedEnd)
         {
-            double dA = ComputeCameraDepth(ax, ay, az, camX, camY, camZ, fwdX, fwdY, fwdZ) - nearDist;
-            double dB = ComputeCameraDepth(bx, by, bz, camX, camY, camZ, fwdX, fwdY, fwdZ) - nearDist;
-
             clippedStart = false;
             clippedEnd = false;
             outAx = ax; outAy = ay; outAz = az;
             outBx = bx; outBy = by; outBz = bz;
 
-            if (dA < 0.0 && dB < 0.0) return false;
-
-            if (dA < 0.0)
+            if (IsNonFinite(ax) || IsNonFinite(ay) || IsNonFinite(az) ||
+                IsNonFinite(bx) || IsNonFinite(by) || IsNonFinite(bz) ||
+                IsNonFinite(camX) || IsNonFinite(camY) || IsNonFinite(camZ) ||
+                IsNonFinite(fwdX) || IsNonFinite(fwdY) || IsNonFinite(fwdZ) ||
+                IsNonFinite(nearDist))
             {
-                double denom = dB - dA;
-                if (denom <= 1e-12) return false;
-                if (dB <= -dA)
-                {
-                    // B is closer to the near plane: interpolate backward from B with s in [0, 0.5]
-                    double s = dB / denom;
-                    outAx = (float)(bx + s * ((double)ax - bx));
-                    outAy = (float)(by + s * ((double)ay - by));
-                    outAz = (float)(bz + s * ((double)az - bz));
-                }
-                else
-                {
-                    double t = -dA / denom;
-                    outAx = (float)(ax + t * ((double)bx - ax));
-                    outAy = (float)(ay + t * ((double)by - ay));
-                    outAz = (float)(az + t * ((double)bz - az));
-                }
+                return false;
+            }
+
+            ExactSignedDepth(ax, ay, az, camX, camY, camZ, fwdX, fwdY, fwdZ, nearDist, out ExactInt dANum, out int dAExp);
+            ExactSignedDepth(bx, by, bz, camX, camY, camZ, fwdX, fwdY, fwdZ, nearDist, out ExactInt dBNum, out int dBExp);
+
+            bool aBehind = dANum.IsNegative;
+            bool bBehind = dBNum.IsNegative;
+            if (aBehind && bBehind) return false;
+            if (!aBehind && !bBehind) return true;
+
+            // Align dA and dB to a common scale exponent.
+            int commonDExp = Math.Min(dAExp, dBExp);
+            ExactInt eDA = dANum.IsZero ? ExactInt.Zero : dANum.ShiftLeft(dAExp - commonDExp);
+            ExactInt eDB = dBNum.IsZero ? ExactInt.Zero : dBNum.ShiftLeft(dBExp - commonDExp);
+
+            if (aBehind)
+            {
+                // eDA < 0 <= eDB => denom = eDB - eDA > 0 strictly.
+                // Exact intersection: P = (A * eDB - B * eDA) / (eDB - eDA)
+                ExactInt denom = ExactInt.Sub(eDB, eDA);
+                if (denom.IsZero) return false;
+                ExactInt wA = eDB;
+                ExactInt wB = eDA.Negate(); // positive
+                outAx = ExactWeightedFloatAverage(ax, wA, bx, wB, denom);
+                outAy = ExactWeightedFloatAverage(ay, wA, by, wB, denom);
+                outAz = ExactWeightedFloatAverage(az, wA, bz, wB, denom);
                 clippedStart = true;
             }
-            else if (dB < 0.0)
+            else
             {
-                double denom = dA - dB;
-                if (denom <= 1e-12) return false;
-                if (dA <= -dB)
-                {
-                    // A is closer to the near plane: interpolate forward from A with t in [0, 0.5]
-                    double t = dA / denom;
-                    outBx = (float)(ax + t * ((double)bx - ax));
-                    outBy = (float)(ay + t * ((double)by - ay));
-                    outBz = (float)(az + t * ((double)bz - az));
-                }
-                else
-                {
-                    double s = -dB / denom;
-                    outBx = (float)(bx + s * ((double)ax - bx));
-                    outBy = (float)(by + s * ((double)ay - by));
-                    outBz = (float)(bz + s * ((double)az - bz));
-                }
+                // eDB < 0 <= eDA => denom = eDA - eDB > 0 strictly.
+                // Exact intersection: P = (B * eDA - A * eDB) / (eDA - eDB)
+                ExactInt denom = ExactInt.Sub(eDA, eDB);
+                if (denom.IsZero) return false;
+                ExactInt wA = eDB.Negate(); // positive
+                ExactInt wB = eDA;
+                outBx = ExactWeightedFloatAverage(ax, wA, bx, wB, denom);
+                outBy = ExactWeightedFloatAverage(ay, wA, by, wB, denom);
+                outBz = ExactWeightedFloatAverage(az, wA, bz, wB, denom);
                 clippedEnd = true;
             }
 
@@ -807,6 +885,164 @@ namespace MonsterPathPredictor.Core
             }
         }
 
+        private static bool IsNonFinite(float v) => float.IsNaN(v) || float.IsInfinity(v);
+
+        private static void DecodeDouble(double value, out bool neg, out ulong mant, out int exp)
+        {
+            if (value == 0.0)
+            {
+                neg = false; mant = 0; exp = 0;
+                return;
+            }
+            long bits = BitConverter.DoubleToInt64Bits(value);
+            neg = bits < 0;
+            int rawExp = (int)((bits >> 52) & 0x7FFL);
+            ulong frac = (ulong)(bits & 0xFFFFFFFFFFFFFL);
+            if (rawExp == 0)
+            {
+                mant = frac;
+                exp = -1074;
+            }
+            else
+            {
+                mant = frac | (1UL << 52);
+                exp = rawExp - 1075;
+            }
+            while ((mant & 1UL) == 0)
+            {
+                mant >>= 1;
+                exp++;
+            }
+        }
+
+        private static void ExactFloatDiff(float a, float b, out ExactInt val, out int exp)
+        {
+            DecodeFloat(a, out bool aNeg, out uint aM, out int aE);
+            DecodeFloat(b, out bool bNeg, out uint bM, out int bE);
+            if (aM == 0 && bM == 0) { val = ExactInt.Zero; exp = 0; return; }
+            if (aM == 0) { val = ExactInt.FromShiftedUint(!bNeg, bM, 0); exp = bE; return; }
+            if (bM == 0) { val = ExactInt.FromShiftedUint(aNeg, aM, 0); exp = aE; return; }
+            exp = Math.Min(aE, bE);
+            ExactInt eA = ExactInt.FromShiftedUint(aNeg, aM, aE - exp);
+            ExactInt eB = ExactInt.FromShiftedUint(bNeg, bM, bE - exp);
+            val = ExactInt.Sub(eA, eB);
+        }
+
+        private static void ExactAxisTerm(float p, float c, float f, out ExactInt val, out int exp)
+        {
+            DecodeFloat(f, out bool fNeg, out uint fM, out int fE);
+            if (fM == 0) { val = ExactInt.Zero; exp = 0; return; }
+            ExactFloatDiff(p, c, out ExactInt diff, out int dExp);
+            if (diff.IsZero) { val = ExactInt.Zero; exp = 0; return; }
+            val = ExactInt.Mul(diff, ExactInt.FromShiftedUint(fNeg, fM, 0));
+            exp = dExp + fE;
+        }
+
+        private static void ExactSignedDepth(
+            float px, float py, float pz,
+            float camX, float camY, float camZ,
+            float fwdX, float fwdY, float fwdZ,
+            float nearDist,
+            out ExactInt num, out int scaleExp)
+        {
+            ExactAxisTerm(px, camX, fwdX, out ExactInt tX, out int eX);
+            ExactAxisTerm(py, camY, fwdY, out ExactInt tY, out int eY);
+            ExactAxisTerm(pz, camZ, fwdZ, out ExactInt tZ, out int eZ);
+            DecodeFloat(nearDist, out bool nNeg, out uint nM, out int eN);
+            ExactInt tN = nM == 0 ? ExactInt.Zero : ExactInt.FromShiftedUint(!nNeg, nM, 0);
+
+            int minExp = int.MaxValue;
+            if (!tX.IsZero && eX < minExp) minExp = eX;
+            if (!tY.IsZero && eY < minExp) minExp = eY;
+            if (!tZ.IsZero && eZ < minExp) minExp = eZ;
+            if (!tN.IsZero && eN < minExp) minExp = eN;
+
+            if (minExp == int.MaxValue)
+            {
+                num = ExactInt.Zero;
+                scaleExp = 0;
+                return;
+            }
+
+            ExactInt sum = ExactInt.Zero;
+            if (!tX.IsZero) sum = ExactInt.Add(sum, tX.ShiftLeft(eX - minExp));
+            if (!tY.IsZero) sum = ExactInt.Add(sum, tY.ShiftLeft(eY - minExp));
+            if (!tZ.IsZero) sum = ExactInt.Add(sum, tZ.ShiftLeft(eZ - minExp));
+            if (!tN.IsZero) sum = ExactInt.Add(sum, tN.ShiftLeft(eN - minExp));
+
+            num = sum;
+            scaleExp = sum.IsZero ? 0 : minExp;
+        }
+
+        private static float ExactWeightedFloatAverage(float a, ExactInt wA, float b, ExactInt wB, ExactInt denom)
+        {
+            if (a == b) return a;
+            DecodeFloat(a, out bool aNeg, out uint aM, out int aE);
+            DecodeFloat(b, out bool bNeg, out uint bM, out int bE);
+            if (aM == 0 && bM == 0) return 0f;
+            int baseExp = aM == 0 ? bE : (bM == 0 ? aE : Math.Min(aE, bE));
+            ExactInt eA = aM == 0 ? ExactInt.Zero : ExactInt.FromShiftedUint(aNeg, aM, aE - baseExp);
+            ExactInt eB = bM == 0 ? ExactInt.Zero : ExactInt.FromShiftedUint(bNeg, bM, bE - baseExp);
+            ExactInt num = ExactInt.Add(ExactInt.Mul(eA, wA), ExactInt.Mul(eB, wB));
+            return ExactInt.ToFloatRatio(num, denom, baseExp);
+        }
+
+        private static double ComputeExactLengthModPeriod(
+            ExactInt numX, ExactInt numY, ExactInt den, int baseExp, double period)
+        {
+            if ((numX.IsZero && numY.IsZero) || den.IsZero ||
+                period <= 0.0 || double.IsNaN(period) || double.IsInfinity(period))
+            {
+                return 0.0;
+            }
+
+            DecodeDouble(period, out _, out ulong pMant, out int pExp);
+            if (pMant == 0UL) return 0.0;
+
+            ExactInt bDen = ExactInt.Mul(den.Abs(), ExactInt.FromShiftedUlong(false, pMant, 0));
+            int s = baseExp - pExp;
+            const int FracBits = 64;
+
+            if (numX.IsZero || numY.IsZero)
+            {
+                ExactInt absAxis = numX.IsZero ? numY.Abs() : numX.Abs();
+                int approxExp = absAxis.BitLength - bDen.BitLength + s;
+                if (approxExp <= -2)
+                {
+                    double direct = ExactInt.ToDoubleRatio(absAxis, den.Abs(), baseExp);
+                    return direct < period ? direct : direct % period;
+                }
+                if (approxExp > 4096) return 0.0;
+
+                int shift = s + FracBits;
+                ExactInt n = shift >= 0 ? absAxis.ShiftLeft(shift) : absAxis;
+                ExactInt d = shift < 0 ? bDen.ShiftLeft(-shift) : bDen;
+                ExactInt q = ExactInt.DivRemPos(n, d, out _);
+                double rem = (double)q.Low64() * Math.Pow(2.0, -FracBits) * period;
+                return rem >= period ? 0.0 : rem;
+            }
+
+            ExactInt aSq = ExactInt.Add(ExactInt.Mul(numX, numX), ExactInt.Mul(numY, numY));
+            int approxDiagExp = ((aSq.BitLength + 1) >> 1) - bDen.BitLength + s;
+            if (approxDiagExp <= -2)
+            {
+                ExactInt.ToDoubleDoubleRatio(numX, den, baseExp, out double xh, out double xl);
+                ExactInt.ToDoubleDoubleRatio(numY, den, baseExp, out double yh, out double yl);
+                HypotDD(xh, xl, yh, yl, out double rh, out double rl);
+                double direct = rh + rl;
+                return direct < period ? direct : direct % period;
+            }
+            if (approxDiagExp > 4096) return 0.0;
+
+            int shift2 = 2 * (s + FracBits);
+            ExactInt nSq = shift2 >= 0 ? aSq.ShiftLeft(shift2) : aSq;
+            ExactInt bSq = ExactInt.Mul(bDen, bDen);
+            ExactInt dSq = shift2 < 0 ? bSq.ShiftLeft(-shift2) : bSq;
+            ExactInt qDiag = ExactInt.ISqrt(ExactInt.DivRemPos(nSq, dSq, out _));
+            double remDiag = (double)qDiag.Low64() * Math.Pow(2.0, -FracBits) * period;
+            return remDiag >= period ? 0.0 : remDiag;
+        }
+
         private static void TwoSum(double a, double b, out double s, out double e)
         {
             s = a + b;
@@ -941,6 +1177,25 @@ namespace MonsterPathPredictor.Core
                 limbs[w] = lo;
                 if (hi != 0u) limbs[w + 1] = hi;
                 return new ExactInt(neg, limbs);
+            }
+
+            public static ExactInt FromShiftedUlong(bool neg, ulong mant, int shift)
+            {
+                if (mant == 0UL) return Zero;
+                uint lo = (uint)mant;
+                uint hi = (uint)(mant >> 32);
+                ExactInt baseVal = hi != 0u
+                    ? new ExactInt(neg, new uint[] { lo, hi })
+                    : new ExactInt(neg, new uint[] { lo });
+                return shift > 0 ? baseVal.ShiftLeft(shift) : baseVal;
+            }
+
+            public ulong Low64()
+            {
+                if (IsZero) return 0UL;
+                ulong lo = _limbs[0];
+                if (_limbs.Length > 1) lo |= ((ulong)_limbs[1]) << 32;
+                return lo;
             }
 
             public ExactInt ShiftLeft(int shift)
@@ -1122,6 +1377,138 @@ namespace MonsterPathPredictor.Core
                 {
                     hi = -hi;
                     lo = -lo;
+                }
+            }
+
+            /// <summary>
+            /// Directly rounds exact rational <c>(num / den) * 2^scaleExp</c> to IEEE-754 binary32
+            /// using round-to-nearest-even with exact remainder comparison (eliminating double-rounding
+            /// through binary64 at binary32 midpoints such as 1 + 2^-24 + 2^-64).
+            /// </summary>
+            public static float ToFloatRatio(ExactInt num, ExactInt den, int scaleExp)
+            {
+                if (num.IsZero || den.IsZero) return 0f;
+
+                bool neg = num._neg != den._neg;
+                ExactInt a = num.Abs();
+                ExactInt b = den.Abs();
+
+                int expTop = a.BitLength - b.BitLength;
+                ExactInt rem = expTop < 0 ? a.ShiftLeft(-expTop) : a;
+                ExactInt div = expTop > 0 ? b.ShiftLeft(expTop) : b;
+                if (CompareAbs(rem, div) < 0)
+                {
+                    expTop--;
+                    rem = rem.ShiftLeft(1);
+                }
+
+                int trueExp = expTop + scaleExp;
+                if (trueExp > 127) return neg ? float.NegativeInfinity : float.PositiveInfinity;
+                if (trueExp < -150) return neg ? -0f : 0f;
+
+                int sigBits = trueExp >= -126 ? 24 : (trueExp + 150);
+                uint q = 0;
+                for (int i = 0; i < sigBits; i++)
+                {
+                    q <<= 1;
+                    if (CompareAbs(rem, div) >= 0)
+                    {
+                        rem = new ExactInt(false, SubAbs(rem._limbs, div._limbs));
+                        q |= 1u;
+                    }
+                    rem = rem.ShiftLeft(1);
+                }
+
+                // After loop, rem has already been shifted left by 1 relative to the last extracted bit,
+                // so CompareAbs(rem, div) directly compares fractional remainder against 0.5 ULP.
+                int halfCmp = CompareAbs(rem, div);
+                if (halfCmp > 0 || (halfCmp == 0 && (q & 1u) != 0u))
+                {
+                    q++;
+                    if (trueExp >= -126)
+                    {
+                        if (q == (1u << 24))
+                        {
+                            q >>= 1;
+                            trueExp++;
+                            if (trueExp > 127) return neg ? float.NegativeInfinity : float.PositiveInfinity;
+                        }
+                    }
+                    else if (q == (1u << 23))
+                    {
+                        trueExp = -126;
+                    }
+                }
+
+                int signBit = neg ? unchecked((int)0x80000000) : 0;
+                if (q == 0u) return new FloatBitsUnion { I = signBit }.F;
+                if (trueExp >= -126)
+                {
+                    int biased = trueExp + 127;
+                    return new FloatBitsUnion { I = signBit | (biased << 23) | (int)(q & 0x7FFFFFu) }.F;
+                }
+                return new FloatBitsUnion { I = signBit | (int)(q & 0x7FFFFFu) }.F;
+            }
+
+            public ExactInt ShiftRight(int shift)
+            {
+                if (IsZero || shift <= 0) return this;
+                int w = shift >> 5;
+                int b = shift & 31;
+                if (w >= _limbs.Length) return Zero;
+                int newLen = _limbs.Length - w;
+                var res = new uint[newLen];
+                if (b == 0)
+                {
+                    Array.Copy(_limbs, w, res, 0, newLen);
+                }
+                else
+                {
+                    for (int i = 0; i < newLen; i++)
+                    {
+                        uint lo = _limbs[i + w] >> b;
+                        uint hi = (i + w + 1 < _limbs.Length) ? (_limbs[i + w + 1] << (32 - b)) : 0u;
+                        res[i] = lo | hi;
+                    }
+                }
+                return new ExactInt(_neg, res);
+            }
+
+            public static ExactInt DivRemPos(ExactInt a, ExactInt b, out ExactInt rem)
+            {
+                if (a.IsZero || CompareAbs(a, b) < 0)
+                {
+                    rem = a.Abs();
+                    return Zero;
+                }
+                int shift = a.BitLength - b.BitLength;
+                ExactInt r = a.Abs();
+                ExactInt d = b.Abs().ShiftLeft(shift);
+                var qLimbs = new uint[(shift >> 5) + 1];
+                for (int k = shift; k >= 0; k--)
+                {
+                    if (CompareAbs(r, d) >= 0)
+                    {
+                        r = new ExactInt(false, SubAbs(r._limbs, d._limbs));
+                        qLimbs[k >> 5] |= 1u << (k & 31);
+                    }
+                    if (k > 0) d = d.ShiftRight(1);
+                }
+                rem = r;
+                return new ExactInt(false, qLimbs);
+            }
+
+            public static ExactInt ISqrt(ExactInt n)
+            {
+                if (n.IsZero || n.IsNegative) return Zero;
+                int bits = n.BitLength;
+                ExactInt x = One.ShiftLeft((bits + 1) >> 1);
+                while (true)
+                {
+                    ExactInt q = DivRemPos(n, x, out _);
+                    ExactInt next = Add(x, q).ShiftRight(1);
+                    if (CompareAbs(next, x) >= 0) return x;
+                    x = next;
                 }
             }
         }

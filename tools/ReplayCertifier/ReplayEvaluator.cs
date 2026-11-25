@@ -69,6 +69,7 @@ namespace MonsterPathPredictor.ReplayCertifier
 
             var players = new Dictionary<long, UnitSim>();
             var monsters = new Dictionary<long, UnitSim>();
+            var registeredRoomIds = new HashSet<long>();
             var seenMonsters = new HashSet<long>();
             var spawnedAtTile = new Dictionary<long, int>();
             var pendingMoveEffects = new Dictionary<long, Dictionary<int, List<dynamic>>>();
@@ -170,9 +171,14 @@ namespace MonsterPathPredictor.ReplayCertifier
                 }
                 players.Clear();
                 monsters.Clear();
+                registeredRoomIds.Clear();
                 if (room.Players != null)
                     foreach (dynamic p in (IEnumerable)room.Players)
-                        if (p?.Hero != null)
+                    {
+                        if (p == null) continue;
+                        long pid = (long)p.Id;
+                        if (pid != 0) registeredRoomIds.Add(pid);
+                        if (p.Hero != null)
                         {
                             UnitSim u = BuildUnit(p, false);
                             ValidateUnitPlacement(u);
@@ -182,9 +188,14 @@ namespace MonsterPathPredictor.ReplayCertifier
                             }
                             players[u.Id] = u;
                         }
+                    }
                 if (room.Monsters != null)
                     foreach (dynamic m in (IEnumerable)room.Monsters)
-                        if (m?.Hero != null)
+                    {
+                        if (m == null) continue;
+                        long mid = (long)m.Id;
+                        if (mid != 0) registeredRoomIds.Add(mid);
+                        if (m.Hero != null)
                         {
                             UnitSim u = BuildUnit(m, true);
                             ValidateUnitPlacement(u);
@@ -205,6 +216,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                             monsters[u.Id] = u;
                             if (seenMonsters.Add(u.Id)) spawnedAtTile[u.Id] = u.NodeId;
                         }
+                    }
             }
 
             for (int fi = 0; fi < frames.Count && !unknownLayout && !decodeFailed && !parseError; fi++)
@@ -313,8 +325,19 @@ namespace MonsterPathPredictor.ReplayCertifier
                     // (allows an initial 1113 snapshot in the same round when curTurnActor was still unset after 1003,
                     // while clearing stale prior-turn hops whenever actor or round advances).
                     bool isTurnSwitch = (curTurnActor != 0 && snapActor != curTurnActor) || (snapRound != curRound);
+                    int prevActorTile = sameOngoingTurn ? GetActorTile(curTurnActor) : -1;
+                    int prevMapIndex = mapIndex;
                     SyncRoom(snap.Room, preservePendingEffects: sameOngoingTurn, preserveDisplacementHops: !isTurnSwitch);
                     if (unknownLayout || decodeFailed) break;
+                    // Reject unregistered non-zero snapshot actor so a bogus 1113.PlayerId cannot hijack
+                    // curTurnActor and suppress fork scoring on subsequent valid monster moves.
+                    // Check registeredRoomIds (not just Hero != null) because real PVE replays can emit 1113
+                    // for a registered player whose Hero object is temporarily null (e.g. dead/respawning).
+                    if (snapActor != 0 && !registeredRoomIds.Contains(snapActor))
+                    {
+                        decodeFailed = true;
+                        break;
+                    }
                     curRound = snapRound;
                     curTurnActor = snapActor;
                     if (!sameOngoingTurn)
@@ -326,6 +349,47 @@ namespace MonsterPathPredictor.ReplayCertifier
                     }
                     else
                     {
+                        if (mapIndex == prevMapIndex)
+                        {
+                            // Reconcile deferred 1096 effects at each unit's snapshot-confirmed landing tile:
+                            // non-self-displacement attrs (e.g. NotSelect/Buff) are already reflected in 1113
+                            // and must be consumed here so later 1040 updates preserve protocol order.
+                            void ReconcileSnapshotTileEffects(UnitSim unit)
+                            {
+                                if (unit == null || unit.NodeId < 0) return;
+                                if (!pendingMoveEffects.TryGetValue(unit.Id, out var byTile)) return;
+                                if (!byTile.TryGetValue(unit.NodeId, out var list)) return;
+                                for (int i = list.Count - 1; i >= 0; i--)
+                                {
+                                    if (!HasSelfMoveAwayFromTile(list[i], unit.Id, unit.NodeId))
+                                        list.RemoveAt(i);
+                                }
+                                if (list.Count == 0) byTile.Remove(unit.NodeId);
+                                if (byTile.Count == 0) pendingMoveEffects.Remove(unit.Id);
+                            }
+                            foreach (var pUnit in players.Values) ReconcileSnapshotTileEffects(pUnit);
+                            foreach (var mUnit in monsters.Values) ReconcileSnapshotTileEffects(mUnit);
+
+                            // If same-turn snapshot confirms the active monster already walked onto a new tile
+                            // via a valid incoming neighbor edge (not a pending skill displacement landing),
+                            // advance stepped so directed 2-exit arrival forks are scored identically to 5028.
+                            if (!stepped && prevActorTile >= 0 &&
+                                monsters.TryGetValue(curTurnActor, out var snapMonster) &&
+                                snapMonster.NodeId >= 0 && snapMonster.NodeId != prevActorTile)
+                            {
+                                bool isSkillLanding = snapMonster.PendingSkillMoveKind != SkillMoveKind.None &&
+                                                      snapMonster.PendingSkillMoveLandId == snapMonster.NodeId;
+                                if (!isSkillLanding && snapMonster.BackNodeId >= 0 &&
+                                    board != null && board.IsValidNeighbor(snapMonster.BackNodeId, snapMonster.NodeId))
+                                {
+                                    stepped = true;
+                                }
+                                if (spawnedAtTile.TryGetValue(snapMonster.Id, out int spt) && spt != snapMonster.NodeId)
+                                {
+                                    spawnedAtTile.Remove(snapMonster.Id);
+                                }
+                            }
+                        }
                         SyncTileScopedTurnFlags();
                     }
                 }
@@ -338,8 +402,14 @@ namespace MonsterPathPredictor.ReplayCertifier
                         UnitSim u = BuildUnit(mr.Monster, true);
                         ValidateUnitPlacement(u);
                         monsters[u.Id] = u;
+                        registeredRoomIds.Add(u.Id);
                         seenMonsters.Add(u.Id);
                         spawnedAtTile[u.Id] = u.NodeId;
+                        if (u.Id == curTurnActor)
+                        {
+                            ClearTileScopedTurnFlags();
+                            SyncTileScopedTurnFlags();
+                        }
                     }
                 }
                 else if (cmd == 5022)
@@ -529,12 +599,13 @@ namespace MonsterPathPredictor.ReplayCertifier
             // so truncated or corrupt replays can NEVER pollute verified corpus accuracy or calibration bins.
             if (unknownLayout)
             {
-                if (!HasValidFrameStream(bytes, decoder, replayId))
+                if (!HasValidFrameStream(bytes, decoder, replayId, out string unknownLayoutReplayId))
                 {
                     return new CertificationSummary
                     {
                         ReplaysAttempted = 1,
                         RequestedReplayId = replayId,
+                        VerifiedReplayId = unknownLayoutReplayId,
                         ContentSha256 = summary.ContentSha256,
                         TruncatedOrCorrupt = 1,
                         MissingPredictions = summary.MissingPredictions,
@@ -546,6 +617,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                 {
                     ReplaysAttempted = 1,
                     RequestedReplayId = replayId,
+                    VerifiedReplayId = unknownLayoutReplayId,
                     ContentSha256 = summary.ContentSha256,
                     MissingMap = 1,
                     MissingPredictions = summary.MissingPredictions,

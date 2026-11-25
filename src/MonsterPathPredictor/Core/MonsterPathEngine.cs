@@ -1623,6 +1623,12 @@ namespace MonsterPathPredictor.Core
             rn = 0;
             rd = 1;
             if (n1 == 0 || n2 == 0) return true;
+            // Pre-reduce each input fraction independently before cross-reducing so large reducible
+            // inputs (e.g. 2^61 / 2^62 = 1/2 multiplied by 1/3) never overflow intermediate denominators.
+            long ga = Gcd(n1, d1);
+            n1 /= ga; d1 /= ga;
+            long gb = Gcd(n2, d2);
+            n2 /= gb; d2 /= gb;
             long g1 = Gcd(n1, d2);
             long g2 = Gcd(n2, d1);
             if (!TryMulChecked(n1 / g1, n2 / g2, out rn)) return false;

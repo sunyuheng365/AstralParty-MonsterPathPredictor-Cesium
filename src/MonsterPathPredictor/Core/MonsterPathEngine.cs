@@ -233,7 +233,7 @@ namespace MonsterPathPredictor.Core
                                 clearedMarkLandId = state.LandId;
                             }
                             if ((monster.ChasesProblemStudent || monster.ChasesMandarinDuckMark) &&
-                                AnyMatchesBossTargetOrMark(monster, turnBossTargetId, targetsHere))
+                                AnyHasPriorityMark(monster, targetsHere))
                             {
                                 bossTargetClearedNow = true;
                             }
@@ -1544,12 +1544,11 @@ namespace MonsterPathPredictor.Core
             return true;
         }
 
-        private static bool AnyMatchesBossTargetOrMark(MonsterState monster, long bossTargetPlayerId, List<TrackedPlayer> targets)
+        private static bool AnyHasPriorityMark(MonsterState monster, List<TrackedPlayer> targets)
         {
             for (int i = 0; i < targets.Count; i++)
             {
                 var p = targets[i];
-                if (bossTargetPlayerId != 0 && p.PlayerId == bossTargetPlayerId) return true;
                 if (monster.ChasesProblemStudent && p.HasProblemStudentMark) return true;
                 if (monster.ChasesMandarinDuckMark && p.HasMandarinDuckMark) return true;
             }

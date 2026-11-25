@@ -627,13 +627,10 @@ namespace MonsterPathPredictor.ReplayCertifier
                             if (monsters.TryGetValue(curTurnActor, out var bm) && (bm.HeroId == 1018 || bm.HeroId == 1047))
                             {
                                 long oppId = (atk == curTurnActor) ? def : atk;
-                                bool foughtBossTarget = (bm.BossTargetId != 0 && oppId == bm.BossTargetId);
-                                if (!foughtBossTarget && players.TryGetValue(oppId, out var oppUnit))
-                                {
-                                    foughtBossTarget = (bm.HeroId == 1018 && oppUnit.BuffIds.Contains(2101001)) ||
-                                                       (bm.HeroId == 1047 && oppUnit.BuffIds.Contains(10470101));
-                                }
-                                if (foughtBossTarget)
+                                bool foughtMarked = players.TryGetValue(oppId, out var oppUnit) &&
+                                    ((bm.HeroId == 1018 && oppUnit.BuffIds.Contains(2101001)) ||
+                                     (bm.HeroId == 1047 && oppUnit.BuffIds.Contains(10470101)));
+                                if (foughtMarked)
                                 {
                                     bm.BossTargetId = 0;
                                     bossTargetClearedTurn = true;

@@ -752,7 +752,6 @@ namespace MonsterPathPredictor.Runtime
                         }
                     }
                 }
-                long effectivePrevBossTarget = usesBossTarget ? mem.LastSeenBossTargetId : 0L;
 
                 // Stamp queued combat events ONLY when the monster is CURRENTLY still standing on the combat tile
                 // (matching current turn epoch/round). If the monster already moved past the combat tile before this
@@ -764,7 +763,7 @@ namespace MonsterPathPredictor.Runtime
                     curActorId == mid)
                 {
                     if ((heroId == 1018 || heroId == 1047) && combatEvt.OpponentId != 0 &&
-                        DidFightBossTargetOrMark(heroId, effectivePrevBossTarget, combatEvt.OpponentId, players))
+                        DidFightMarkedTarget(heroId, combatEvt.OpponentId, players))
                     {
                         mem.BossTargetClearedTurnSequence = _turnSequence;
                         mem.LastSeenBossTargetId = 0;
@@ -1719,9 +1718,8 @@ namespace MonsterPathPredictor.Runtime
             return bestId;
         }
 
-        private static bool DidFightBossTargetOrMark(int monsterHeroId, long trackedBossTargetId, long opponentId, List<TrackedPlayer> players)
+        private static bool DidFightMarkedTarget(int monsterHeroId, long opponentId, List<TrackedPlayer> players)
         {
-            if (trackedBossTargetId != 0 && opponentId == trackedBossTargetId) return true;
             if (players == null) return false;
             for (int i = 0; i < players.Count; i++)
             {

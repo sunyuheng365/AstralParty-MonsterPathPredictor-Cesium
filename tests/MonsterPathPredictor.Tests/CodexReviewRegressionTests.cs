@@ -1474,6 +1474,27 @@ namespace MonsterPathPredictor.Tests
             var planCleared = MonsterPathEngine.Plan(board, midAfterUnmarked, playersWithOtherMark, new PlanOptions { MaxSteps = 1 });
             // P2@6 (Slot 0/1, dist 1) beats P3@7 (Slot 2, dist 1) because mark PriorityTier=0 is suppressed after BossTargetCleared!
             Assert.Equal(6, planCleared.Forks.Single(f => f.ForkLandId == 5).Exits.Single().NextLandId);
+
+            // 4. Verified on 82015 (1795593160172877 R10 F4138): fighting BossTargetId whose mark ALREADY expired
+            //    does NOT clear BossTargetId in multi-step lookahead -> monster keeps chasing BossTargetId at next fork!
+            var playersExpiredBossTarget = new List<TrackedPlayer>
+            {
+                new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = 3, IsAlive = true, IsTargetable = true, HasMandarinDuckMark = false },
+                new TrackedPlayer { PlayerId = 2, Slot = 1, LandId = 6, IsAlive = true, IsTargetable = true, HasMandarinDuckMark = false }
+            };
+            var multiStepExpired = new MonsterState
+            {
+                MonsterId = 981,
+                HeroId = 1047,
+                CurrentLandId = 2,
+                FromLandId = 1,
+                FrontNodeIds = new[] { 3, 4 },
+                ChasesMandarinDuckMark = true,
+                BossTargetPlayerId = 1
+            };
+            // Walks 2 -> 3 (fights unmarked BossTargetId P1@3!) -> 5 (mid-walk fork) -> STILL U-turns back to 3 toward P1@3!
+            var planExpiredBossFight = MonsterPathEngine.Plan(board, multiStepExpired, playersExpiredBossTarget, new PlanOptions { MaxSteps = 3 });
+            Assert.Equal(3, planExpiredBossFight.Forks.Single(f => f.ForkLandId == 5).Exits.Single().NextLandId);
         }
 
         [Fact]

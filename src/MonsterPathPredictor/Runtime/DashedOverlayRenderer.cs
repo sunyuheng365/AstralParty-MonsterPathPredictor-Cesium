@@ -166,23 +166,77 @@ namespace MonsterPathPredictor.Runtime
             }
             for (int i = 0; i < _pillPool.Count; i++)
             {
-                try
-                {
-                    var p = _pillPool[i];
-                    if (p == null) continue;
-                    if (p.Root != null && !p.Root.isDisposed && p.Root.visible) p.Root.visible = false;
-                    if (force)
-                    {
-                        if (p.Bg != null && !p.Bg.isDisposed && p.Bg.parent != p.Root) p.Bg.visible = false;
-                        if (p.Text != null && !p.Text.isDisposed && p.Text.parent != p.Root) p.Text.visible = false;
-                    }
-                }
-                catch { }
+                HidePooledPill(_pillPool[i]);
             }
             _usedLineGraphs = 0;
             _usedPills = 0;
             _placedPillRects.Clear();
             _hasVisibleWidgets = false;
+        }
+
+        private static void HidePooledPill(PooledPill p)
+        {
+            if (p == null) return;
+            try
+            {
+                if (p.Root != null && !p.Root.isDisposed && p.Root.visible) p.Root.visible = false;
+            }
+            catch { }
+            try
+            {
+                if (p.Bg != null && !p.Bg.isDisposed && p.Bg.parent != p.Root)
+                {
+                    p.Bg.visible = false;
+                    p.Bg.RemoveFromParent();
+                    p.Bg.Dispose();
+                }
+            }
+            catch { }
+            try
+            {
+                if (p.Text != null && !p.Text.isDisposed && p.Text.parent != p.Root)
+                {
+                    p.Text.visible = false;
+                    p.Text.RemoveFromParent();
+                    p.Text.Dispose();
+                }
+            }
+            catch { }
+        }
+
+        private static void DisposePooledPill(PooledPill p)
+        {
+            if (p == null) return;
+            try
+            {
+                if (p.Bg != null && !p.Bg.isDisposed && (p.Root == null || p.Root.isDisposed || p.Bg.parent != p.Root))
+                {
+                    p.Bg.visible = false;
+                    p.Bg.RemoveFromParent();
+                    p.Bg.Dispose();
+                }
+            }
+            catch { }
+            try
+            {
+                if (p.Text != null && !p.Text.isDisposed && (p.Root == null || p.Root.isDisposed || p.Text.parent != p.Root))
+                {
+                    p.Text.visible = false;
+                    p.Text.RemoveFromParent();
+                    p.Text.Dispose();
+                }
+            }
+            catch { }
+            try
+            {
+                if (p.Root != null && !p.Root.isDisposed)
+                {
+                    p.Root.visible = false;
+                    p.Root.RemoveFromParent();
+                    p.Root.Dispose();
+                }
+            }
+            catch { }
         }
 
         public void Render(
@@ -506,12 +560,7 @@ namespace MonsterPathPredictor.Runtime
             }
             for (int i = _usedPills; i < _pillPool.Count; i++)
             {
-                try
-                {
-                    var root = _pillPool[i]?.Root;
-                    if (root != null && !root.isDisposed && root.visible) root.visible = false;
-                }
-                catch { }
+                HidePooledPill(_pillPool[i]);
             }
             _hasVisibleWidgets = _usedLineGraphs > 0 || _usedPills > 0;
         }
@@ -1007,6 +1056,30 @@ namespace MonsterPathPredictor.Runtime
             if (TryCandidate(prefCenter.X + stepX, prefCenter.Y + stepY)) return bestCenter;
             if (TryCandidate(prefCenter.X - stepX, prefCenter.Y + stepY)) return bestCenter;
 
+            // Expand search to additional horizontal columns and edge-adjacent positions of already placed
+            // pills within the viewport so dense projected tile clusters utilize nearby free screen space.
+            for (int col = 2; col <= 3; col++)
+            {
+                if (TryCandidate(prefCenter.X + col * stepX, prefCenter.Y)) return bestCenter;
+                if (TryCandidate(prefCenter.X - col * stepX, prefCenter.Y)) return bestCenter;
+                if (TryCandidate(prefCenter.X + col * stepX, prefCenter.Y - stepY)) return bestCenter;
+                if (TryCandidate(prefCenter.X - col * stepX, prefCenter.Y - stepY)) return bestCenter;
+                if (TryCandidate(prefCenter.X + col * stepX, prefCenter.Y + stepY)) return bestCenter;
+                if (TryCandidate(prefCenter.X - col * stepX, prefCenter.Y + stepY)) return bestCenter;
+            }
+
+            float pillHalfW = w * 0.5f;
+            float pillHalfH = h * 0.5f;
+            float hGap = 4f;
+            for (int i = 0; i < _placedPillRects.Count; i++)
+            {
+                var r = _placedPillRects[i];
+                if (TryCandidate(r.xMax + pillHalfW + hGap, r.center.y)) return bestCenter;
+                if (TryCandidate(r.xMin - pillHalfW - hGap, r.center.y)) return bestCenter;
+                if (TryCandidate(r.center.x, r.yMin - pillHalfH - gapPx)) return bestCenter;
+                if (TryCandidate(r.center.x, r.yMax + pillHalfH + gapPx)) return bestCenter;
+            }
+
             return bestCenter;
         }
 
@@ -1072,22 +1145,7 @@ namespace MonsterPathPredictor.Runtime
                     {
                         try { insertIdx = _pillLayer.GetChildIndex(existing.Root); } catch { }
                     }
-                    // Explicitly reclaim any detached/reparented child widgets before disposing the old root.
-                    if (existing.Bg != null && !existing.Bg.isDisposed && existing.Bg.parent != existing.Root)
-                    {
-                        try { existing.Bg.RemoveFromParent(); } catch { }
-                        try { existing.Bg.Dispose(); } catch { }
-                    }
-                    if (existing.Text != null && !existing.Text.isDisposed && existing.Text.parent != existing.Root)
-                    {
-                        try { existing.Text.RemoveFromParent(); } catch { }
-                        try { existing.Text.Dispose(); } catch { }
-                    }
-                    if (existing.Root != null && !existing.Root.isDisposed)
-                    {
-                        try { existing.Root.RemoveFromParent(); } catch { }
-                        try { existing.Root.Dispose(); } catch { }
-                    }
+                    DisposePooledPill(existing);
                 }
                 var replacement = CreatePooledPill(insertIdx);
                 _pillPool[_usedPills] = replacement;
@@ -1141,11 +1199,21 @@ namespace MonsterPathPredictor.Runtime
         {
             for (int i = 0; i < _lineGraphPool.Count; i++)
             {
-                try { _lineGraphPool[i].Dispose(); } catch { }
+                try
+                {
+                    var g = _lineGraphPool[i];
+                    if (g != null && !g.isDisposed)
+                    {
+                        g.visible = false;
+                        g.RemoveFromParent();
+                        g.Dispose();
+                    }
+                }
+                catch { }
             }
             for (int i = 0; i < _pillPool.Count; i++)
             {
-                try { _pillPool[i].Root.Dispose(); } catch { }
+                DisposePooledPill(_pillPool[i]);
             }
             _lineGraphPool.Clear();
             _pillPool.Clear();
@@ -1155,12 +1223,47 @@ namespace MonsterPathPredictor.Runtime
             _hasVisibleWidgets = false;
             _placedPillRects.Clear();
 
-            _lineLayer = null;
-            _pillLayer = null;
+            if (_lineLayer != null)
+            {
+                try
+                {
+                    if (!_lineLayer.isDisposed)
+                    {
+                        _lineLayer.visible = false;
+                        _lineLayer.RemoveFromParent();
+                        _lineLayer.Dispose();
+                    }
+                }
+                catch { }
+                _lineLayer = null;
+            }
+            if (_pillLayer != null)
+            {
+                try
+                {
+                    if (!_pillLayer.isDisposed)
+                    {
+                        _pillLayer.visible = false;
+                        _pillLayer.RemoveFromParent();
+                        _pillLayer.Dispose();
+                    }
+                }
+                catch { }
+                _pillLayer = null;
+            }
 
             if (_layer != null)
             {
-                try { _layer.Dispose(); } catch { }
+                try
+                {
+                    if (!_layer.isDisposed)
+                    {
+                        _layer.visible = false;
+                        _layer.RemoveFromParent();
+                        _layer.Dispose();
+                    }
+                }
+                catch { }
                 _layer = null;
             }
         }

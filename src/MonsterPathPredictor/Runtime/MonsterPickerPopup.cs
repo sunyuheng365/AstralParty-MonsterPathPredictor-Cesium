@@ -76,12 +76,19 @@ namespace MonsterPathPredictor.Runtime
         private bool _isOpen;
         private bool _temporarilyHidden;
         private bool _positioned;
-        private bool _closeOnSelect;
         private bool _styleSaveFailed;
-        private int _activeTouchId = int.MinValue;
-        private bool _activePressFromMouse;
+        private readonly HashSet<int> _activePopupTouchIds = new HashSet<int>();
+        private readonly HashSet<int> _mouseOriginatedTouchIds = new HashSet<int>();
+        private Stage _hookedStage;
         private bool _hasRenderedContent;
         private int _currentMatchGen;
+        private int _popupLocalRevision;
+        private int _lastRefreshDataRev = -1;
+        private int _lastRefreshLocalRev = -1;
+        private int _lastRefreshStageW = -1;
+        private int _lastRefreshStageH = -1;
+        private int _lastRefreshMatchGen = -1;
+        private long _lastRefreshSelectedId = long.MinValue;
         private PickerPopupTab _activeTab = PickerPopupTab.Monsters;
         private RouteColorRole _selectedColorRole = RouteColorRole.Deterministic;
         private int _monsterPageIndex;
@@ -97,13 +104,15 @@ namespace MonsterPathPredictor.Runtime
         {
             if (_styleSaveFailed == failed) return;
             _styleSaveFailed = failed;
+            _popupLocalRevision++;
             _lastSignature = string.Empty;
         }
 
         public void CancelPendingPress()
         {
-            _activeTouchId = int.MinValue;
-            _activePressFromMouse = false;
+            _activePopupTouchIds.Clear();
+            _mouseOriginatedTouchIds.Clear();
+            _popupLocalRevision++;
             _lastSignature = string.Empty;
         }
 
@@ -111,12 +120,12 @@ namespace MonsterPathPredictor.Runtime
         public event Action ClearRequested;
         public event Action<int> StepsDeltaRequested;
 
-        public event Action<long> VirtualPlayerSelected;
-        public event Action<long, int, int, int> VirtualStepNeighborRequested;
-        public event Action<long, int> VirtualUndoRequested;
-        public event Action<long> VirtualResetPlayerRequested;
-        public event Action VirtualResetAllRequested;
-        public event Action<long, bool, int> VirtualBoardPickToggled;
+        public event Action<long, int, int> VirtualPlayerSelected;
+        public event Action<long, int, int, int, int> VirtualStepNeighborRequested;
+        public event Action<long, int, int> VirtualUndoRequested;
+        public event Action<long, int, int> VirtualResetPlayerRequested;
+        public event Action<int, int> VirtualResetAllRequested;
+        public event Action<long, bool, int, int> VirtualBoardPickToggled;
 
         public event Action<Action<PredictorSettings>> StyleMutationRequested;
         public event Action StyleResetRequested;
@@ -131,6 +140,7 @@ namespace MonsterPathPredictor.Runtime
         {
             _isOpen = true;
             _temporarilyHidden = false;
+            _popupLocalRevision++;
             _lastSignature = string.Empty;
             EnsureCreated();
             if (_root != null && !_root.isDisposed)
@@ -150,8 +160,8 @@ namespace MonsterPathPredictor.Runtime
         {
             _isOpen = false;
             _temporarilyHidden = false;
-            _activeTouchId = int.MinValue;
-            _activePressFromMouse = false;
+            _activePopupTouchIds.Clear();
+            _mouseOriginatedTouchIds.Clear();
             if (_root != null && !_root.isDisposed)
             {
                 _root.visible = false;
@@ -160,6 +170,7 @@ namespace MonsterPathPredictor.Runtime
 
         public void Invalidate()
         {
+            _popupLocalRevision++;
             _lastSignature = string.Empty;
         }
 
@@ -167,6 +178,15 @@ namespace MonsterPathPredictor.Runtime
         {
             if (_temporarilyHidden == hidden) return;
             _temporarilyHidden = hidden;
+            if (hidden)
+            {
+                _activePopupTouchIds.Clear();
+                _mouseOriginatedTouchIds.Clear();
+            }
+            else
+            {
+                _popupLocalRevision++;
+            }
             if (_root != null && !_root.isDisposed)
             {
                 _root.visible = _isOpen && !_temporarilyHidden;
@@ -195,14 +215,44 @@ namespace MonsterPathPredictor.Runtime
             long localPlayerId,
             long selectedMonsterId,
             PredictorSettings settings,
-            int matchGeneration = 0)
+            int matchGeneration = 0,
+            int dataRevision = 0)
         {
             if (!IsOpen) return;
             EnsureCreated();
             if (_root == null || _root.isDisposed) return;
 
             _currentMatchGen = matchGeneration;
-            _closeOnSelect = settings.ClosePickerOnSelect;
+
+            float stageWidth = GRoot.inst != null && GRoot.inst.width > 0f ? GRoot.inst.width : PanelWidth;
+            float stageHeight = GRoot.inst != null && GRoot.inst.height > 0f ? GRoot.inst.height : 720f;
+            int stageWInt = (int)Math.Round(stageWidth);
+            int stageHInt = (int)Math.Round(stageHeight);
+
+            // Defer destructive content rebuild while any pointer/touch press that began inside our popup
+            // is still active — independent of _lastSignature so Invalidate() or briefly dragging
+            // outside the popup never disposes a pressed row/button before MouseUp fires onClick.
+            if (_hasRenderedContent && IsPopupPressActive())
+            {
+                if (_positioned) ClampToStage();
+                return;
+            }
+
+            // Fast-path cache hit: skip row layout, pagination, neighbor enumeration, and signature building
+            // whenever neither external data/sandbox/settings nor local tab/page/stage dimensions changed.
+            if (dataRevision > 0 &&
+                _hasRenderedContent &&
+                !string.IsNullOrEmpty(_lastSignature) &&
+                _lastRefreshDataRev == dataRevision &&
+                _lastRefreshLocalRev == _popupLocalRevision &&
+                _lastRefreshStageW == stageWInt &&
+                _lastRefreshStageH == stageHInt &&
+                _lastRefreshMatchGen == matchGeneration &&
+                _lastRefreshSelectedId == selectedMonsterId)
+            {
+                if (_positioned) ClampToStage();
+                return;
+            }
 
             _visibleMonstersBuf.Clear();
             if (monsters != null)
@@ -216,20 +266,9 @@ namespace MonsterPathPredictor.Runtime
                 }
             }
 
-            float stageWidth = GRoot.inst != null && GRoot.inst.width > 0f ? GRoot.inst.width : PanelWidth;
-            float stageHeight = GRoot.inst != null && GRoot.inst.height > 0f ? GRoot.inst.height : 720f;
             float panelW = Math.Min(PanelWidth, Math.Max(48f, stageWidth));
             float padX = panelW < 220f ? 4f : Padding;
             float contentW = Math.Max(40f, panelW - padX * 2f);
-
-            // Defer destructive content rebuild while a pointer press that began inside our popup
-            // is still active — independent of _lastSignature so Invalidate() or briefly dragging
-            // outside the popup never disposes a pressed row/button before MouseUp fires onClick.
-            if (_hasRenderedContent && IsPopupPressActive())
-            {
-                if (_positioned) ClampToStage();
-                return;
-            }
 
             bool hasVirtualOverrides = sandbox != null && sandbox.HasOverrides;
             int rowsPerPage = ComputeRowsPerPage(stageHeight, hasVirtualOverrides);
@@ -238,6 +277,7 @@ namespace MonsterPathPredictor.Runtime
             CompactLayout layout;
             List<PopupPagination.VirtualRowItem> virtualRows = null;
             List<PageSlice> virtualPages = null;
+            IReadOnlyList<int> virtualNeighbors = Array.Empty<int>();
             float virtualRowGap = 3f;
             int virtualNeighborCols = 1;
             List<PopupPagination.StyleRowItem> styleRows = null;
@@ -255,7 +295,7 @@ namespace MonsterPathPredictor.Runtime
             {
                 ComputeVirtualTabLayout(
                     players, board, sandbox, stageHeight, contentW,
-                    out layout, out virtualRows, out virtualPages, out virtualRowGap, out virtualNeighborCols);
+                    out layout, out virtualRows, out virtualPages, out virtualRowGap, out virtualNeighborCols, out virtualNeighbors);
                 totalPages = Math.Max(1, virtualPages.Count);
                 _virtualPageIndex = ClampPage(_virtualPageIndex, totalPages);
                 activePageIndex = _virtualPageIndex;
@@ -272,8 +312,17 @@ namespace MonsterPathPredictor.Runtime
 
             if (_positioned) ClampToStage();
 
-            string sig = BuildSignature(_visibleMonstersBuf, players, board, sandbox, localPlayerId, selectedMonsterId, settings, activePageIndex, totalPages, rowsPerPage, stageWidth, stageHeight);
-            if (sig == _lastSignature) return;
+            string sig = BuildSignature(_visibleMonstersBuf, players, virtualNeighbors, sandbox, localPlayerId, selectedMonsterId, settings, activePageIndex, totalPages, rowsPerPage, stageWidth, stageHeight);
+            if (sig == _lastSignature)
+            {
+                _lastRefreshDataRev = dataRevision;
+                _lastRefreshLocalRev = _popupLocalRevision;
+                _lastRefreshStageW = stageWInt;
+                _lastRefreshStageH = stageHInt;
+                _lastRefreshMatchGen = matchGeneration;
+                _lastRefreshSelectedId = selectedMonsterId;
+                return;
+            }
 
             bool showPager = totalPages > 1;
 
@@ -295,7 +344,7 @@ namespace MonsterPathPredictor.Runtime
             else if (_activeTab == PickerPopupTab.VirtualMove)
             {
                 contentHeight = BuildVirtualTab(
-                    players, board, sandbox, localPlayerId, layout, contentW,
+                    players, virtualNeighbors, sandbox, localPlayerId, layout, contentW,
                     virtualRows, virtualPages[activePageIndex], virtualRowGap, virtualNeighborCols);
             }
             else
@@ -342,6 +391,12 @@ namespace MonsterPathPredictor.Runtime
             // Commit signature only AFTER full tab construction and layout succeed.
             _hasRenderedContent = true;
             _lastSignature = sig;
+            _lastRefreshDataRev = dataRevision;
+            _lastRefreshLocalRev = _popupLocalRevision;
+            _lastRefreshStageW = stageWInt;
+            _lastRefreshStageH = stageHInt;
+            _lastRefreshMatchGen = matchGeneration;
+            _lastRefreshSelectedId = selectedMonsterId;
         }
 
         private static int ClampPage(int index, int totalPages)
@@ -360,70 +415,74 @@ namespace MonsterPathPredictor.Runtime
                 _virtualPageIndex = Math.Max(0, _virtualPageIndex + delta);
             else
                 _stylePageIndex = Math.Max(0, _stylePageIndex + delta);
+            _popupLocalRevision++;
             _lastSignature = string.Empty;
         }
 
         private void OnPopupTouchBegin(EventContext ctx)
         {
-            if (_activeTouchId != int.MinValue) return;
             int touchId = (ctx != null && ctx.inputEvent != null) ? ctx.inputEvent.touchId : -1;
-            _activeTouchId = touchId;
-            try
+            // In FairyGUI, mouse pointers carry negative touchId (-1) while touch fingers carry >= 0.
+            // Track every concurrent touchId independently so a second finger never loses rebuild deferral
+            // and a touch is never misclassified as mouse merely because a mouse button is held simultaneously.
+            _activePopupTouchIds.Add(touchId);
+            if (touchId < 0)
             {
-                _activePressFromMouse = InputService.IsMouseButtonHeld(0) || InputService.IsMouseButtonPressed(0);
-            }
-            catch
-            {
-                _activePressFromMouse = touchId < 0;
+                _mouseOriginatedTouchIds.Add(touchId);
             }
         }
 
         private void OnStageTouchEnd(EventContext ctx)
         {
-            if (_activeTouchId == int.MinValue) return;
-            if (ctx == null || ctx.inputEvent == null || ctx.inputEvent.touchId == _activeTouchId)
+            if (_activePopupTouchIds.Count == 0) return;
+            if (ctx == null || ctx.inputEvent == null)
             {
-                _activeTouchId = int.MinValue;
-                _activePressFromMouse = false;
+                _activePopupTouchIds.Clear();
+                _mouseOriginatedTouchIds.Clear();
+                return;
             }
+            int tid = ctx.inputEvent.touchId;
+            _activePopupTouchIds.Remove(tid);
+            _mouseOriginatedTouchIds.Remove(tid);
         }
 
         private bool IsPopupPressActive()
         {
-            if (_root == null || _root.isDisposed || !_root.visible)
+            if (_root == null || _root.isDisposed || !_root.visible ||
+                (_hookedStage != null && Stage.inst != _hookedStage))
             {
-                _activeTouchId = int.MinValue;
-                _activePressFromMouse = false;
+                _activePopupTouchIds.Clear();
+                _mouseOriginatedTouchIds.Clear();
                 return false;
             }
 
-            if (_activeTouchId != int.MinValue)
+            if (_mouseOriginatedTouchIds.Count > 0)
             {
-                // For mouse-originated gestures, also recover automatically if focus loss dropped Stage.onTouchEnd.
-                // For non-mouse touch gestures, track strictly by initiating touchId through Stage.onTouchEnd.
-                if (_activePressFromMouse)
+                // Auto-recover mouse-originated presses if focus loss dropped Stage.onTouchEnd,
+                // without ever clearing concurrent non-mouse finger touches.
+                try
                 {
-                    try
+                    if (!InputService.IsMouseButtonHeld(0) && !InputService.IsMouseButtonPressed(0))
                     {
-                        if (!InputService.IsMouseButtonHeld(0) && !InputService.IsMouseButtonPressed(0))
+                        foreach (int mid in _mouseOriginatedTouchIds)
                         {
-                            _activeTouchId = int.MinValue;
-                            _activePressFromMouse = false;
-                            return false;
+                            _activePopupTouchIds.Remove(mid);
                         }
+                        _mouseOriginatedTouchIds.Clear();
                     }
-                    catch { }
                 }
-                return true;
+                catch { }
             }
+
+            if (_activePopupTouchIds.Count > 0) return true;
 
             try
             {
                 if ((InputService.IsMouseButtonHeld(0) || InputService.IsMouseButtonPressed(0)) &&
                     Stage.inst != null && ContainsStagePoint(Stage.inst.touchPosition))
                 {
-                    _activeTouchId = -1;
-                    _activePressFromMouse = true;
+                    _activePopupTouchIds.Add(-1);
+                    _mouseOriginatedTouchIds.Add(-1);
                     return true;
                 }
             }
@@ -435,6 +494,7 @@ namespace MonsterPathPredictor.Runtime
         {
             if (_activeTab == tab) return;
             _activeTab = tab;
+            _popupLocalRevision++;
             _lastSignature = string.Empty;
         }
     }

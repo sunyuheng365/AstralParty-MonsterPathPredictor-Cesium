@@ -109,12 +109,16 @@ namespace MonsterPathPredictor.Tests
             Assert.Equal(seqBefore, tracker.TurnSequence);
             Assert.False(tracker.HasActedThisRound(101));
 
-            // (7, 101) -> (8, null) -> (8, 101): pending round transition advances boundary once identity recovers
+            // (7, 101) -> (8, null) -> (8, 101): pending round transition withholds EffectiveActiveActorId
+            // during the gap and advances boundary once identity recovers
             var gapNext = tracker.Observe(false, 0, curRound: 8, latestDiceEpoch: 0, latestDiceOwnerId: 0, aliveMonsters.Contains, _ => false);
             Assert.True(gapNext.RoundChanged);
+            Assert.Equal(0, tracker.EffectiveActiveActorId);
+            Assert.True(tracker.IsPendingNullRoundReset);
             var recoverNext = tracker.Observe(true, 101, curRound: 8, latestDiceEpoch: 0, latestDiceOwnerId: 0, aliveMonsters.Contains, _ => false);
             Assert.True(recoverNext.BoundaryAdvanced);
             Assert.True(recoverNext.ShouldResetMovementState);
+            Assert.Equal(101, tracker.EffectiveActiveActorId);
             Assert.Equal(seqBefore + 1, tracker.TurnSequence);
             Assert.Equal(8, tracker.ActiveActorStartedRound);
         }
@@ -151,13 +155,13 @@ namespace MonsterPathPredictor.Tests
             Assert.True(tracker.HasActedThisRound(101));
 
             // Immediately following snapshot still reads lagging ActionEnd=false for 101: must keep 101 acted!
-            tracker.ReconcileServerActionEnd(101, serverActionEnd: false, sameRoundBaseline: true);
+            tracker.ReconcileServerActionEnd(101, serverActionEnd: false, currentRound: 3);
             Assert.True(tracker.HasActedThisRound(101));
 
             // Once server catches up with ActionEnd=true and later explicitly resets to false, clear cleanly.
-            tracker.ReconcileServerActionEnd(101, serverActionEnd: true, sameRoundBaseline: true);
+            tracker.ReconcileServerActionEnd(101, serverActionEnd: true, currentRound: 3);
             Assert.True(tracker.HasActedThisRound(101));
-            tracker.ReconcileServerActionEnd(101, serverActionEnd: false, sameRoundBaseline: true);
+            tracker.ReconcileServerActionEnd(101, serverActionEnd: false, currentRound: 3);
             Assert.False(tracker.HasActedThisRound(101));
         }
 
@@ -221,8 +225,116 @@ namespace MonsterPathPredictor.Tests
             Assert.True(tracker.HasActedThisRound(102));
             var reg = tracker.ObserveWithOwnedRolls(true, 101, 8, 0, aliveMonsters.Contains, _ => false);
             Assert.False(reg.RoundChanged);
+            Assert.True(reg.SampleRejected);
             Assert.Equal(9, tracker.LastObservedRound);
             Assert.True(tracker.HasActedThisRound(102));
+        }
+
+        [Fact]
+        public void RegressingRoundWithDifferentActorNeverRollsActorBackwardsOrConsumesRolls()
+        {
+            var aliveMonsters = new HashSet<long> { 101, 102 };
+            var tracker = new ActionRoundTracker();
+
+            tracker.Observe(true, 101, curRound: 8, latestDiceEpoch: 1, latestDiceOwnerId: 101, aliveMonsters.Contains, _ => false);
+            tracker.Observe(true, 102, curRound: 9, latestDiceEpoch: 2, latestDiceOwnerId: 102, aliveMonsters.Contains, _ => false);
+            int seqBefore = tracker.TurnSequence;
+            Assert.Equal(102, tracker.EffectiveActiveActorId);
+            Assert.False(tracker.HasActedThisRound(102));
+
+            // Delayed (8, 101) arrives after accepting (9, 102) -> MUST be rejected completely!
+            var reg = tracker.Observe(true, 101, curRound: 8, latestDiceEpoch: 3, latestDiceOwnerId: 101, aliveMonsters.Contains, _ => false);
+            Assert.True(reg.SampleRejected);
+            Assert.False(reg.BoundaryAdvanced);
+            Assert.False(reg.ShouldResetMovementState);
+            Assert.Equal(102, tracker.EffectiveActiveActorId);
+            Assert.Equal(seqBefore, tracker.TurnSequence);
+            Assert.False(tracker.HasActedThisRound(102));
+            Assert.Equal(9, tracker.LastObservedRound);
+        }
+
+        [Fact]
+        public void ProvisionalNextRoundCoalescesFirstRollOnPromotionCreditsOutgoingOnSwitchAndSurvivesExtraRoll()
+        {
+            var aliveMonsters = new HashSet<long> { 101, 102, 103 };
+
+            // Case 1: (7, 102) -> (7, 101 provisional, no roll) -> (8, 101, first roll)
+            // First roll MUST coalesce on the promotion poll without advancing TurnSequence or resetting movement!
+            var t1 = new ActionRoundTracker();
+            t1.ObserveWithOwnedRolls(true, 102, 7, 1, aliveMonsters.Contains, _ => false);
+            var prov1 = t1.ObserveWithOwnedRolls(true, 101, 7, 0, aliveMonsters.Contains, _ => false, isEarlierRoundPriorityThanPrevious: true);
+            Assert.True(prov1.BoundaryAdvanced);
+            int seqB1 = t1.TurnSequence;
+            var promo1 = t1.ObserveWithOwnedRolls(true, 101, 8, 1, aliveMonsters.Contains, _ => false);
+            Assert.True(promo1.RoundChanged);
+            Assert.False(promo1.BoundaryAdvanced);
+            Assert.False(promo1.ShouldResetMovementState);
+            Assert.Equal(seqB1, t1.TurnSequence);
+            Assert.Equal(8, t1.ActiveActorStartedRound);
+
+            // Case 2: (7, 102) -> (7, 101 provisional) -> (8, 103)
+            // 101 completed the first turn of Round 8 and MUST be credited in Round 8!
+            var t2 = new ActionRoundTracker();
+            t2.ObserveWithOwnedRolls(true, 102, 7, 1, aliveMonsters.Contains, _ => false);
+            t2.ObserveWithOwnedRolls(true, 101, 7, 1, aliveMonsters.Contains, _ => false, isEarlierRoundPriorityThanPrevious: true);
+            var sw2 = t2.ObserveWithOwnedRolls(true, 103, 8, 1, aliveMonsters.Contains, _ => false);
+            Assert.True(sw2.RoundChanged);
+            Assert.True(sw2.BoundaryAdvanced);
+            Assert.True(t2.HasActedThisRound(101));
+            Assert.False(t2.HasActedThisRound(102));
+            Assert.False(t2.HasActedThisRound(103));
+
+            // Case 3: (7, 102) -> (7, 101 provisional, 0 rolls) -> (7, 101, 2 rolls [first + extra turn]) -> (8, 101)
+            // Same-actor extra roll before Room.Round ticks MUST preserve provisional status so (8, 101) is not marked stale!
+            var t3 = new ActionRoundTracker();
+            t3.ObserveWithOwnedRolls(true, 102, 7, 1, aliveMonsters.Contains, _ => false);
+            t3.ObserveWithOwnedRolls(true, 101, 7, 0, aliveMonsters.Contains, _ => false, isEarlierRoundPriorityThanPrevious: true);
+            int seqBeforeExtra = t3.TurnSequence;
+            var extra = t3.ObserveWithOwnedRolls(true, 101, 7, 2, aliveMonsters.Contains, _ => false);
+            Assert.True(extra.BoundaryAdvanced);
+            Assert.Equal(seqBeforeExtra + 1, t3.TurnSequence);
+            var tick3 = t3.ObserveWithOwnedRolls(true, 101, 8, 0, aliveMonsters.Contains, _ => false);
+            Assert.True(tick3.RoundChanged);
+            Assert.False(tick3.BoundaryAdvanced);
+            Assert.False(t3.IsCurrentActorStalePendingRound);
+            Assert.Equal(101, t3.EffectiveActiveActorId);
+            Assert.Equal(8, t3.ActiveActorStartedRound);
+        }
+
+        [Fact]
+        public void ActionEndReconciliationCreditsCrossRoundFalseToTrueAndTransfersActiveConfirmation()
+        {
+            var aliveMonsters = new HashSet<long> { 101, 102 };
+            var tracker = new ActionRoundTracker();
+
+            // Round 7: 101 is observed with ActionEnd=false, 102 with ActionEnd=true
+            tracker.ObserveWithOwnedRolls(true, 101, 7, 1, aliveMonsters.Contains, _ => false);
+            tracker.ReconcileServerActionEnd(101, serverActionEnd: false, currentRound: 7);
+            tracker.SeedInitialServerActionEnd(102, serverActionEnd: true, currentRound: 7);
+
+            // Round 8 starts (actor switches to hero 1):
+            tracker.ObserveWithOwnedRolls(true, 1, 8, 1, aliveMonsters.Contains, id => id == 1);
+
+            // 101 completed between polls (R7 false -> R8 true): MUST be credited in Round 8!
+            tracker.ReconcileServerActionEnd(101, serverActionEnd: true, currentRound: 8);
+            Assert.True(tracker.HasActedThisRound(101));
+
+            // 102 still carries stale R7 true into R8: MUST NOT be credited until false -> true!
+            tracker.ReconcileServerActionEnd(102, serverActionEnd: true, currentRound: 8);
+            Assert.False(tracker.HasActedThisRound(102));
+            tracker.ReconcileServerActionEnd(102, serverActionEnd: false, currentRound: 8);
+            tracker.ReconcileServerActionEnd(102, serverActionEnd: true, currentRound: 8);
+            Assert.True(tracker.HasActedThisRound(102));
+
+            // Active confirmation transfer: 101 becomes active in R9, server sets ActionEnd=true while 101 is still active,
+            // then actor switches to 102, then server explicitly resets 101's ActionEnd=false -> clears immediately!
+            tracker.ObserveWithOwnedRolls(true, 101, 9, 1, aliveMonsters.Contains, _ => false);
+            tracker.ReconcileServerActionEnd(101, serverActionEnd: false, currentRound: 9);
+            tracker.ReconcileServerActionEnd(101, serverActionEnd: true, currentRound: 9);
+            tracker.ObserveWithOwnedRolls(true, 102, 9, 1, aliveMonsters.Contains, _ => false);
+            Assert.True(tracker.HasActedThisRound(101));
+            tracker.ReconcileServerActionEnd(101, serverActionEnd: false, currentRound: 9);
+            Assert.False(tracker.HasActedThisRound(101));
         }
     }
 }

@@ -149,41 +149,149 @@ namespace MonsterPathPredictor.Tests
             Assert.Equal(4.5f, externalAfterFailedReset.LineWidth);
         }
 
-        [Fact]
-        public void StylePersistenceBoundaryPreservesExternalWritesAcrossFailedSaveAndRetry()
+        private sealed class FakeConfigStore : IConfigStore
         {
-            var disk = new System.Collections.Generic.Dictionary<string, object>
+            public readonly System.Collections.Generic.Dictionary<string, object> Disk =
+                new System.Collections.Generic.Dictionary<string, object>(System.StringComparer.Ordinal);
+            private System.Collections.Generic.Dictionary<string, object> _mem =
+                new System.Collections.Generic.Dictionary<string, object>(System.StringComparer.Ordinal);
+            private bool _diskChangedExternally;
+            private bool _memDirty;
+            public bool FailSave;
+            public bool ThrowOnReload;
+            public int ReloadCallCount;
+            public System.Action<FakeConfigStore> OnReloadBeforeCheck;
+
+            public void SeedDisk(string key, object value)
             {
-                ["lineWidth"] = 4.5f,
-                ["fontSize"] = 18,
-                ["dashSpeed"] = 26f,
-                ["previewSteps"] = 12
-            };
+                Disk[key] = value;
+                _mem[key] = value;
+            }
+
+            public void ExternalEditDisk(string key, object value)
+            {
+                Disk[key] = value;
+                _diskChangedExternally = true;
+            }
+
+            public bool Has(string key) => _mem.ContainsKey(key);
+            public bool GetBool(string key, bool defaultValue) => _mem.TryGetValue(key, out var v) && v is bool b ? b : defaultValue;
+            public int GetInt(string key, int defaultValue) => _mem.TryGetValue(key, out var v) && v is int i ? i : defaultValue;
+            public float GetFloat(string key, float defaultValue) => _mem.TryGetValue(key, out var v) && v is float f ? f : defaultValue;
+            public string GetString(string key, string defaultValue) => _mem.TryGetValue(key, out var v) && v is string s ? s : defaultValue;
+            public void Set(string key, bool value) { _mem[key] = value; _memDirty = true; }
+            public void Set(string key, int value) { _mem[key] = value; _memDirty = true; }
+            public void Set(string key, float value) { _mem[key] = value; _memDirty = true; }
+            public void Set(string key, string value) { _mem[key] = value; _memDirty = true; }
+
+            public bool ReloadIfChanged()
+            {
+                ReloadCallCount++;
+                OnReloadBeforeCheck?.Invoke(this);
+                if (ThrowOnReload) throw new System.IO.IOException("simulated disk read error");
+                if (!_diskChangedExternally) return false;
+                _mem = new System.Collections.Generic.Dictionary<string, object>(Disk, System.StringComparer.Ordinal);
+                _diskChangedExternally = false;
+                _memDirty = false;
+                return true;
+            }
+
+            public bool Save()
+            {
+                if (FailSave) return false;
+                Disk.Clear();
+                foreach (var kv in _mem) Disk[kv.Key] = kv.Value;
+                _memDirty = false;
+                return true;
+            }
+
+            public bool SaveIfDirty() => _memDirty ? Save() : true;
+        }
+
+        [Fact]
+        public void ProductionConfigCoordinatorHandlesNullStoreFailedMigrationRetryAndConcurrentExternalEdits()
+        {
+            var coord = new ConfigPersistenceCoordinator();
             var patch = new StylePendingPatch();
 
-            // 1. User changes lineWidth to 7.0 -> write fails (disk unchanged, patch retains lineWidth=7.0)
-            var s1 = new PredictorSettings { LineWidth = (float)disk["lineWidth"], FontSize = (int)disk["fontSize"], DashSpeed = (float)disk["dashSpeed"], PreviewSteps = (int)disk["previewSteps"] };
-            var b1 = s1.Clone();
-            s1.LineWidth = 7.0f;
-            patch.RecordDiff(b1, s1);
-
-            // 2. External editor updates fontSize=24 and previewSteps=16 on disk
-            disk["fontSize"] = 24;
-            disk["previewSteps"] = 16;
-
-            // 3. Reload from disk, merge pending patch, user edits dashSpeed=44, retry write succeeds
-            var s2 = new PredictorSettings { LineWidth = (float)disk["lineWidth"], FontSize = (int)disk["fontSize"], DashSpeed = (float)disk["dashSpeed"], PreviewSteps = (int)disk["previewSteps"] };
-            patch.ApplyTo(s2);
-            var b2 = s2.Clone();
-            s2.DashSpeed = 44f;
-            patch.RecordDiff(b2, s2);
-            foreach (var kv in patch.Entries) disk[kv.Key] = kv.Value;
+            // 1. Null storage MUST report saveOk=false on both Load and style edits while retaining pending patch.
+            var nullSettings = coord.Load(null, isInitial: true, FakeNormalizeKey, null, out bool nullLoadSaveOk);
+            Assert.False(nullLoadSaveOk);
+            var nullEdit = coord.ApplyStyleMutationAndPersist(null, nullSettings, patch, s => s.LineWidth = 7.0f, isFullReset: false, FakeNormalizeKey);
+            Assert.True(nullEdit.SaveAttempted);
+            Assert.False(nullEdit.SaveOk);
+            Assert.True(patch.HasPending);
             patch.Clear();
 
-            Assert.Equal(7.0f, (float)disk["lineWidth"]);
-            Assert.Equal(44f, (float)disk["dashSpeed"]);
-            Assert.Equal(24, (int)disk["fontSize"]);
-            Assert.Equal(16, (int)disk["previewSteps"]);
+            // 2. Legacy v1 config migration with failed initial Save(): migration stays pending and disk stays untouched.
+            var store = new FakeConfigStore { FailSave = true };
+            store.SeedDisk("configVersion", 1);
+            store.SeedDisk("pickerHotkey", "F8");
+            store.SeedDisk("clearHotkey", "Escape");
+            store.SeedDisk("clearOnEmptyClick", true);
+            store.SeedDisk("lineWidth", 4.5f);
+            store.SeedDisk("fontSize", 18);
+            store.SeedDisk("previewSteps", 12);
+
+            var loaded = coord.Load(store, isInitial: true, FakeNormalizeKey, null, out bool initSaveOk);
+            Assert.False(initSaveOk);
+            Assert.True(coord.HasPendingMigrationSave);
+            Assert.Equal("F10", loaded.PickerHotkey);
+            Assert.Equal(1, (int)store.Disk["configVersion"]); // Disk unchanged on failed save
+
+            // 3. User edits lineWidth=7.0 while Save() still fails -> patch retained, disk unchanged.
+            var r1 = coord.ApplyStyleMutationAndPersist(store, loaded, patch, s => s.LineWidth = 7.0f, isFullReset: false, FakeNormalizeKey);
+            Assert.False(r1.SaveOk);
+            Assert.True(patch.HasPending);
+            Assert.Equal(4.5f, (float)store.Disk["lineWidth"]);
+
+            // 4. External editor modifies fontSize=24 and previewSteps=16 on disk BEFORE next edit.
+            store.ExternalEditDisk("fontSize", 24);
+            store.ExternalEditDisk("previewSteps", 16);
+
+            // 5. Simulate an additional external edit arriving BETWEEN the pre-mutate reload and the pre-save reload!
+            int reloadCountBeforeEdit = store.ReloadCallCount;
+            store.OnReloadBeforeCheck = st =>
+            {
+                if (st.ReloadCallCount == reloadCountBeforeEdit + 2)
+                {
+                    st.ExternalEditDisk("gapLength", 14.0f);
+                }
+            };
+
+            // Save now succeeds: MUST preserve fontSize=24, previewSteps=16, gapLength=14.0,
+            // apply pending lineWidth=7.0 + new dashSpeed=44.0, AND commit the pending v1->v3 migration!
+            store.FailSave = false;
+            var r2 = coord.ApplyStyleMutationAndPersist(store, r1.Settings, patch, s => s.DashSpeed = 44.0f, isFullReset: false, FakeNormalizeKey);
+            Assert.True(r2.SaveOk);
+            Assert.False(patch.HasPending);
+            Assert.False(coord.HasPendingMigrationSave);
+
+            Assert.Equal(3, (int)store.Disk["configVersion"]);
+            Assert.Equal("F10", (string)store.Disk["pickerHotkey"]);
+            Assert.False((bool)store.Disk["clearOnEmptyClick"]);
+            Assert.Equal(7.0f, (float)store.Disk["lineWidth"]);
+            Assert.Equal(44.0f, (float)store.Disk["dashSpeed"]);
+            Assert.Equal(24, (int)store.Disk["fontSize"]);
+            Assert.Equal(16, (int)store.Disk["previewSteps"]);
+            Assert.Equal(14.0f, (float)store.Disk["gapLength"]);
+            Assert.Equal(14.0f, r2.Settings.GapLength);
+            Assert.Equal(24, r2.Settings.FontSize);
+            Assert.Equal(16, r2.Settings.PreviewSteps);
+
+            // 6. Reload failure aborts save cleanly without clobbering disk and retains pending edit for later retry.
+            store.OnReloadBeforeCheck = null;
+            store.ThrowOnReload = true;
+            var r3 = coord.ApplyStyleMutationAndPersist(store, r2.Settings, patch, s => s.DashLength = 20.0f, isFullReset: false, FakeNormalizeKey);
+            Assert.True(r3.ReloadFailed);
+            Assert.False(r3.SaveOk);
+            Assert.True(patch.HasPending);
+            Assert.False(store.Disk.ContainsKey("dashLength"));
+            store.ThrowOnReload = false;
+            var r4 = coord.ApplyStyleMutationAndPersist(store, r3.Settings, patch, _ => { }, isFullReset: false, FakeNormalizeKey);
+            Assert.True(r4.SaveOk);
+            Assert.False(patch.HasPending);
+            Assert.Equal(20.0f, (float)store.Disk["dashLength"]);
         }
     }
 }

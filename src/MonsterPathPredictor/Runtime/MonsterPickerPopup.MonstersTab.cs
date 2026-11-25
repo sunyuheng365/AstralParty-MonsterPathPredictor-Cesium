@@ -20,12 +20,12 @@ namespace MonsterPathPredictor.Runtime
         {
             float y = 0f;
             bool hasVirtual = sandbox != null && sandbox.HasOverrides;
-            float bannerH = layout.RowH < 28f ? 22f : 26f;
+            float bannerH = rowW < 120f ? Math.Min(layout.MaxContentHeight, 28f) : (layout.RowH < 28f ? 22f : 26f);
             // Always reserve space for at least one selectable monster row FIRST before showing the virtual banner.
             float minForBannerAndOneRow = bannerH + layout.RowGap + (visible.Count > 0 ? layout.RowH : 22f);
             if (hasVirtual && layout.MaxContentHeight >= minForBannerAndOneRow)
             {
-                var banner = BuildVirtualActiveBanner(sandbox.OverrideCount, rowW, bannerH);
+                var banner = BuildVirtualActiveBanner(sandbox.OverrideCount, rowW, bannerH, sandbox.LayoutGeneration);
                 banner.SetXY(0f, y);
                 _contentHost.AddChild(banner);
                 y += bannerH + layout.RowGap;
@@ -35,9 +35,10 @@ namespace MonsterPathPredictor.Runtime
             if (visible.Count == 0)
             {
                 float emptyH = Math.Min(42f, availListH);
-                _emptyText.visible = emptyH >= 18f;
-                _emptyText.SetXY(padX, contentY + y + Math.Max(2f, (emptyH - 18f) * 0.5f));
-                _emptyText.SetSize(rowW, 20f);
+                PopupPagination.ClampChildVertical(Math.Max(1f, emptyH), (emptyH - 18f) * 0.5f, 20f, out float relY, out float lblH);
+                _emptyText.visible = emptyH >= 8f;
+                _emptyText.SetXY(padX, contentY + y + relY);
+                _emptyText.SetSize(rowW, lblH);
                 return y + emptyH;
             }
 
@@ -58,7 +59,7 @@ namespace MonsterPathPredictor.Runtime
             return Math.Min(layout.MaxContentHeight, y + fitRows * rowStep + layout.RowGap);
         }
 
-        private GComponent BuildVirtualActiveBanner(int overrideCount, float w, float h)
+        private GComponent BuildVirtualActiveBanner(int overrideCount, float w, float h, int layoutGen)
         {
             var bar = new GComponent { touchable = true, opaque = true };
             bar.SetSize(w, h);
@@ -68,22 +69,36 @@ namespace MonsterPathPredictor.Runtime
             bg.DrawRect(w, h, 1, BtnVioletBorder, BtnVioletBg);
             bar.AddChild(bg);
 
-            float resetW = Math.Min(54f, w * 0.3f);
+            PopupPagination.ComputeVirtualBannerGeometry(
+                w, h,
+                out float textX, out float textY, out float textW, out float textH,
+                out float btnX, out float btnY, out float btnW, out float btnH,
+                out bool stacked);
+
+            string bannerText = w < 120f
+                ? ("虚(" + overrideCount + ")")
+                : ("虚拟站位生效中 (" + overrideCount + "人)");
+            int txtSize = (w < 120f || textH < 14f) ? Math.Max(8, Math.Min(10, (int)Math.Max(8f, textH - 1f))) : 12;
+
             var txt = new GTextField
             {
                 touchable = false,
                 autoSize = AutoSizeType.None,
                 singleLine = true,
+                align = stacked ? AlignType.Center : AlignType.Left,
                 verticalAlign = VertAlignType.Middle,
-                textFormat = new TextFormat { size = 12, bold = true, color = AccentViolet },
-                text = "虚拟站位生效中 (" + overrideCount + "人)"
+                textFormat = new TextFormat { size = txtSize, bold = true, color = AccentViolet },
+                text = bannerText
             };
-            txt.SetXY(6f, 0f);
-            txt.SetSize(Math.Max(30f, w - resetW - 14f), h);
+            txt.SetXY(textX, textY);
+            txt.SetSize(textW, textH);
             bar.AddChild(txt);
 
-            var resetBtn = CreateMiniButton("还原", resetW, Math.Max(16f, h - 4f), () => VirtualResetAllRequested?.Invoke(), fontSize: 11);
-            resetBtn.SetXY(w - resetW - 4f, (h - resetBtn.height) * 0.5f);
+            int capturedMatchGen = _currentMatchGen;
+            string btnLabel = btnW < 28f ? "复" : "还原";
+            int btnFont = (btnW < 30f || btnH < 14f) ? Math.Max(8, Math.Min(10, (int)Math.Max(8f, btnH - 1f))) : 11;
+            var resetBtn = CreateMiniButton(btnLabel, btnW, btnH, () => VirtualResetAllRequested?.Invoke(capturedMatchGen, layoutGen), fontSize: btnFont);
+            resetBtn.SetXY(btnX, btnY);
             bar.AddChild(resetBtn);
             return bar;
         }
@@ -103,8 +118,8 @@ namespace MonsterPathPredictor.Runtime
             DrawRowBg(bg, rowW, rowHeight, isSelected, hasActed, hovered: false);
             row.AddChild(bg);
 
-            int nameFontSize = rowHeight < 30f ? 13 : 14;
-            float nameY = Math.Max(1f, (rowHeight - 20f) * 0.5f);
+            int nameFontSize = rowHeight < 30f ? Math.Max(8, Math.Min(13, (int)Math.Max(8f, rowHeight - 2f))) : 14;
+            PopupPagination.ClampChildVertical(rowHeight, (rowHeight - 20f) * 0.5f, Math.Min(22f, rowHeight), out float nameY, out float nameH);
             PopupPagination.ComputeSplitRowGeometry(rowW, 6f, 0.54f, out float nameX, out float nameW, out float metaX, out float metaW);
             Color nameColor = isSelected ? AccentGold : (isActing ? AccentGreen : (hasActed ? TextMuted : TextPrimary));
 
@@ -121,16 +136,16 @@ namespace MonsterPathPredictor.Runtime
                 text = prefix + rankTag + displayName
             };
             nameTf.SetXY(nameX, nameY);
-            nameTf.SetSize(nameW, Math.Min(22f, Math.Max(8f, rowHeight - 2f)));
+            nameTf.SetSize(nameW, nameH);
             row.AddChild(nameTf);
 
-            int metaFontSize = rowHeight < 30f ? 11 : 12;
-            float metaY = Math.Max(1f, (rowHeight - 18f) * 0.5f);
+            int metaFontSize = rowHeight < 30f ? Math.Max(8, Math.Min(11, (int)Math.Max(8f, rowHeight - 2f))) : 12;
+            PopupPagination.ClampChildVertical(rowHeight, (rowHeight - 18f) * 0.5f, Math.Min(20f, rowHeight), out float metaY, out float metaH);
             Color metaColor = isActing ? AccentGreen : (!st.IsNormalAggressive ? AccentCyan : TextMuted);
 
-            string hpPart = st.MaxHp > 0
-                ? ("HP " + (st.HasHp ? st.Hp.ToString() : "?") + "/" + st.MaxHp)
-                : string.Empty;
+            string hpPart = st.HasHp
+                ? (st.MaxHp > 0 ? ("HP " + st.Hp + "/" + st.MaxHp) : ("HP " + st.Hp))
+                : (st.MaxHp > 0 ? ("HP ?/" + st.MaxHp) : string.Empty);
             string tilePart = "格" + st.CurrentLandId;
             string statusPart = isActing
                 ? " 行动中"
@@ -148,7 +163,7 @@ namespace MonsterPathPredictor.Runtime
                     text = tilePart + (hpPart.Length > 0 ? " " + hpPart : string.Empty) + statusPart
                 };
                 metaTf.SetXY(metaX, metaY);
-                metaTf.SetSize(metaW, Math.Min(20f, Math.Max(8f, rowHeight - 2f)));
+                metaTf.SetSize(metaW, metaH);
                 row.AddChild(metaTf);
             }
 
@@ -158,8 +173,8 @@ namespace MonsterPathPredictor.Runtime
             row.onRollOut.Add(() => DrawRowBg(bg, rowW, rowHeight, isSelected, hasActed, hovered: false));
             row.onClick.Add(() =>
             {
+                // Auto-close is owned by the controller after validating and committing the selection.
                 MonsterSelected?.Invoke(capturedId, capturedMatchGen);
-                if (_closeOnSelect) Hide();
             });
             return row;
         }

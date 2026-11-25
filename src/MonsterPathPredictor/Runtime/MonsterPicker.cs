@@ -147,13 +147,20 @@ namespace MonsterPathPredictor.Runtime
                 return false;
             }
 
-            // Prefer the monster cleanly hit on MouseDown if still alive AND still eligible under current settings.
-            long hitMonsterId = IsMonsterEligible(monsters, outcome.DownHitMonsterId, settings)
+            // Prefer the monster cleanly hit on MouseDown if still alive AND still eligible against the LIVE roster
+            // (never trusting a stale 120ms snapshot cache if the monster died before mouse-up!).
+            long hitMonsterId = (IsMonsterEligible(monsters, outcome.DownHitMonsterId, settings) &&
+                                 MonsterStateTracker.TryIsMonsterLiveAndEligible(outcome.DownHitMonsterId, settings.AllowNonAggressiveMonsters))
                 ? outcome.DownHitMonsterId
                 : 0;
             if (hitMonsterId == 0)
             {
-                hitMonsterId = HitTestMonsters(layer, camera, monsters, localPos, settings);
+                long fallbackHit = HitTestMonsters(layer, camera, monsters, localPos, settings);
+                if (fallbackHit != 0 &&
+                    MonsterStateTracker.TryIsMonsterLiveAndEligible(fallbackHit, settings.AllowNonAggressiveMonsters))
+                {
+                    hitMonsterId = fallbackHit;
+                }
             }
 
             long nextSelected = PointerClickTracker.ApplyBoardClickSelection(

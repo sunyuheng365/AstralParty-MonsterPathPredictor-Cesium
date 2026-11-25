@@ -187,6 +187,11 @@ namespace MonsterPathPredictor.Core
         /// </summary>
         public double LogConditionalProbability { get; set; } = double.NegativeInfinity;
         public double CumulativeProbability { get; set; }
+        /// <summary>
+        /// Natural logarithm of the cumulative exit probability (finite even when CumulativeProbability
+        /// underflows IEEE-754 double to 0.0; NegativeInfinity when unreachable).
+        /// </summary>
+        public double LogCumulativeProbability { get; set; } = double.NegativeInfinity;
         public bool IsGlobalRedArrow { get; set; }
 
         public bool IsPositiveSupport => ConditionalProbability > 0.0 || !double.IsNegativeInfinity(LogConditionalProbability);
@@ -197,6 +202,12 @@ namespace MonsterPathPredictor.Core
         /// from displaying "100%" alongside a sibling "&lt;0.1%" branch.
         /// </summary>
         public bool HasOtherPositiveExits { get; set; }
+
+        /// <summary>
+        /// True when other exits or sibling branches hold positive cumulative probability mass,
+        /// preventing a cumulative probability rounded to 1.0 in double precision from formatting as "100%".
+        /// </summary>
+        public bool HasOtherCumulativeSupport { get; set; }
 
         public string FormatConditionalPercent() => FormatConditionalPercent(HasOtherPositiveExits ? 2 : 1);
 
@@ -209,7 +220,14 @@ namespace MonsterPathPredictor.Core
             return ProbabilityFormat.Percent(ConditionalProbability);
         }
 
-        public string FormatCumulativePercent() => ProbabilityFormat.Percent(CumulativeProbability);
+        public string FormatCumulativePercent()
+        {
+            if (CumulativeProbability <= 0.0 && !double.IsNegativeInfinity(LogCumulativeProbability))
+                return "<0.1%";
+            if (CumulativeProbability >= 1.0 && (HasOtherPositiveExits || HasOtherCumulativeSupport))
+                return ">99.9%";
+            return ProbabilityFormat.Percent(CumulativeProbability);
+        }
     }
 
     public sealed class PredictedFork
@@ -218,6 +236,7 @@ namespace MonsterPathPredictor.Core
         public int IncomingLandId { get; set; }
         public int StepIndex { get; set; }
         public double ArrivalProbability { get; set; }
+        public double LogArrivalProbability { get; set; } = double.NegativeInfinity;
         public bool IsAfterCombat { get; set; }
         public ForkReasonKind ReasonKind { get; set; }
         public string SummaryLabel { get; set; } = string.Empty;

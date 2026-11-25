@@ -18,11 +18,12 @@ namespace MonsterPathPredictor.Runtime
             out List<PopupPagination.VirtualRowItem> rows,
             out List<PageSlice> pages,
             out float rowGap,
-            out int neighborCols)
+            out int neighborCols,
+            out IReadOnlyList<int> neighbors)
         {
             int playerCount = players != null ? players.Count : 0;
             bool hasLivingSelected = false;
-            int neighborCount = 0;
+            neighbors = Array.Empty<int>();
             if (players != null && sandbox != null)
             {
                 for (int i = 0; i < players.Count; i++)
@@ -34,12 +35,13 @@ namespace MonsterPathPredictor.Runtime
                         if (hasLivingSelected && board != null)
                         {
                             int eff = sandbox.GetEffectiveLandId(p);
-                            neighborCount = VirtualPlayerSandbox.GetReachableNeighbors(board, eff).Count;
+                            neighbors = VirtualPlayerSandbox.GetReachableNeighbors(board, eff);
                         }
                         break;
                     }
                 }
             }
+            int neighborCount = neighbors.Count;
 
             if (playerCount == 0 || sandbox == null)
             {
@@ -73,7 +75,7 @@ namespace MonsterPathPredictor.Runtime
 
         private float BuildVirtualTab(
             IReadOnlyList<TrackedPlayer> players,
-            BoardGraph board,
+            IReadOnlyList<int> precomputedNeighbors,
             VirtualPlayerSandbox sandbox,
             long localPlayerId,
             CompactLayout layout,
@@ -88,18 +90,21 @@ namespace MonsterPathPredictor.Runtime
 
             if (players == null || players.Count == 0 || sandbox == null || rows == null || slice.Count == 0)
             {
+                if (maxH < 4f) return 0f;
+                PopupPagination.ClampChildVertical(maxH, Math.Min(8f, maxH * 0.15f), 20f, out float ey, out float eh);
                 var empty = new GTextField
                 {
                     touchable = false,
                     autoSize = AutoSizeType.None,
                     singleLine = true,
-                    textFormat = new TextFormat { size = 13, color = TextMuted },
-                    text = "等待读取角色站位..."
+                    verticalAlign = VertAlignType.Middle,
+                    textFormat = new TextFormat { size = eh < 14f ? Math.Max(8, (int)eh) : 13, color = TextMuted },
+                    text = contentW < 80f ? "等待..." : "等待读取角色站位..."
                 };
-                empty.SetXY(0f, 8f);
-                empty.SetSize(contentW, 20f);
+                empty.SetXY(0f, ey);
+                empty.SetSize(contentW, eh);
                 _contentHost.AddChild(empty);
-                return Math.Min(maxH, 36f);
+                return Math.Min(maxH, ey + eh);
             }
 
             TrackedPlayer selectedPlayer = null;
@@ -114,9 +119,10 @@ namespace MonsterPathPredictor.Runtime
 
             bool hasLivingSelected = selectedPlayer != null && selectedPlayer.IsAlive;
             int effLand = hasLivingSelected ? sandbox.GetEffectiveLandId(selectedPlayer) : -1;
+            int matchGen = _currentMatchGen;
             int layoutGen = sandbox.LayoutGeneration;
-            IReadOnlyList<int> neighbors = (hasLivingSelected && board != null)
-                ? (IReadOnlyList<int>)VirtualPlayerSandbox.GetReachableNeighbors(board, effLand)
+            IReadOnlyList<int> neighbors = (hasLivingSelected && precomputedNeighbors != null)
+                ? precomputedNeighbors
                 : Array.Empty<int>();
 
             int end = Math.Min(rows.Count, slice.StartIndex + slice.Count);
@@ -160,9 +166,12 @@ namespace MonsterPathPredictor.Runtime
                     {
                         bool armed = hasLivingSelected && sandbox.BoardPickArmed;
                         long capturedOwnerId = selectedPlayer != null ? selectedPlayer.PlayerId : 0L;
-                        string toggleLabel = !hasLivingSelected
-                            ? "○ 暂无存活角色可右键移位"
-                            : (armed ? "● 右键点击棋盘任意格移位：已开启" : "○ 开启「右键点击棋盘格」快速移位");
+                        string toggleLabel = contentW < 100f
+                            ? (!hasLivingSelected ? "无活人" : (armed ? "●右选" : "○右选"))
+                            : (!hasLivingSelected
+                                ? "○ 暂无存活角色可右键移位"
+                                : (armed ? "● 右键点击棋盘任意格移位：已开启" : "○ 开启「右键点击棋盘格」快速移位"));
+                        int btnFont = (contentW < 100f || item.Height < 15f) ? Math.Max(8, Math.Min(10, (int)Math.Max(8f, item.Height - 2f))) : 12;
                         var pickBtn = CreateStyledButton(
                             toggleLabel,
                             contentW,
@@ -170,8 +179,8 @@ namespace MonsterPathPredictor.Runtime
                             armed ? BtnVioletBg : BtnBg,
                             armed ? BtnVioletBorder : (hasLivingSelected ? new Color(0.35f, 0.45f, 0.60f, 0.8f) : new Color(0.26f, 0.30f, 0.36f, 0.55f)),
                             armed ? AccentGold : (hasLivingSelected ? TextPrimary : TextMuted),
-                            () => VirtualBoardPickToggled?.Invoke(capturedOwnerId, !armed, layoutGen),
-                            fontSize: 12);
+                            () => VirtualBoardPickToggled?.Invoke(capturedOwnerId, !armed, matchGen, layoutGen),
+                            fontSize: btnFont);
                         pickBtn.touchable = hasLivingSelected;
                         pickBtn.SetXY(0f, y);
                         _contentHost.AddChild(pickBtn);
@@ -187,11 +196,13 @@ namespace MonsterPathPredictor.Runtime
                                 touchable = false,
                                 autoSize = AutoSizeType.None,
                                 singleLine = true,
-                                textFormat = new TextFormat { size = 12, bold = true, color = AccentCyan },
-                                text = selectedPlayer.SeatTag + " 当前格#" + effLand + (neighbors.Count > 0 ? "，点相邻格移动：" : "（无相邻格）")
+                                textFormat = new TextFormat { size = item.Height < 14f ? Math.Max(8, (int)item.Height) : 12, bold = true, color = AccentCyan },
+                                text = contentW < 100f
+                                    ? (selectedPlayer.SeatTag + "#" + effLand)
+                                    : (selectedPlayer.SeatTag + " 当前格#" + effLand + (neighbors.Count > 0 ? "，点相邻格移动：" : "（无相邻格）"))
                             };
                             nbTitle.SetXY(2f, y);
-                            nbTitle.SetSize(contentW - 4f, item.Height);
+                            nbTitle.SetSize(Math.Max(0f, contentW - 4f), item.Height);
                             _contentHost.AddChild(nbTitle);
                         }
                         break;
@@ -202,15 +213,18 @@ namespace MonsterPathPredictor.Runtime
                         if (hasLivingSelected && neighbors.Count > 0)
                         {
                             int cols = Math.Max(1, neighborCols);
-                            float nbGap = 4f;
+                            float nbGap = contentW < 100f ? 2f : 4f;
                             float nbW = (contentW - nbGap * (cols - 1)) / cols;
                             long capturedPid = selectedPlayer.PlayerId;
                             int rowCount = Math.Min(item.Count, neighbors.Count - item.StartIndex);
+                            int nbFont = (nbW < 54f || item.Height < 15f) ? Math.Max(8, Math.Min(10, (int)Math.Max(8f, item.Height - 2f))) : 12;
                             for (int c = 0; c < rowCount; c++)
                             {
                                 int targetTile = neighbors[item.StartIndex + c];
                                 bool isRealTile = targetTile == selectedPlayer.LandId;
-                                string label = isRealTile ? ("回格#" + targetTile) : ("走→#" + targetTile);
+                                string label = nbW < 54f
+                                    ? ((isRealTile ? "回" : "→") + targetTile)
+                                    : (isRealTile ? ("回格#" + targetTile) : ("走→#" + targetTile));
                                 var stepBtn = CreateStyledButton(
                                     label,
                                     nbW,
@@ -218,8 +232,8 @@ namespace MonsterPathPredictor.Runtime
                                     isRealTile ? BtnActiveBg : BtnBg,
                                     isRealTile ? AccentCyan : BtnVioletBorder,
                                     isRealTile ? AccentCyan : TextPrimary,
-                                    () => VirtualStepNeighborRequested?.Invoke(capturedPid, effLand, targetTile, layoutGen),
-                                    fontSize: 12);
+                                    () => VirtualStepNeighborRequested?.Invoke(capturedPid, effLand, targetTile, matchGen, layoutGen),
+                                    fontSize: nbFont);
                                 stepBtn.SetXY(c * (nbW + nbGap), y);
                                 _contentHost.AddChild(stepBtn);
                             }
@@ -229,27 +243,38 @@ namespace MonsterPathPredictor.Runtime
 
                     case PopupPagination.VirtualRowKind.ActionsRow:
                     {
-                        float aGap = 4f;
-                        float aW = (contentW - aGap * 2f) / 3f;
+                        int count = item.Count > 0 ? item.Count : 3;
+                        int start = item.Count > 0 ? item.StartIndex : 0;
+                        float aGap = contentW < 100f ? 2f : 4f;
+                        float aW = (contentW - aGap * (count - 1)) / count;
                         long selId = sandbox.SelectedPlayerId;
                         bool canUndo = sandbox.CanUndo(selId);
                         bool selHasState = sandbox.HasPlayerState(selId);
                         bool anyState = sandbox.HasAnyState;
+                        int aFont = (aW < 54f || item.Height < 15f) ? Math.Max(8, Math.Min(10, (int)Math.Max(8f, item.Height - 2f))) : 12;
 
-                        var undoBtn = CreateStyledButton("撤回一步", aW, item.Height, BtnBg, canUndo ? AccentCyan : new Color(0.28f, 0.34f, 0.42f, 0.6f), canUndo ? TextPrimary : TextMuted, () => VirtualUndoRequested?.Invoke(selId, layoutGen), fontSize: 12);
-                        undoBtn.touchable = canUndo;
-                        undoBtn.SetXY(0f, y);
-                        _contentHost.AddChild(undoBtn);
-
-                        var resetOneBtn = CreateStyledButton("重置角色", aW, item.Height, BtnBg, selHasState ? AccentGold : new Color(0.28f, 0.34f, 0.42f, 0.6f), selHasState ? AccentGold : TextMuted, () => VirtualResetPlayerRequested?.Invoke(selId), fontSize: 12);
-                        resetOneBtn.touchable = selHasState;
-                        resetOneBtn.SetXY(aW + aGap, y);
-                        _contentHost.AddChild(resetOneBtn);
-
-                        var resetAllBtn = CreateStyledButton("全部还原", aW, item.Height, anyState ? BtnVioletBg : BtnBg, anyState ? BtnVioletBorder : new Color(0.28f, 0.34f, 0.42f, 0.6f), anyState ? AccentViolet : TextMuted, () => VirtualResetAllRequested?.Invoke(), fontSize: 12);
-                        resetAllBtn.touchable = anyState;
-                        resetAllBtn.SetXY((aW + aGap) * 2f, y);
-                        _contentHost.AddChild(resetAllBtn);
+                        for (int c = 0; c < count; c++)
+                        {
+                            int actionIdx = start + c;
+                            GComponent btn;
+                            if (actionIdx == 0)
+                            {
+                                btn = CreateStyledButton(aW < 50f ? "撤回" : "撤回一步", aW, item.Height, BtnBg, canUndo ? AccentCyan : new Color(0.28f, 0.34f, 0.42f, 0.6f), canUndo ? TextPrimary : TextMuted, () => VirtualUndoRequested?.Invoke(selId, matchGen, layoutGen), fontSize: aFont);
+                                btn.touchable = canUndo;
+                            }
+                            else if (actionIdx == 1)
+                            {
+                                btn = CreateStyledButton(aW < 50f ? "重置" : "重置角色", aW, item.Height, BtnBg, selHasState ? AccentGold : new Color(0.28f, 0.34f, 0.42f, 0.6f), selHasState ? AccentGold : TextMuted, () => VirtualResetPlayerRequested?.Invoke(selId, matchGen, layoutGen), fontSize: aFont);
+                                btn.touchable = selHasState;
+                            }
+                            else
+                            {
+                                btn = CreateStyledButton(aW < 50f ? "全复" : "全部还原", aW, item.Height, anyState ? BtnVioletBg : BtnBg, anyState ? BtnVioletBorder : new Color(0.28f, 0.34f, 0.42f, 0.6f), anyState ? AccentViolet : TextMuted, () => VirtualResetAllRequested?.Invoke(matchGen, layoutGen), fontSize: aFont);
+                                btn.touchable = anyState;
+                            }
+                            btn.SetXY(c * (aW + aGap), y);
+                            _contentHost.AddChild(btn);
+                        }
                         break;
                     }
                 }
@@ -330,9 +355,11 @@ namespace MonsterPathPredictor.Runtime
             if (player.IsAlive)
             {
                 long capturedId = player.PlayerId;
+                int capturedMatchGen = _currentMatchGen;
+                int capturedLayoutGen = sandbox.LayoutGeneration;
                 row.onRollOver.Add(() => bg.DrawRect(rowW, rowH, isSelected ? 2 : 1, PanelBorder, RowHoverBg));
                 row.onRollOut.Add(() => bg.DrawRect(rowW, rowH, isSelected ? 2 : 1, border, fill));
-                row.onClick.Add(() => VirtualPlayerSelected?.Invoke(capturedId));
+                row.onClick.Add(() => VirtualPlayerSelected?.Invoke(capturedId, capturedMatchGen, capturedLayoutGen));
             }
             return row;
         }

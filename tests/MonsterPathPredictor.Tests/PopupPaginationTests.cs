@@ -7,7 +7,11 @@ namespace MonsterPathPredictor.Tests
     public class PopupPaginationTests
     {
         [Theory]
+        [InlineData(4f, 40f, true)]
+        [InlineData(6f, 40f, false)]
+        [InlineData(16f, 40f, true)]
         [InlineData(16f, 52f, true)]
+        [InlineData(42f, 40f, true)]
         [InlineData(42f, 140f, false)]
         [InlineData(42f, 140f, true)]
         [InlineData(78f, 140f, false)]
@@ -172,6 +176,100 @@ namespace MonsterPathPredictor.Tests
             Assert.True(lX >= 0f);
             Assert.True(lX + lW <= rX + 0.01f);
             Assert.True(rX + rW <= contentW + 0.01f);
+
+            // Actual numeric stepper child rects MUST stay non-overlapping and strictly inside [0, contentW] x [0, rowH]
+            // even at the 48px panel (40px content) breakpoint AND tiny 6px/24px/30px row heights!
+            foreach (float rowH in new[] { 6f, 16f, 24f, 30f })
+            {
+                var st = PopupPagination.ComputeStepperGeometry(contentW, rowH);
+                Assert.True(st.MinusX >= 0f);
+                Assert.True(st.MinusX + st.BtnW <= st.ValX + 0.01f);
+                Assert.True(st.ValX + st.ValW <= st.PlusX + 0.01f);
+                Assert.True(st.PlusX + st.BtnW <= contentW + 0.01f);
+                Assert.True(st.MinusY >= 0f && st.MinusY + st.BtnH <= rowH + 0.01f);
+                Assert.True(st.ValY >= 0f && st.ValY + st.ValH <= rowH + 0.01f);
+                if (st.ShowLabel)
+                {
+                    Assert.True(st.LabelX >= 0f && st.LabelX + st.LabelW <= contentW + 0.01f);
+                    Assert.True(st.LabelY >= 0f && st.LabelY + st.LabelH <= rowH + 0.01f);
+                    if (st.Stacked)
+                        Assert.True(st.LabelY + st.LabelH <= st.MinusY + 0.01f);
+                    else
+                        Assert.True(st.LabelX + st.LabelW <= st.MinusX + 0.01f);
+                }
+                if (contentW >= 40f)
+                {
+                    Assert.True(st.ValW >= 12f, $"Stepper value width too narrow at contentW={contentW}: {st.ValW}");
+                }
+
+                // Virtual banner text and reset button MUST NOT overlap at any width or height!
+                PopupPagination.ComputeVirtualBannerGeometry(
+                    contentW, rowH,
+                    out float bx, out float by, out float bw, out float bh,
+                    out float rx, out float ry, out float rw, out float rh,
+                    out bool stacked);
+                Assert.True(bx >= 0f && bx + bw <= contentW + 0.01f);
+                Assert.True(by >= 0f && by + bh <= rowH + 0.01f);
+                Assert.True(rx >= 0f && rx + rw <= contentW + 0.01f);
+                Assert.True(ry >= 0f && ry + rh <= rowH + 0.01f);
+                if (stacked)
+                    Assert.True(by + bh <= ry + 0.01f);
+                else
+                    Assert.True(bx + bw <= rx + 0.01f);
+            }
+        }
+
+        [Fact]
+        public void Narrow48PxPanelSplitsMultiButtonRowsAndClampsExtremeCompactChromeHeights()
+        {
+            // At 48px panel width (40px contentW), Style toggles MUST split to 1 button per row (full 40px width!)
+            // and Virtual actions MUST split to 1 button per row so no button is crushed to 7.75px!
+            var styleRows = PopupPagination.BuildStyleRows(maxContentH: 300f, contentW: 40f, hasSaveWarn: false, out _);
+            int toggleRows = 0;
+            int toggleCovered = 0;
+            int roleRows = 0;
+            int roleCovered = 0;
+            foreach (var r in styleRows)
+            {
+                if (r.Kind == PopupPagination.StyleRowKind.Toggles)
+                {
+                    toggleRows++;
+                    Assert.Equal(1, r.Count);
+                    toggleCovered += r.Count;
+                }
+                if (r.Kind == PopupPagination.StyleRowKind.ColorRolesRow1 || r.Kind == PopupPagination.StyleRowKind.ColorRolesRow2)
+                {
+                    roleRows++;
+                    Assert.Equal(1, r.Count);
+                    roleCovered += r.Count;
+                }
+            }
+            Assert.Equal(4, toggleRows);
+            Assert.Equal(4, toggleCovered);
+            Assert.Equal(6, roleRows);
+            Assert.Equal(6, roleCovered);
+
+            var virtRows = PopupPagination.BuildVirtualRows(4, hasLivingSelected: true, neighborCount: 3, maxContentH: 300f, contentW: 40f, out _, out int nbCols);
+            Assert.Equal(1, nbCols);
+            int actionRows = 0;
+            foreach (var vr in virtRows)
+            {
+                if (vr.Kind == PopupPagination.VirtualRowKind.ActionsRow)
+                {
+                    actionRows++;
+                    Assert.Equal(1, vr.Count);
+                }
+            }
+            Assert.Equal(3, actionRows);
+
+            // Extreme 48px-high stage chrome clamping: child heights MUST stay <= parent budget!
+            foreach (float tabH in new[] { 4f, 6f, 7.5f, 12f, 24f })
+            {
+                float btnH = PopupPagination.ComputeTabStripButtonHeight(tabH);
+                Assert.True(btnH >= 1f && btnH <= tabH + 0.001f);
+                PopupPagination.ClampChildVertical(tabH, 2f, 16f, out float cy, out float ch);
+                Assert.True(cy >= 0f && cy + ch <= tabH + 0.001f);
+            }
         }
     }
 }

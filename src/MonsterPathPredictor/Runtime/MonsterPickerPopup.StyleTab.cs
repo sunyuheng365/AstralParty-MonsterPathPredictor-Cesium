@@ -52,18 +52,22 @@ namespace MonsterPathPredictor.Runtime
             var activeUnityCol = new Color(activeRgba.Rf, activeRgba.Gf, activeRgba.Bf, 1f);
             int alphaPct = (int)Math.Round(activeRgba.A * 100.0 / 255.0);
 
-            void AddStepper(string label, string valueText, float h, Action onMinus, Action onPlus)
+            void AddStepper(string label, string shortLabel, string valueText, string shortValueText, float h, Action onMinus, Action onPlus)
             {
-                var row = BuildStyleStepperRow(label, valueText, contentW, h, onMinus, onPlus);
+                var row = BuildStyleStepperRow(label, shortLabel, valueText, shortValueText, contentW, h, onMinus, onPlus);
                 row.SetXY(0f, y);
                 _contentHost.AddChild(row);
             }
 
-            void AddColorRoleRow(int startRoleIndex, float chipH)
+            void AddColorRoleRow(int startRoleIndex, int count, float chipH)
             {
-                float cGap = 3f;
-                float cW = (contentW - cGap * 2f) / 3f;
-                for (int c = 0; c < 3; c++)
+                int safeCount = Math.Max(1, Math.Min(count, 6 - startRoleIndex));
+                float cGap = contentW < 100f ? 2f : 3f;
+                float cW = (contentW - cGap * (safeCount - 1)) / safeCount;
+                float dotSize = Math.Max(3f, Math.Min(10f, chipH - 2f));
+                bool showDot = cW >= 28f && chipH >= 8f;
+                int chipFont = (cW < 54f || chipH < 14f) ? Math.Max(8, Math.Min(10, (int)Math.Max(8f, chipH - 2f))) : 11;
+                for (int c = 0; c < safeCount; c++)
                 {
                     int roleIdx = startRoleIndex + c;
                     if (roleIdx >= 6) break;
@@ -71,21 +75,26 @@ namespace MonsterPathPredictor.Runtime
                     bool sel = role == activeRole;
                     var roleCol = StyleColor.GetRoleColor(settings, role);
 
+                    string roleTxt = showDot ? ("  " + StyleColor.GetRoleLabel(role)) : StyleColor.GetRoleLabel(role);
                     var chip = CreateStyledButton(
-                        "  " + StyleColor.GetRoleLabel(role),
+                        roleTxt,
                         cW,
                         chipH,
                         sel ? BtnActiveBg : BtnBg,
                         sel ? AccentGold : new Color(0.32f, 0.40f, 0.52f, 0.8f),
                         sel ? AccentGold : TextPrimary,
-                        () => { _selectedColorRole = role; _lastSignature = string.Empty; },
-                        fontSize: 11);
+                        () => { _selectedColorRole = role; _popupLocalRevision++; _lastSignature = string.Empty; },
+                        fontSize: chipFont);
 
-                    var dot = new GGraph { touchable = false };
-                    dot.SetXY(5f, (chipH - 10f) * 0.5f);
-                    dot.SetSize(10f, 10f);
-                    dot.DrawRect(10f, 10f, 1, Color.black, new Color(roleCol.Rf, roleCol.Gf, roleCol.Bf, 1f));
-                    chip.AddChild(dot);
+                    if (showDot)
+                    {
+                        PopupPagination.ClampChildVertical(chipH, (chipH - dotSize) * 0.5f, dotSize, out float dotY, out float dotH);
+                        var dot = new GGraph { touchable = false };
+                        dot.SetXY(3f, dotY);
+                        dot.SetSize(dotH, dotH);
+                        dot.DrawRect(dotH, dotH, 1, Color.black, new Color(roleCol.Rf, roleCol.Gf, roleCol.Bf, 1f));
+                        chip.AddChild(dot);
+                    }
 
                     chip.SetXY(c * (cW + cGap), y);
                     _contentHost.AddChild(chip);
@@ -117,73 +126,91 @@ namespace MonsterPathPredictor.Runtime
                     }
                     case PopupPagination.StyleRowKind.LineWidth:
                         AddStepper(
-                            "线条宽度",
+                            "线条宽度", "线宽",
                             settings.LineWidth.ToString("0.0", CultureInfo.InvariantCulture) + " px",
+                            settings.LineWidth.ToString("0.0", CultureInfo.InvariantCulture),
                             item.Height,
                             () => StyleMutationRequested?.Invoke(s => s.LineWidth = (float)Math.Round(s.LineWidth - 0.5f, 1)),
                             () => StyleMutationRequested?.Invoke(s => s.LineWidth = (float)Math.Round(s.LineWidth + 0.5f, 1)));
                         break;
                     case PopupPagination.StyleRowKind.DashSpeed:
                         AddStepper(
-                            "行进速度",
+                            "行进速度", "速度",
                             settings.DashSpeed <= 0.01f ? "静态 (0)" : ((int)Math.Round(settings.DashSpeed) + " px/s"),
+                            settings.DashSpeed <= 0.01f ? "0" : ((int)Math.Round(settings.DashSpeed)).ToString(CultureInfo.InvariantCulture),
                             item.Height,
                             () => StyleMutationRequested?.Invoke(s => s.DashSpeed = Math.Max(0f, (float)Math.Round(s.DashSpeed - 6f))),
                             () => StyleMutationRequested?.Invoke(s => s.DashSpeed = Math.Min(150f, (float)Math.Round(s.DashSpeed + 6f))));
                         break;
                     case PopupPagination.StyleRowKind.DashLength:
                         AddStepper(
-                            "虚线长度",
+                            "虚线长度", "线长",
                             ((int)Math.Round(settings.DashLength)) + " px",
+                            ((int)Math.Round(settings.DashLength)).ToString(CultureInfo.InvariantCulture),
                             item.Height,
                             () => StyleMutationRequested?.Invoke(s => s.DashLength = (float)Math.Round(s.DashLength - 2f)),
                             () => StyleMutationRequested?.Invoke(s => s.DashLength = (float)Math.Round(s.DashLength + 2f)));
                         break;
                     case PopupPagination.StyleRowKind.GapLength:
                         AddStepper(
-                            "虚线间距",
+                            "虚线间距", "间距",
                             ((int)Math.Round(settings.GapLength)) + " px",
+                            ((int)Math.Round(settings.GapLength)).ToString(CultureInfo.InvariantCulture),
                             item.Height,
                             () => StyleMutationRequested?.Invoke(s => s.GapLength = (float)Math.Round(s.GapLength - 2f)),
                             () => StyleMutationRequested?.Invoke(s => s.GapLength = (float)Math.Round(s.GapLength + 2f)));
                         break;
                     case PopupPagination.StyleRowKind.FontSize:
                         AddStepper(
-                            "标签字号",
+                            "标签字号", "字号",
                             settings.FontSize + " pt",
+                            settings.FontSize.ToString(CultureInfo.InvariantCulture),
                             item.Height,
                             () => StyleMutationRequested?.Invoke(s => s.FontSize -= 2),
                             () => StyleMutationRequested?.Invoke(s => s.FontSize += 2));
                         break;
                     case PopupPagination.StyleRowKind.HeightOffset:
                         AddStepper(
-                            "悬浮高度",
+                            "悬浮高度", "高度",
                             settings.HeightOffset.ToString("0.00", CultureInfo.InvariantCulture),
+                            settings.HeightOffset.ToString("0.0", CultureInfo.InvariantCulture),
                             item.Height,
                             () => StyleMutationRequested?.Invoke(s => s.HeightOffset = (float)Math.Round(s.HeightOffset - 0.1f, 2)),
                             () => StyleMutationRequested?.Invoke(s => s.HeightOffset = (float)Math.Round(s.HeightOffset + 0.1f, 2)));
                         break;
                     case PopupPagination.StyleRowKind.Toggles:
                     {
-                        float tGap = 3f;
-                        float tW = (contentW - tGap * 3f) / 4f;
-                        string pcLabel = settings.PostCombatMode == PostCombatMode.StopAtFirstCombat
-                            ? "战后:截断"
-                            : (settings.PostCombatMode == PostCombatMode.RedBlueAfterCombat ? "战后:红蓝" : "战后:续行");
-
-                        var pcBtn = CreateStyledButton(pcLabel, tW, item.Height, BtnBg, AccentCyan, AccentCyan, () =>
+                        int tStart = item.Count > 0 ? item.StartIndex : 0;
+                        int tCount = item.Count > 0 ? item.Count : 4;
+                        float tGap = contentW < 100f ? 2f : 3f;
+                        float tW = (contentW - tGap * (tCount - 1)) / tCount;
+                        int tFont = (tW < 54f || item.Height < 14f) ? Math.Max(8, Math.Min(10, (int)Math.Max(8f, item.Height - 2f))) : 11;
+                        for (int c = 0; c < tCount; c++)
                         {
-                            StyleMutationRequested?.Invoke(s =>
+                            int tIdx = tStart + c;
+                            float tx = c * (tW + tGap);
+                            if (tIdx == 0)
                             {
-                                s.PostCombatMode = (PostCombatMode)(((int)s.PostCombatMode + 1) % 3);
-                            });
-                        }, fontSize: 11);
-                        pcBtn.SetXY(0f, y);
-                        _contentHost.AddChild(pcBtn);
-
-                        AddToggleChip("步数", settings.ShowStepNumbers, tW + tGap, y, tW, item.Height, () => StyleMutationRequested?.Invoke(s => s.ShowStepNumbers = !s.ShowStepNumbers));
-                        AddToggleChip("依据", settings.ShowReasonTag, (tW + tGap) * 2f, y, tW, item.Height, () => StyleMutationRequested?.Invoke(s => s.ShowReasonTag = !s.ShowReasonTag));
-                        AddToggleChip("100%", settings.ShowDeterministicPercent, (tW + tGap) * 3f, y, tW, item.Height, () => StyleMutationRequested?.Invoke(s => s.ShowDeterministicPercent = !s.ShowDeterministicPercent));
+                                string pcLabel = tW < 52f
+                                    ? (settings.PostCombatMode == PostCombatMode.StopAtFirstCombat ? "截断" : (settings.PostCombatMode == PostCombatMode.RedBlueAfterCombat ? "红蓝" : "续行"))
+                                    : (settings.PostCombatMode == PostCombatMode.StopAtFirstCombat ? "战后:截断" : (settings.PostCombatMode == PostCombatMode.RedBlueAfterCombat ? "战后:红蓝" : "战后:续行"));
+                                var pcBtn = CreateStyledButton(pcLabel, tW, item.Height, BtnBg, AccentCyan, AccentCyan, () =>
+                                {
+                                    StyleMutationRequested?.Invoke(s =>
+                                    {
+                                        s.PostCombatMode = (PostCombatMode)(((int)s.PostCombatMode + 1) % 3);
+                                    });
+                                }, fontSize: tFont);
+                                pcBtn.SetXY(tx, y);
+                                _contentHost.AddChild(pcBtn);
+                            }
+                            else if (tIdx == 1)
+                                AddToggleChip("步数", settings.ShowStepNumbers, tx, y, tW, item.Height, tFont, () => StyleMutationRequested?.Invoke(s => s.ShowStepNumbers = !s.ShowStepNumbers));
+                            else if (tIdx == 2)
+                                AddToggleChip("依据", settings.ShowReasonTag, tx, y, tW, item.Height, tFont, () => StyleMutationRequested?.Invoke(s => s.ShowReasonTag = !s.ShowReasonTag));
+                            else if (tIdx == 3)
+                                AddToggleChip(tW < 46f ? "满%" : "100%", settings.ShowDeterministicPercent, tx, y, tW, item.Height, tFont, () => StyleMutationRequested?.Invoke(s => s.ShowDeterministicPercent = !s.ShowDeterministicPercent));
+                        }
                         break;
                     }
                     case PopupPagination.StyleRowKind.ColorHeader:
@@ -228,19 +255,19 @@ namespace MonsterPathPredictor.Runtime
                         break;
                     }
                     case PopupPagination.StyleRowKind.ColorRolesRow1:
-                        AddColorRoleRow(0, item.Height);
+                        AddColorRoleRow(item.Count > 0 ? item.StartIndex : 0, item.Count > 0 ? item.Count : 3, item.Height);
                         break;
                     case PopupPagination.StyleRowKind.ColorRolesRow2:
-                        AddColorRoleRow(3, item.Height);
+                        AddColorRoleRow(item.Count > 0 ? item.StartIndex : 3, item.Count > 0 ? item.Count : 3, item.Height);
                         break;
                     case PopupPagination.StyleRowKind.Presets:
-                        AddPresetSwatchRow(0, StyleColor.Presets.Length, y, contentW, item.Height, activeRole, activeRgba);
+                        AddPresetSwatchRow(item.Count > 0 ? item.StartIndex : 0, item.Count > 0 ? item.Count : StyleColor.Presets.Length, y, contentW, item.Height, activeRole, activeRgba);
                         break;
                     case PopupPagination.StyleRowKind.PresetsRow1:
-                        AddPresetSwatchRow(0, Math.Min(4, StyleColor.Presets.Length), y, contentW, item.Height, activeRole, activeRgba);
+                        AddPresetSwatchRow(item.Count > 0 ? item.StartIndex : 0, item.Count > 0 ? item.Count : Math.Min(4, StyleColor.Presets.Length), y, contentW, item.Height, activeRole, activeRgba);
                         break;
                     case PopupPagination.StyleRowKind.PresetsRow2:
-                        AddPresetSwatchRow(4, Math.Max(0, StyleColor.Presets.Length - 4), y, contentW, item.Height, activeRole, activeRgba);
+                        AddPresetSwatchRow(item.Count > 0 ? item.StartIndex : 4, item.Count > 0 ? item.Count : Math.Max(0, StyleColor.Presets.Length - 4), y, contentW, item.Height, activeRole, activeRgba);
                         break;
                     case PopupPagination.StyleRowKind.RgbaPairRG:
                     {
@@ -322,17 +349,18 @@ namespace MonsterPathPredictor.Runtime
             }
         }
 
-        private void AddToggleChip(string label, bool isOn, float x, float y, float w, float h, Action onClick)
+        private void AddToggleChip(string label, bool isOn, float x, float y, float w, float h, int fontSize, Action onClick)
         {
+            string suffix = w < 44f ? (isOn ? "✓" : "×") : (isOn ? ":开" : ":关");
             var btn = CreateStyledButton(
-                label + (isOn ? ":开" : ":关"),
+                label + suffix,
                 w,
                 h,
                 isOn ? BtnActiveBg : BtnBg,
                 isOn ? AccentGreen : new Color(0.32f, 0.38f, 0.48f, 0.75f),
                 isOn ? AccentGreen : TextMuted,
                 onClick,
-                fontSize: 11);
+                fontSize: fontSize);
             btn.SetXY(x, y);
             _contentHost.AddChild(btn);
         }
@@ -365,7 +393,8 @@ namespace MonsterPathPredictor.Runtime
                 out float minusX, out float btnW,
                 out float valX, out float valW,
                 out float plusX);
-            float btnH = Math.Max(8f, Math.Min(h - 2f, h - 4f));
+            PopupPagination.ClampChildVertical(h, 1f, Math.Max(1f, h - 2f), out float btnY, out float btnH);
+            int smallFont = (w < 100f || h < 14f) ? Math.Max(8, Math.Min(10, (int)Math.Max(8f, h - 2f))) : 11;
 
             var tagTf = new GTextField
             {
@@ -373,7 +402,7 @@ namespace MonsterPathPredictor.Runtime
                 autoSize = AutoSizeType.None,
                 singleLine = true,
                 verticalAlign = VertAlignType.Middle,
-                textFormat = new TextFormat { size = w < 100f ? 10 : 11, bold = true, color = tagColor },
+                textFormat = new TextFormat { size = smallFont, bold = true, color = tagColor },
                 text = tag
             };
             tagTf.SetXY(tagX, 0f);
@@ -388,8 +417,8 @@ namespace MonsterPathPredictor.Runtime
                     var next = StyleColor.AdjustChannel(cur, channelIndex, -step, minAlpha);
                     StyleColor.SetRoleHex(s, role, next.ToHex());
                 });
-            }, fontSize: w < 100f ? 10 : 12);
-            minus.SetXY(minusX, (h - minus.height) * 0.5f);
+            }, fontSize: smallFont);
+            minus.SetXY(minusX, btnY);
             host.AddChild(minus);
 
             var plus = CreateMiniButton("+", btnW, btnH, () =>
@@ -400,11 +429,11 @@ namespace MonsterPathPredictor.Runtime
                     var next = StyleColor.AdjustChannel(cur, channelIndex, step, minAlpha);
                     StyleColor.SetRoleHex(s, role, next.ToHex());
                 });
-            }, fontSize: w < 100f ? 10 : 12);
-            plus.SetXY(plusX, (h - plus.height) * 0.5f);
+            }, fontSize: smallFont);
+            plus.SetXY(plusX, btnY);
             host.AddChild(plus);
 
-            if (valW >= 8f)
+            if (valW >= 6f)
             {
                 var valTf = new GTextField
                 {
@@ -413,7 +442,7 @@ namespace MonsterPathPredictor.Runtime
                     singleLine = true,
                     align = AlignType.Center,
                     verticalAlign = VertAlignType.Middle,
-                    textFormat = new TextFormat { size = w < 100f ? 10 : 11, color = TextPrimary },
+                    textFormat = new TextFormat { size = smallFont, color = TextPrimary },
                     text = valText
                 };
                 valTf.SetXY(valX, 0f);
@@ -424,7 +453,15 @@ namespace MonsterPathPredictor.Runtime
             _contentHost.AddChild(host);
         }
 
-        private static GComponent BuildStyleStepperRow(string label, string valueText, float w, float h, Action onMinus, Action onPlus)
+        private static GComponent BuildStyleStepperRow(
+            string label,
+            string shortLabel,
+            string valueText,
+            string shortValueText,
+            float w,
+            float h,
+            Action onMinus,
+            Action onPlus)
         {
             var row = new GComponent { touchable = true };
             row.SetSize(w, h);
@@ -434,33 +471,36 @@ namespace MonsterPathPredictor.Runtime
             bg.DrawRect(w, h, 1, new Color(0.24f, 0.30f, 0.40f, 0.65f), RowNormalBg);
             row.AddChild(bg);
 
-            float pad = w < 160f ? 2f : 4f;
-            float btnW = w < 160f ? 18f : (w < 220f ? 22f : 26f);
-            float btnH = Math.Max(15f, h - 4f);
-            float btnY = (h - btnH) * 0.5f;
-            float valW = w < 160f ? Math.Max(26f, w * 0.28f) : (w < 220f ? 52f : 68f);
-            float plusX = Math.Max(pad, w - btnW - pad);
-            float valX = Math.Max(pad, plusX - valW - pad);
-            float minusX = Math.Max(pad, valX - btnW - pad);
-            float lblX = pad + 1f;
-            float lblW = Math.Max(0f, minusX - lblX - pad);
+            var geo = PopupPagination.ComputeStepperGeometry(w, h);
+            int lblFont = geo.Stacked
+                ? Math.Max(8, Math.Min(10, (int)Math.Max(8f, geo.LabelH - 1f)))
+                : (w < 190f ? 10 : 12);
+            int valFont = (geo.ValW < 34f || geo.ValH < 14f)
+                ? Math.Max(8, Math.Min(10, (int)Math.Max(8f, geo.ValH - 1f)))
+                : 12;
+            int btnFont = (geo.BtnW < 16f || geo.BtnH < 14f)
+                ? Math.Max(8, Math.Min(11, (int)Math.Max(8f, geo.BtnH - 1f)))
+                : 13;
 
-            var lbl = new GTextField
+            if (geo.ShowLabel && geo.LabelW >= 8f && geo.LabelH >= 6f)
             {
-                touchable = false,
-                autoSize = AutoSizeType.None,
-                singleLine = true,
-                verticalAlign = VertAlignType.Middle,
-                textFormat = new TextFormat { size = w < 160f ? 10 : 12, color = TextPrimary },
-                text = label
-            };
-            lbl.SetXY(lblX, 0f);
-            lbl.SetSize(lblW, h);
-            lbl.visible = lblW >= 14f;
-            row.AddChild(lbl);
+                var lbl = new GTextField
+                {
+                    touchable = false,
+                    autoSize = AutoSizeType.None,
+                    singleLine = true,
+                    align = geo.Stacked ? AlignType.Center : AlignType.Left,
+                    verticalAlign = VertAlignType.Middle,
+                    textFormat = new TextFormat { size = lblFont, color = TextPrimary },
+                    text = geo.LabelW < 56f ? shortLabel : label
+                };
+                lbl.SetXY(geo.LabelX, geo.LabelY);
+                lbl.SetSize(geo.LabelW, geo.LabelH);
+                row.AddChild(lbl);
+            }
 
-            var minus = CreateMiniButton("-", btnW, btnH, onMinus, fontSize: 13);
-            minus.SetXY(minusX, btnY);
+            var minus = CreateMiniButton("-", geo.BtnW, geo.BtnH, onMinus, fontSize: btnFont);
+            minus.SetXY(geo.MinusX, geo.MinusY);
             row.AddChild(minus);
 
             var val = new GTextField
@@ -470,15 +510,15 @@ namespace MonsterPathPredictor.Runtime
                 singleLine = true,
                 align = AlignType.Center,
                 verticalAlign = VertAlignType.Middle,
-                textFormat = new TextFormat { size = 12, bold = true, color = AccentGold },
-                text = valueText
+                textFormat = new TextFormat { size = valFont, bold = true, color = AccentGold },
+                text = geo.ValW < 34f ? shortValueText : valueText
             };
-            val.SetXY(valX, 0f);
-            val.SetSize(valW, h);
+            val.SetXY(geo.ValX, geo.ValY);
+            val.SetSize(geo.ValW, geo.ValH);
             row.AddChild(val);
 
-            var plus = CreateMiniButton("+", btnW, btnH, onPlus, fontSize: 13);
-            plus.SetXY(plusX, btnY);
+            var plus = CreateMiniButton("+", geo.BtnW, geo.BtnH, onPlus, fontSize: btnFont);
+            plus.SetXY(geo.PlusX, geo.MinusY);
             row.AddChild(plus);
 
             return row;

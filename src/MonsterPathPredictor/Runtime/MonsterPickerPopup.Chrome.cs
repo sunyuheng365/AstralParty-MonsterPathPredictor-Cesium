@@ -30,7 +30,8 @@ namespace MonsterPathPredictor.Runtime
             _root.onTouchBegin.Add(OnPopupTouchBegin);
             if (Stage.inst != null)
             {
-                Stage.inst.onTouchEnd.Add(OnStageTouchEnd);
+                _hookedStage = Stage.inst;
+                _hookedStage.onTouchEnd.Add(OnStageTouchEnd);
             }
             GRoot.inst.AddChild(_root);
 
@@ -297,22 +298,23 @@ namespace MonsterPathPredictor.Runtime
         {
             _headerBg.SetSize(panelW, layout.HeaderH);
             _headerBg.DrawRect(panelW, layout.HeaderH, 0, Color.clear, HeaderBg);
-            float closeW = panelW < 100f ? 18f : (panelW < 200f ? 22f : 28f);
-            float closeH = Math.Min(24f, Math.Max(12f, layout.HeaderH - 4f));
+            float closeW = panelW < 100f ? 14f : (panelW < 200f ? 22f : 28f);
+            PopupPagination.ClampChildVertical(layout.HeaderH, 2f, Math.Min(24f, Math.Max(1f, layout.HeaderH - 4f)), out float closeY, out float closeH);
             float closeX = Math.Max(padX, panelW - padX - closeW);
             ResizeMiniButton(_closeBtn, closeW, closeH);
-            _closeBtn.SetXY(closeX, Math.Max(1f, (layout.HeaderH - closeH) * 0.5f));
+            _closeBtn.SetXY(closeX, closeY);
             float titleW = Math.Max(0f, closeX - padX - 4f);
-            _titleText.SetXY(padX, Math.Max(1f, (layout.HeaderH - 20f) * 0.5f));
-            _titleText.SetSize(titleW, Math.Min(20f, layout.HeaderH - 2f));
-            _titleText.visible = titleW >= 12f;
+            PopupPagination.ClampChildVertical(layout.HeaderH, (layout.HeaderH - 20f) * 0.5f, Math.Min(20f, layout.HeaderH), out float titleY, out float titleH);
+            _titleText.SetXY(padX, titleY);
+            _titleText.SetSize(titleW, titleH);
+            _titleText.visible = titleW >= 12f && titleH >= 6f;
 
-            // 3-tab bar directly under header — guaranteed strictly inside [padX, panelW - padX].
+            // 3-tab bar directly under header — guaranteed strictly inside [padX, panelW - padX] and [0, layout.TabH].
             _tabHost.SetXY(0f, layout.HeaderH);
             _tabHost.SetSize(panelW, layout.TabH);
             PopupPagination.ComputeThreeTabGeometry(panelW, padX, out float tabW, out float tabGap);
-            float tabBtnH = Math.Min(24f, Math.Max(13f, layout.TabH - 4f));
-            float tabBtnY = Math.Max(1f, (layout.TabH - tabBtnH) * 0.5f);
+            float desiredTabH = Math.Min(24f, PopupPagination.ComputeTabStripButtonHeight(layout.TabH));
+            PopupPagination.ClampChildVertical(layout.TabH, (layout.TabH - desiredTabH) * 0.5f, desiredTabH, out float tabBtnY, out float tabBtnH);
 
             string monstersLabel = tabW < 42f ? "怪" : (panelW < 210f ? "怪物" : "怪物列表");
             string virtualLabel = tabW < 42f
@@ -334,24 +336,23 @@ namespace MonsterPathPredictor.Runtime
             {
                 _pagerHost.SetSize(panelW, layout.PagerH);
                 float usablePager = Math.Max(24f, panelW - padX * 2f);
-                float pBtnW = Math.Min(panelW < 200f ? 24f : 28f, Math.Max(12f, usablePager * 0.28f));
-                float pBtnH = Math.Min(22f, Math.Max(13f, layout.PagerH - 4f));
-                float pBtnY = Math.Max(1f, (layout.PagerH - pBtnH) * 0.5f);
+                float pBtnW = Math.Min(panelW < 200f ? 24f : 28f, Math.Max(8f, usablePager * 0.28f));
+                PopupPagination.ClampChildVertical(layout.PagerH, 1f, Math.Min(22f, Math.Max(1f, layout.PagerH - 2f)), out float pBtnY, out float pBtnH);
                 ResizeMiniButton(_prevBtn, pBtnW, pBtnH);
                 _prevBtn.SetXY(padX, pBtnY);
                 float nextX = Math.Max(padX + pBtnW + 2f, panelW - padX - pBtnW);
                 ResizeMiniButton(_nextBtn, pBtnW, pBtnH);
                 _nextBtn.SetXY(nextX, pBtnY);
                 float labelX = padX + pBtnW + 2f;
-                _pageLabel.SetXY(labelX, Math.Max(1f, (layout.PagerH - 18f) * 0.5f));
-                _pageLabel.SetSize(Math.Max(12f, nextX - labelX - 2f), Math.Min(18f, layout.PagerH - 2f));
+                PopupPagination.ClampChildVertical(layout.PagerH, (layout.PagerH - 18f) * 0.5f, Math.Min(18f, layout.PagerH), out float pLblY, out float pLblH);
+                _pageLabel.SetXY(labelX, pLblY);
+                _pageLabel.SetSize(Math.Max(0f, nextX - labelX - 2f), pLblH);
             }
 
             _footerHost.SetSize(panelW, layout.FooterH);
             _footerBg.SetSize(panelW, layout.FooterH);
             _footerBg.DrawRect(panelW, layout.FooterH, 0, Color.clear, HeaderBg);
-            float fBtnH = Math.Min(24f, Math.Max(14f, layout.FooterH - 4f));
-            float fBtnY = Math.Max(1f, (layout.FooterH - fBtnH) * 0.5f);
+            PopupPagination.ClampChildVertical(layout.FooterH, 1f, Math.Min(24f, Math.Max(1f, layout.FooterH - 2f)), out float fBtnY, out float fBtnH);
             PopupPagination.ComputeFooterGeometry(
                 panelW, padX,
                 out float minusX, out float stepBtnW,
@@ -361,8 +362,9 @@ namespace MonsterPathPredictor.Runtime
 
             ResizeMiniButton(_minusBtn, stepBtnW, fBtnH);
             _minusBtn.SetXY(minusX, fBtnY);
-            _stepsLabel.SetXY(stepsX, Math.Max(1f, (layout.FooterH - 20f) * 0.5f));
-            _stepsLabel.SetSize(stepsW, Math.Min(22f, layout.FooterH - 2f));
+            PopupPagination.ClampChildVertical(layout.FooterH, (layout.FooterH - 20f) * 0.5f, Math.Min(22f, layout.FooterH), out float sLblY, out float sLblH);
+            _stepsLabel.SetXY(stepsX, sLblY);
+            _stepsLabel.SetSize(stepsW, sLblH);
             ResizeMiniButton(_plusBtn, stepBtnW, fBtnH);
             _plusBtn.SetXY(plusX, fBtnY);
             ResizeMiniButton(_clearBtn, clearW, fBtnH);
@@ -388,7 +390,7 @@ namespace MonsterPathPredictor.Runtime
         private string BuildSignature(
             IReadOnlyList<LiveMonsterInfo> visibleMonsters,
             IReadOnlyList<TrackedPlayer> players,
-            BoardGraph board,
+            IReadOnlyList<int> virtualNeighbors,
             VirtualPlayerSandbox sandbox,
             long localPlayerId,
             long selectedId,
@@ -451,20 +453,10 @@ namespace MonsterPathPredictor.Runtime
                       .Append(p.IsAlive ? '1' : '0').Append(':')
                       .Append(p.LandId).Append('>').Append(eff).Append(';');
                 }
-                if (sandbox != null && board != null && sandbox.SelectedPlayerId != 0)
+                if (virtualNeighbors != null && virtualNeighbors.Count > 0)
                 {
-                    int curTile = -1;
-                    for (int i = 0; i < players.Count; i++)
-                    {
-                        if (players[i] != null && players[i].PlayerId == sandbox.SelectedPlayerId)
-                        {
-                            curTile = sandbox.GetEffectiveLandId(players[i]);
-                            break;
-                        }
-                    }
-                    var nbs = VirtualPlayerSandbox.GetReachableNeighbors(board, curTile);
                     sb.Append("NB:");
-                    for (int i = 0; i < nbs.Count; i++) sb.Append(nbs[i]).Append(',');
+                    for (int i = 0; i < virtualNeighbors.Count; i++) sb.Append(virtualNeighbors[i]).Append(',');
                 }
             }
             else if (_activeTab == PickerPopupTab.RouteStyle)
@@ -496,17 +488,21 @@ namespace MonsterPathPredictor.Runtime
             _lastSignature = string.Empty;
             _positioned = false;
             _temporarilyHidden = false;
-            _activeTouchId = int.MinValue;
-            _activePressFromMouse = false;
+            _activePopupTouchIds.Clear();
+            _mouseOriginatedTouchIds.Clear();
             _hasRenderedContent = false;
+            _lastRefreshDataRev = -1;
+            _lastRefreshLocalRev = -1;
             _monsterPageIndex = 0;
             _virtualPageIndex = 0;
             _stylePageIndex = 0;
             try
             {
-                if (Stage.inst != null) Stage.inst.onTouchEnd.Remove(OnStageTouchEnd);
+                if (_hookedStage != null) _hookedStage.onTouchEnd.Remove(OnStageTouchEnd);
+                if (Stage.inst != null && Stage.inst != _hookedStage) Stage.inst.onTouchEnd.Remove(OnStageTouchEnd);
             }
             catch { }
+            _hookedStage = null;
             if (_root != null)
             {
                 try { _root.onTouchBegin.Remove(OnPopupTouchBegin); } catch { }

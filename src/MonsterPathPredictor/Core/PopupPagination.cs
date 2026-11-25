@@ -178,6 +178,154 @@ namespace MonsterPathPredictor.Core
             rightW = Math.Max(0f, avail - leftW);
         }
 
+        public static void ClampChildVertical(float parentH, float desiredY, float desiredH, out float y, out float h)
+        {
+            float safeParent = Math.Max(1f, parentH);
+            h = Math.Max(1f, Math.Min(safeParent, desiredH));
+            y = Math.Max(0f, Math.Min(safeParent - h, desiredY));
+        }
+
+        public static float ComputeTabStripButtonHeight(float tabStripH)
+        {
+            float safeH = Math.Max(1f, tabStripH);
+            return safeH <= 4f ? safeH : Math.Max(1f, safeH - 1f);
+        }
+
+        public readonly struct StepperLayout
+        {
+            public bool Stacked { get; }
+            public bool ShowLabel { get; }
+            public float LabelX { get; }
+            public float LabelY { get; }
+            public float LabelW { get; }
+            public float LabelH { get; }
+            public float MinusX { get; }
+            public float MinusY { get; }
+            public float BtnW { get; }
+            public float BtnH { get; }
+            public float ValX { get; }
+            public float ValY { get; }
+            public float ValW { get; }
+            public float ValH { get; }
+            public float PlusX { get; }
+
+            public StepperLayout(
+                bool stacked, bool showLabel,
+                float labelX, float labelY, float labelW, float labelH,
+                float minusX, float minusY, float btnW, float btnH,
+                float valX, float valY, float valW, float valH,
+                float plusX)
+            {
+                Stacked = stacked; ShowLabel = showLabel;
+                LabelX = labelX; LabelY = labelY; LabelW = labelW; LabelH = labelH;
+                MinusX = minusX; MinusY = minusY; BtnW = btnW; BtnH = btnH;
+                ValX = valX; ValY = valY; ValW = valW; ValH = valH;
+                PlusX = plusX;
+            }
+        }
+
+        /// <summary>
+        /// Computes strictly in-bounds, non-overlapping numeric stepper child rects across all widths
+        /// (including 40px narrow panels) and extreme compact heights.
+        /// </summary>
+        public static StepperLayout ComputeStepperGeometry(float rowW, float rowH)
+        {
+            float safeW = Math.Max(12f, rowW);
+            float safeH = Math.Max(1f, rowH);
+            float pad = safeW < 80f ? 1f : 4f;
+            float gap = safeW < 80f ? 1f : 2f;
+            float usable = Math.Max(6f, safeW - pad * 2f);
+
+            if (safeW >= 150f)
+            {
+                float btnW = Math.Min(24f, Math.Max(16f, safeW * 0.09f));
+                float valW = Math.Min(48f, Math.Max(30f, safeW * 0.16f));
+                float rightBlock = btnW * 2f + valW + gap * 2f;
+                float labelW = Math.Max(20f, usable - rightBlock - gap);
+                float minusX = pad + labelW + gap;
+                float valX = minusX + btnW + gap;
+                float plusX = valX + valW + gap;
+                ClampChildVertical(safeH, 1f, Math.Max(1f, safeH - 2f), out float cy, out float ch);
+                return new StepperLayout(false, true, pad, cy, labelW, ch, minusX, cy, btnW, ch, valX, cy, valW, ch, plusX);
+            }
+
+            // Narrow width (< 150px): stack label above [- val +] when height allows; otherwise compact single-band.
+            bool stacked = safeH >= 18f;
+            float topH = stacked ? Math.Max(7f, (float)Math.Floor(safeH * 0.42f)) : 0f;
+            float botY = stacked ? topH : 0f;
+            float botH = Math.Max(1f, safeH - botY);
+            ClampChildVertical(botH, 0.5f, Math.Max(1f, botH - 1f), out float relBy, out float btnH);
+            float cyBot = botY + relBy;
+
+            float nBtnW = Math.Max(4f, Math.Min(14f, (usable - gap * 2f) * 0.28f));
+            float nValW = Math.Max(4f, usable - nBtnW * 2f - gap * 2f);
+            float nMinusX = pad;
+            float nValX = nMinusX + nBtnW + gap;
+            float nPlusX = nValX + nValW + gap;
+
+            return new StepperLayout(
+                stacked: stacked,
+                showLabel: stacked,
+                labelX: pad, labelY: 0f, labelW: usable, labelH: topH,
+                minusX: nMinusX, minusY: cyBot, btnW: nBtnW, btnH: btnH,
+                valX: nValX, valY: cyBot, valW: nValW, valH: btnH,
+                plusX: nPlusX);
+        }
+
+        public static void ComputeVirtualBannerGeometry(
+            float rowW,
+            float rowH,
+            out float textX,
+            out float textY,
+            out float textW,
+            out float textH,
+            out float btnX,
+            out float btnY,
+            out float btnW,
+            out float btnH,
+            out bool stacked)
+        {
+            float safeW = Math.Max(12f, rowW);
+            float safeH = Math.Max(1f, rowH);
+            float pad = safeW < 80f ? 1f : 6f;
+            float gap = safeW < 80f ? 1f : 4f;
+            float usable = Math.Max(6f, safeW - pad * 2f);
+
+            if (safeW >= 120f)
+            {
+                stacked = false;
+                btnW = Math.Min(56f, Math.Max(28f, usable * 0.26f));
+                textW = Math.Max(8f, usable - btnW - gap);
+                textX = pad;
+                btnX = pad + textW + gap;
+                ClampChildVertical(safeH, 1f, Math.Max(1f, safeH - 2f), out textY, out textH);
+                ClampChildVertical(safeH, 2f, Math.Max(1f, safeH - 4f), out btnY, out btnH);
+                return;
+            }
+
+            if (safeH >= 20f)
+            {
+                stacked = true;
+                textX = pad;
+                textY = 0f;
+                textW = usable;
+                textH = Math.Max(8f, (float)Math.Floor(safeH * 0.48f));
+                btnX = pad;
+                btnY = textH;
+                btnW = usable;
+                btnH = Math.Max(1f, safeH - textH);
+                return;
+            }
+
+            stacked = false;
+            textW = Math.Max(4f, (usable - gap) * 0.56f);
+            btnW = Math.Max(4f, usable - gap - textW);
+            textX = pad;
+            btnX = pad + textW + gap;
+            ClampChildVertical(safeH, 0f, safeH, out textY, out textH);
+            ClampChildVertical(safeH, 0f, safeH, out btnY, out btnH);
+        }
+
         public enum StyleRowKind
         {
             SaveWarning,
@@ -207,40 +355,68 @@ namespace MonsterPathPredictor.Core
         {
             public StyleRowKind Kind { get; }
             public float Height { get; }
-            public StyleRowItem(StyleRowKind kind, float height) { Kind = kind; Height = height; }
+            public int StartIndex { get; }
+            public int Count { get; }
+            public StyleRowItem(StyleRowKind kind, float height, int startIndex = 0, int count = 0)
+            {
+                Kind = kind;
+                Height = height;
+                StartIndex = startIndex;
+                Count = count;
+            }
         }
 
         public static List<StyleRowItem> BuildStyleRows(float maxContentH, float contentW, bool hasSaveWarn, out float rowGap)
         {
-            float capH = Math.Max(8f, maxContentH);
+            float capH = Math.Max(1f, maxContentH);
             float rowH = Math.Min(capH, maxContentH < 220f ? 21f : (maxContentH < 360f ? 23f : 25f));
+            float stepperH = (contentW < 150f && capH >= 24f) ? Math.Min(capH, 30f) : rowH;
             float chipH = Math.Min(capH, Math.Min(rowH, 23f));
             float swatchH = Math.Min(capH, Math.Min(rowH, 22f));
             float headerH = Math.Min(capH, 20f);
             float warnH = Math.Min(capH, 18f);
             rowGap = capH < 24f ? 1f : 3f;
 
-            var items = new List<StyleRowItem>(18);
+            var items = new List<StyleRowItem>(24);
             if (hasSaveWarn) items.Add(new StyleRowItem(StyleRowKind.SaveWarning, warnH));
-            items.Add(new StyleRowItem(StyleRowKind.LineWidth, rowH));
-            items.Add(new StyleRowItem(StyleRowKind.DashSpeed, rowH));
-            items.Add(new StyleRowItem(StyleRowKind.DashLength, rowH));
-            items.Add(new StyleRowItem(StyleRowKind.GapLength, rowH));
-            items.Add(new StyleRowItem(StyleRowKind.FontSize, rowH));
-            items.Add(new StyleRowItem(StyleRowKind.HeightOffset, rowH));
-            items.Add(new StyleRowItem(StyleRowKind.Toggles, rowH));
+            items.Add(new StyleRowItem(StyleRowKind.LineWidth, stepperH));
+            items.Add(new StyleRowItem(StyleRowKind.DashSpeed, stepperH));
+            items.Add(new StyleRowItem(StyleRowKind.DashLength, stepperH));
+            items.Add(new StyleRowItem(StyleRowKind.GapLength, stepperH));
+            items.Add(new StyleRowItem(StyleRowKind.FontSize, stepperH));
+            items.Add(new StyleRowItem(StyleRowKind.HeightOffset, stepperH));
+
+            int toggleCols = contentW < 96f ? 1 : (contentW < 190f ? 2 : 4);
+            for (int start = 0; start < 4; start += toggleCols)
+            {
+                items.Add(new StyleRowItem(StyleRowKind.Toggles, rowH, start, Math.Min(toggleCols, 4 - start)));
+            }
+
             items.Add(new StyleRowItem(StyleRowKind.ColorHeader, headerH));
-            items.Add(new StyleRowItem(StyleRowKind.ColorRolesRow1, chipH));
-            items.Add(new StyleRowItem(StyleRowKind.ColorRolesRow2, chipH));
+
+            int roleCols = contentW < 96f ? 1 : (contentW < 160f ? 2 : 3);
+            for (int start = 0; start < 6; start += roleCols)
+            {
+                var rk = start < 3 ? StyleRowKind.ColorRolesRow1 : StyleRowKind.ColorRolesRow2;
+                items.Add(new StyleRowItem(rk, chipH, start, Math.Min(roleCols, 6 - start)));
+            }
 
             if (contentW >= 160f)
             {
-                items.Add(new StyleRowItem(StyleRowKind.Presets, swatchH));
+                items.Add(new StyleRowItem(StyleRowKind.Presets, swatchH, 0, 8));
+            }
+            else if (contentW >= 80f)
+            {
+                items.Add(new StyleRowItem(StyleRowKind.PresetsRow1, swatchH, 0, 4));
+                items.Add(new StyleRowItem(StyleRowKind.PresetsRow2, swatchH, 4, 4));
             }
             else
             {
-                items.Add(new StyleRowItem(StyleRowKind.PresetsRow1, swatchH));
-                items.Add(new StyleRowItem(StyleRowKind.PresetsRow2, swatchH));
+                for (int start = 0; start < 8; start += 2)
+                {
+                    var pk = start < 4 ? StyleRowKind.PresetsRow1 : StyleRowKind.PresetsRow2;
+                    items.Add(new StyleRowItem(pk, swatchH, start, 2));
+                }
             }
 
             if (contentW >= 210f)
@@ -294,14 +470,14 @@ namespace MonsterPathPredictor.Core
             out float rowGap,
             out int neighborCols)
         {
-            float capH = Math.Max(8f, maxContentH);
+            float capH = Math.Max(1f, maxContentH);
             float pRowH = Math.Min(capH, maxContentH < 160f ? 22f : 28f);
             float btnH = Math.Min(capH, maxContentH < 180f ? 21f : (maxContentH < 240f ? 23f : 26f));
             float hdrH = Math.Min(capH, 18f);
             rowGap = capH < 24f ? 1f : 3f;
             neighborCols = neighborCount <= 0 ? 1 : (contentW < 110f ? 1 : (contentW < 180f ? 2 : Math.Min(3, neighborCount)));
 
-            var items = new List<VirtualRowItem>(12);
+            var items = new List<VirtualRowItem>(14);
             if (maxContentH >= 170f)
             {
                 items.Add(new VirtualRowItem(VirtualRowKind.Hint, hdrH));
@@ -320,7 +496,11 @@ namespace MonsterPathPredictor.Core
                     items.Add(new VirtualRowItem(VirtualRowKind.NeighborRow, btnH, start, cnt));
                 }
             }
-            items.Add(new VirtualRowItem(VirtualRowKind.ActionsRow, btnH));
+            int actionCols = contentW < 110f ? 1 : 3;
+            for (int start = 0; start < 3; start += actionCols)
+            {
+                items.Add(new VirtualRowItem(VirtualRowKind.ActionsRow, btnH, start, Math.Min(actionCols, 3 - start)));
+            }
             return items;
         }
 

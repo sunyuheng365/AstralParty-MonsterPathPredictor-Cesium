@@ -157,16 +157,19 @@ namespace MonsterPathPredictor.Core
         {
             if (m == null) return string.Empty;
             options = options ?? new PlanOptions();
+            double normMinProb = options.MinBranchProbability > 0.0 ? options.MinBranchProbability : 0.0;
+            string mName = m.Name ?? string.Empty;
+            string mDisplay = m.DisplayName ?? string.Empty;
             var sb = new System.Text.StringBuilder(220);
             sb.Append(layoutGen).Append('|')
               .Append(options.MaxSteps).Append(':')
               .Append(options.SimulateCombatOnFork ? '1' : '0')
               .Append((int)options.PostCombatMode).Append(':')
-              .Append(BitConverter.DoubleToInt64Bits(options.MinBranchProbability)).Append('|')
+              .Append(BitConverter.DoubleToInt64Bits(normMinProb)).Append('|')
               .Append(m.MonsterId).Append(':')
               .Append(m.HeroId).Append(':')
-              .Append(m.Name).Append(':')
-              .Append(m.DisplayName).Append(':')
+              .Append(mName.Length).Append(':').Append(mName).Append(':')
+              .Append(mDisplay.Length).Append(':').Append(mDisplay).Append(':')
               .Append(m.IsNormalAggressive ? '1' : '0')
               .Append(m.IsThief ? '1' : '0')
               .Append(m.ChasesProblemStudent ? '1' : '0')
@@ -260,6 +263,7 @@ namespace MonsterPathPredictor.Core
             var stepPositiveEdges = new HashSet<EdgeKey>();
             var stepPositiveTiles = new HashSet<int>();
             bool hasEarlyTerminationOrPruning = false;
+            bool hasPrunedBranch = false;
 
             bool initialCombatState = monster.HasLaunchedFightThisTurn || monster.JustFoughtOnCurrentFork;
             long turnBossTargetId = ResolveTurnBossTargetId(board, monster, activePlayers, shortestPathCache, out bool freshMarkedAtTurnStart);
@@ -276,6 +280,10 @@ namespace MonsterPathPredictor.Core
                 var nextLayer = new Dictionary<WalkStateKey, (double Prob, double LogProb)>();
                 stepPositiveEdges.Clear();
                 stepPositiveTiles.Clear();
+                int stepActiveStateCount = 0;
+                int stepForkHitCount = 0;
+                PredictedFork soleStepFork = null;
+                bool multipleStepForks = false;
 
                 foreach (var entry in currentLayer)
                 {
@@ -283,10 +291,12 @@ namespace MonsterPathPredictor.Core
                     double arrivalProb = entry.Value.Prob;
                     double arrivalLogProb = entry.Value.LogProb;
                     if (double.IsNegativeInfinity(arrivalLogProb)) continue;
+                    stepActiveStateCount++;
                     if (step > 0 && minProb > 0.0 && arrivalProb < minProb)
                     {
                         plan.PrunedProbability += arrivalProb;
                         hasEarlyTerminationOrPruning = true;
+                        hasPrunedBranch = true;
                         continue;
                     }
 
@@ -369,7 +379,10 @@ namespace MonsterPathPredictor.Core
 
                     if (outcome.IsForkDecision)
                     {
-                        RecordFork(board, forkMap, state.LandId, state.FromLandId, step, arrivalProb, arrivalLogProb, postCombatNow, clearedMarkLandId, bossTargetClearedNow, outcome);
+                        var recordedFork = RecordFork(board, forkMap, state.LandId, state.FromLandId, step, arrivalProb, arrivalLogProb, postCombatNow, clearedMarkLandId, bossTargetClearedNow, outcome);
+                        stepForkHitCount++;
+                        if (soleStepFork == null) soleStepFork = recordedFork;
+                        else if (!ReferenceEquals(soleStepFork, recordedFork)) multipleStepForks = true;
                         if (step == 0 && string.IsNullOrEmpty(plan.HeadlineNote))
                         {
                             plan.HeadlineNote = outcome.SummaryLabel;
@@ -439,6 +452,10 @@ namespace MonsterPathPredictor.Core
                     {
                         foreach (var soleTile in stepPositiveTiles) tileStepHasCertainStep.Add(soleTile);
                     }
+                    if (!multipleStepForks && soleStepFork != null && stepActiveStateCount > 0 && stepForkHitCount == stepActiveStateCount)
+                    {
+                        UpdateExitPositiveFlags(soleStepFork.Exits, arrivalIsCertain: true);
+                    }
                 }
 
                 currentLayer = nextLayer;
@@ -503,7 +520,7 @@ namespace MonsterPathPredictor.Core
             plan.Combats.AddRange(combatMap.Values);
             plan.Combats.Sort((a, b) => a.StepIndex.CompareTo(b.StepIndex));
 
-            bool multipleEndpointsOrPruned = endpointMap.Count > 1 || plan.PrunedProbability > 0.0;
+            bool multipleEndpointsOrPruned = endpointMap.Count > 1 || hasPrunedBranch || plan.PrunedProbability > 0.0;
             foreach (var ep in endpointMap)
             {
                 plan.Endpoints.Add(new PredictedEndpoint
@@ -1191,7 +1208,7 @@ namespace MonsterPathPredictor.Core
             };
         }
 
-        private static void RecordFork(
+        private static PredictedFork RecordFork(
             BoardGraph board,
             Dictionary<ForkRecordKey, PredictedFork> forkMap,
             int forkLandId,
@@ -1216,6 +1233,7 @@ namespace MonsterPathPredictor.Core
                     IncomingLandId = incomingLandId,
                     StepIndex = stepIndex,
                     ArrivalProbability = arrivalProb,
+                    LogArrivalProbability = arrivalLogProb,
                     IsAfterCombat = isAfterCombat,
                     ReasonKind = outcome.Reason,
                     SummaryLabel = outcome.SummaryLabel,
@@ -1231,21 +1249,23 @@ namespace MonsterPathPredictor.Core
                         ConditionalProbability = tr.Prob,
                         LogConditionalProbability = tr.LogProb,
                         CumulativeProbability = Math.Min(1.0, arrivalProb * tr.Prob),
+                        LogCumulativeProbability = arrivalLogProb + tr.LogProb,
                         IsGlobalRedArrow = (tr.NextLandId == globalRed)
                     });
                 }
 
-                UpdateExitPositiveFlags(pf.Exits);
+                UpdateExitPositiveFlags(pf.Exits, arrivalIsCertain: false);
                 forkMap[key] = pf;
-                return;
+                return pf;
             }
 
             double oldArrival = pf.ArrivalProbability;
             double newTotalArrival = oldArrival + arrivalProb;
             pf.ArrivalProbability = Math.Min(1.0, newTotalArrival);
-            double oldLogArrival = oldArrival > 0.0 ? Math.Log(oldArrival) : double.NegativeInfinity;
+            double oldLogArrival = pf.LogArrivalProbability;
             double newLogArrival = arrivalLogProb;
             double totalLogArrival = BoardGraph.LogAddExp(oldLogArrival, newLogArrival);
+            pf.LogArrivalProbability = totalLogArrival;
 
             var updatedExitIds = new HashSet<int>();
             for (int i = 0; i < outcome.Transitions.Count; i++)
@@ -1270,12 +1290,14 @@ namespace MonsterPathPredictor.Core
                         NextLandId = tr.NextLandId,
                         LogConditionalProbability = double.IsNegativeInfinity(totalLogArrival) ? tr.LogProb : addedLogMass - totalLogArrival,
                         CumulativeProbability = Math.Min(1.0, addedMass),
+                        LogCumulativeProbability = addedLogMass,
                         IsGlobalRedArrow = (tr.NextLandId == globalRed)
                     });
                 }
                 else
                 {
                     existing.CumulativeProbability = Math.Min(1.0, existing.CumulativeProbability + addedMass);
+                    existing.LogCumulativeProbability = BoardGraph.LogAddExp(existing.LogCumulativeProbability, addedLogMass);
                     if (!double.IsNegativeInfinity(totalLogArrival))
                     {
                         double prevLogMass = oldLogArrival + existing.LogConditionalProbability;
@@ -1301,18 +1323,25 @@ namespace MonsterPathPredictor.Core
                 {
                     pf.Exits[i].ConditionalProbability = Math.Min(1.0, pf.Exits[i].CumulativeProbability / newTotalArrival);
                 }
-                pf.Exits.Sort((a, b) =>
-                {
-                    int lc = b.LogConditionalProbability.CompareTo(a.LogConditionalProbability);
-                    return lc != 0 ? lc : b.ConditionalProbability.CompareTo(a.ConditionalProbability);
-                });
             }
+            else if (!double.IsNegativeInfinity(totalLogArrival))
+            {
+                for (int i = 0; i < pf.Exits.Count; i++)
+                {
+                    pf.Exits[i].ConditionalProbability = Math.Min(1.0, Math.Exp(pf.Exits[i].LogConditionalProbability));
+                }
+            }
+            pf.Exits.Sort((a, b) =>
+            {
+                int lc = b.LogConditionalProbability.CompareTo(a.LogConditionalProbability);
+                return lc != 0 ? lc : b.ConditionalProbability.CompareTo(a.ConditionalProbability);
+            });
 
             pf.IsExactUniformSplit = pf.IsExactUniformSplit &&
                                      outcome.IsExactUniformSplit &&
                                      updatedExitIds.Count == pf.Exits.Count &&
                                      outcome.Transitions.Count == pf.Exits.Count;
-            UpdateExitPositiveFlags(pf.Exits);
+            UpdateExitPositiveFlags(pf.Exits, arrivalIsCertain: false);
 
             if (outcome.Reason != pf.ReasonKind || !string.Equals(outcome.SummaryLabel, pf.SummaryLabel, StringComparison.Ordinal))
             {
@@ -1348,6 +1377,8 @@ namespace MonsterPathPredictor.Core
                     }
                 }
             }
+
+            return pf;
         }
 
         private static bool TryDecideTauntStep(
@@ -1850,7 +1881,7 @@ namespace MonsterPathPredictor.Core
             };
         }
 
-        private static void UpdateExitPositiveFlags(List<ForkExitPrediction> exits)
+        private static void UpdateExitPositiveFlags(List<ForkExitPrediction> exits, bool arrivalIsCertain)
         {
             int positiveCount = 0;
             for (int i = 0; i < exits.Count; i++)
@@ -1858,9 +1889,11 @@ namespace MonsterPathPredictor.Core
                 if (exits[i].IsPositiveSupport) positiveCount++;
             }
             bool hasOthers = positiveCount > 1;
+            bool hasOtherCumulative = hasOthers || !arrivalIsCertain;
             for (int i = 0; i < exits.Count; i++)
             {
                 exits[i].HasOtherPositiveExits = hasOthers;
+                exits[i].HasOtherCumulativeSupport = hasOtherCumulative;
             }
         }
 

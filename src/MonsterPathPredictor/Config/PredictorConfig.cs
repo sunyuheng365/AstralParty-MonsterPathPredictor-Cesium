@@ -7,7 +7,27 @@ namespace MonsterPathPredictor.Config
 {
     internal static class PredictorConfig
     {
-        private static bool _pendingMigrationSave;
+        private static readonly ConfigPersistenceCoordinator Coordinator = new ConfigPersistenceCoordinator();
+
+        private sealed class ModConfigStoreAdapter : IConfigStore
+        {
+            private readonly ModConfig _cfg;
+            public ModConfigStoreAdapter(ModConfig cfg) { _cfg = cfg; }
+            public bool Has(string key) => _cfg.Has(key);
+            public bool GetBool(string key, bool defaultValue) => _cfg.GetBool(key, defaultValue);
+            public int GetInt(string key, int defaultValue) => _cfg.GetInt(key, defaultValue);
+            public float GetFloat(string key, float defaultValue) => _cfg.GetFloat(key, defaultValue);
+            public string GetString(string key, string defaultValue) => _cfg.GetString(key, defaultValue);
+            public void Set(string key, bool value) => _cfg.Set(key, value);
+            public void Set(string key, int value) => _cfg.Set(key, value);
+            public void Set(string key, float value) => _cfg.Set(key, value);
+            public void Set(string key, string value) => _cfg.Set(key, value);
+            public bool ReloadIfChanged() => _cfg.ReloadIfChanged();
+            public bool Save() => _cfg.Save();
+            public bool SaveIfDirty() => _cfg.SaveIfDirty();
+        }
+
+        public static bool HasPendingMigrationSave => Coordinator.HasPendingMigrationSave;
 
         public static bool TryParseValidKeyCode(string raw, out KeyCode code)
         {
@@ -24,20 +44,6 @@ namespace MonsterPathPredictor.Config
             return TryParseValidKeyCode(raw, out var code) ? code.ToString() : null;
         }
 
-        private static string NormalizeHotkey(string raw, string fallback)
-        {
-            return NormalizeHotkeyOrNull(raw) ?? fallback;
-        }
-
-        private static bool HasAnyExistingKey(ModConfig config)
-        {
-            for (int i = 0; i < ConfigMigrationLogic.AllKnownLegacyKeys.Length; i++)
-            {
-                if (config.Has(ConfigMigrationLogic.AllKnownLegacyKeys[i])) return true;
-            }
-            return false;
-        }
-
         public static PredictorSettings Load(ModConfig config, bool isInitial)
         {
             return Load(config, isInitial, out _);
@@ -45,128 +51,41 @@ namespace MonsterPathPredictor.Config
 
         public static PredictorSettings Load(ModConfig config, bool isInitial, out bool saveOk)
         {
-            saveOk = true;
-            var settings = new PredictorSettings();
-            if (config == null)
-            {
-                settings.ClampInPlace();
-                return settings;
-            }
-
-            bool migrated = ApplyMigrationsIfNeeded(config);
-            if (migrated) _pendingMigrationSave = true;
-
-            string rawClearBefore = config.GetString("clearHotkey", "Escape");
-            string rawPickerBefore = config.Has("pickerHotkey") ? config.GetString("pickerHotkey", "") : null;
-            ConfigMigrationLogic.ResolveEffectiveHotkeys(
-                rawClearBefore,
-                rawPickerBefore,
+            IConfigStore store = config != null ? new ModConfigStoreAdapter(config) : null;
+            return Coordinator.Load(
+                store,
+                isInitial,
                 NormalizeHotkeyOrNull,
-                out _,
-                out _,
-                out string pickerDefault);
-
-            if (isInitial)
-            {
-                ApplyDefaultsAndDocs(config, pickerDefault);
-            }
-
-            settings.Enabled = config.GetBool("enabled", settings.Enabled);
-            settings.PreviewSteps = config.GetInt("previewSteps", settings.PreviewSteps);
-            settings.DashLength = config.GetFloat("dashLength", settings.DashLength);
-            settings.GapLength = config.GetFloat("gapLength", settings.GapLength);
-            settings.DashSpeed = config.GetFloat("dashSpeed", settings.DashSpeed);
-            settings.LineWidth = config.GetFloat("lineWidth", settings.LineWidth);
-            settings.HeightOffset = config.GetFloat("heightOffset", settings.HeightOffset);
-            settings.FontSize = config.GetInt("fontSize", settings.FontSize);
-            settings.ClickRadius = config.GetFloat("clickRadius", settings.ClickRadius);
-            settings.ClearOnEmptyClick = config.GetBool("clearOnEmptyClick", settings.ClearOnEmptyClick);
-            settings.ShowReasonTag = config.GetBool("showReasonTag", settings.ShowReasonTag);
-            settings.ShowStepNumbers = config.GetBool("showStepNumbers", settings.ShowStepNumbers);
-            settings.ShowDeterministicPercent = config.GetBool("showDeterministicPercent", settings.ShowDeterministicPercent);
-            settings.SimulateCombatOnFork = config.GetBool("simulateCombatOnFork", settings.SimulateCombatOnFork);
-            settings.PostCombatMode = PredictorSettings.ParsePostCombatMode(config.GetString("postCombatMode", "continue"));
-            settings.AllowNonAggressiveMonsters = config.GetBool("allowNonAggressiveMonsters", settings.AllowNonAggressiveMonsters);
-            ConfigMigrationLogic.ResolveEffectiveHotkeys(
-                config.GetString("clearHotkey", settings.ClearHotkey),
-                config.Has("pickerHotkey") ? config.GetString("pickerHotkey", "") : null,
-                NormalizeHotkeyOrNull,
-                out string effectiveClear,
-                out string effectivePicker,
-                out _);
-            settings.ClearHotkey = effectiveClear;
-            settings.PickerHotkey = effectivePicker;
-            settings.ClosePickerOnSelect = config.GetBool("closePickerOnSelect", settings.ClosePickerOnSelect);
-            settings.ExcludedPlayerBuffIds = PredictorSettings.ParseIdCsv(config.GetString("excludedPlayerBuffIds", ""));
-            settings.DeterministicColorHex = config.GetString("deterministicColor", settings.DeterministicColorHex);
-            settings.MajorBranchColorHex = config.GetString("majorBranchColor", settings.MajorBranchColorHex);
-            settings.MinorBranchColorHex = config.GetString("minorBranchColor", settings.MinorBranchColorHex);
-            settings.PostCombatColorHex = config.GetString("postCombatColor", settings.PostCombatColorHex);
-            settings.GuideRedColorHex = config.GetString("guideRedColor", settings.GuideRedColorHex);
-            settings.GuideBlueColorHex = config.GetString("guideBlueColor", settings.GuideBlueColorHex);
-
-            settings.ClampInPlace();
-
-            if (isInitial || migrated || _pendingMigrationSave)
-            {
-                try
-                {
-                    saveOk = _pendingMigrationSave ? config.Save() : config.SaveIfDirty();
-                    _pendingMigrationSave = !saveOk;
-                }
-                catch
-                {
-                    saveOk = false;
-                    _pendingMigrationSave = true;
-                }
-            }
-
-            return settings;
+                (s, pickerDefault) => ApplyDefaultsAndDocs(config, pickerDefault),
+                out saveOk);
         }
 
-        private static bool ApplyMigrationsIfNeeded(ModConfig config)
+        public static ConfigPersistenceCoordinator.StylePersistOutcome ApplyStyleMutationAndPersist(
+            ModConfig config,
+            PredictorSettings currentSettings,
+            StylePendingPatch pendingPatch,
+            Action<PredictorSettings> mutate,
+            bool isFullReset)
         {
-            if (config == null) return false;
-            bool hasAny = HasAnyExistingKey(config);
-            int existingVer = config.GetInt("configVersion", 1);
-            bool hasPicker = config.Has("pickerHotkey");
-            string rawPicker = hasPicker ? config.GetString("pickerHotkey", "") : null;
-            string normClear = NormalizeHotkey(config.GetString("clearHotkey", "Escape"), "Escape");
+            IConfigStore store = config != null ? new ModConfigStoreAdapter(config) : null;
+            return Coordinator.ApplyStyleMutationAndPersist(
+                store,
+                currentSettings,
+                pendingPatch,
+                mutate,
+                isFullReset,
+                NormalizeHotkeyOrNull);
+        }
 
-            var plan = ConfigMigrationLogic.PlanMigration(hasAny, existingVer, hasPicker, rawPicker, normClear, NormalizeHotkeyOrNull);
-            if (!plan.NeedsMigration) return false;
-
-            if (plan.SetClearOnEmptyClickFalse)
-            {
-                config.Set("clearOnEmptyClick", false);
-            }
-            if (!string.IsNullOrEmpty(plan.SetPickerHotkeyTo))
-            {
-                config.Set("pickerHotkey", plan.SetPickerHotkeyTo);
-            }
-            config.Set("configVersion", plan.TargetVersion);
-            return true;
+        public static bool SaveStylePatch(ModConfig config, StylePendingPatch patch, out PredictorSettings mergedFromDisk)
+        {
+            IConfigStore store = config != null ? new ModConfigStoreAdapter(config) : null;
+            return Coordinator.SaveStylePatch(store, patch, NormalizeHotkeyOrNull, out mergedFromDisk);
         }
 
         public static bool SaveStylePatch(ModConfig config, StylePendingPatch patch)
         {
-            if (config == null) return false;
-            bool dirty = false;
-            if (patch != null && patch.HasPending)
-            {
-                foreach (var kv in patch.Entries)
-                {
-                    if (kv.Value is int iv) { config.Set(kv.Key, iv); dirty = true; }
-                    else if (kv.Value is float fv) { config.Set(kv.Key, fv); dirty = true; }
-                    else if (kv.Value is bool bv) { config.Set(kv.Key, bv); dirty = true; }
-                    else if (kv.Value is string sv) { config.Set(kv.Key, sv); dirty = true; }
-                }
-            }
-
-            if (!dirty && !_pendingMigrationSave) return true;
-            bool ok = config.Save();
-            if (ok) _pendingMigrationSave = false;
-            return ok;
+            return SaveStylePatch(config, patch, out _);
         }
 
         private static void ApplyDefaultsAndDocs(ModConfig cfg, string pickerDefault = "F10")

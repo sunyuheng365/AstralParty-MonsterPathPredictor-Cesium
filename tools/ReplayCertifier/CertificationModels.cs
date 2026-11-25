@@ -113,6 +113,16 @@ namespace MonsterPathPredictor.ReplayCertifier
         public long MissingPredictions;
         public long OutOfSupportPredictions;
         public long IllegalMoveEdges;
+        public List<string> IllegalMoveEdgeSamples = new();
+
+        public void RecordIllegalMoveEdge(string sample, int maxSamples = 25)
+        {
+            IllegalMoveEdges++;
+            if (!string.IsNullOrEmpty(sample) && IllegalMoveEdgeSamples.Count < maxSamples)
+            {
+                IllegalMoveEdgeSamples.Add(sample);
+            }
+        }
 
         // Per-replay identity metadata (set on single-replay evaluation for duplicate/spoof detection; not merged).
         public string RequestedReplayId;
@@ -145,6 +155,11 @@ namespace MonsterPathPredictor.ReplayCertifier
             MissingPredictions += other.MissingPredictions;
             OutOfSupportPredictions += other.OutOfSupportPredictions;
             IllegalMoveEdges += other.IllegalMoveEdges;
+            foreach (var sample in other.IllegalMoveEdgeSamples)
+            {
+                if (IllegalMoveEdgeSamples.Count >= 25) break;
+                IllegalMoveEdgeSamples.Add(sample);
+            }
             FrontAudit.MergeFrom(other.FrontAudit);
 
             foreach (var kv in other.Buckets) Buckets[kv.Key].MergeFrom(kv.Value);

@@ -174,9 +174,14 @@ namespace MonsterPathPredictor.Core
                 return plan;
             }
 
-            var activePlayers = FilterEffectivePlayers(board, monster, players);
+            var trackablePlayers = FilterTrackablePlayers(board, players);
+            var activePlayers = FilterEffectivePlayers(monster, trackablePlayers);
             var shortestPathCache = new Dictionary<int, ShortestPathField>();
             var combatPlayersByLand = BuildPlayersByLand(activePlayers, combatEligibleOnly: true);
+            if (monster.IsNormalAggressive && !monster.IsThief && monster.IsTaunted && monster.TauntTargetPlayerId != 0 && monster.RequiresCrimeTarget)
+            {
+                AddTauntTargetToCombatMapIfEligible(combatPlayersByLand, trackablePlayers, monster.TauntTargetPlayerId);
+            }
             var stealPlayersByLand = BuildPlayersByLand(activePlayers, combatEligibleOnly: false);
 
             var edgeMap = new Dictionary<EdgeKey, PredictedEdge>();
@@ -264,13 +269,14 @@ namespace MonsterPathPredictor.Core
                     }
 
                     StepOutcome outcome = step == 0
-                        ? DecideFirstStep(board, monster, players, activePlayers, turnBossTargetId, freshMarkedAtTurnStart, bossTargetClearedNow, shortestPathCache, options.PostCombatMode)
+                        ? DecideFirstStep(board, monster, players, trackablePlayers, activePlayers, turnBossTargetId, freshMarkedAtTurnStart, bossTargetClearedNow, shortestPathCache, options.PostCombatMode)
                         : DecideMidWalkStep(
                             board,
                             monster,
                             state.LandId,
                             state.FromLandId,
                             players,
+                            trackablePlayers,
                             activePlayers,
                             encounteredOnThisTile,
                             postCombatNow,
@@ -476,6 +482,7 @@ namespace MonsterPathPredictor.Core
             BoardGraph board,
             MonsterState monster,
             IReadOnlyList<TrackedPlayer> allPlayers,
+            List<TrackedPlayer> trackablePlayers,
             List<TrackedPlayer> activePlayers,
             long lockedBossTargetId,
             bool freshMarkedAtTurnStart,
@@ -487,27 +494,54 @@ namespace MonsterPathPredictor.Core
             int from = monster.FromLandId;
             var forward = board.GetForwardNeighbors(cur, from);
             bool isFork = IsForkForFirstStep(board, monster);
+            int excludedTurnStartLand = ResolveExcludedTurnStartLandId(monster, isMidTurn: monster.IsCurrentlyMovingMidTurn);
 
-            // 0. Taunt override (嘲讽 — allows overriding facing / U-turning before combat at turn start or forks;
-            //    matches DecideMidWalkStep so straight-road continuation past an unattackable taunter never diverges).
-            if ((!monster.IsCurrentlyMovingMidTurn || isFork) &&
+            // 0a. Turn-start fresh marked-target lock-on (1018 学院安全官 / 1047 铜盏鸳鸯):
+            //     When starting a turn with a living marked player (2101001 / 10470101), the server's
+            //     turn-start lock-on overrides facing, ForkStart Red>Blue, AND Taunt (10011) on Step 0
+            //     (verified on 1792397536442877 F3569 and 1795260241852966 F3969/F4024).
+            if (!monster.IsCurrentlyMovingMidTurn &&
+                freshMarkedAtTurnStart &&
+                !monster.JustFoughtOnCurrentFork &&
+                !bossTargetCleared &&
+                !(monster.HasLaunchedFightThisTurn && postCombatMode == PostCombatMode.RedBlueAfterCombat) &&
+                monster.SkillMoveKind == SkillMoveKind.None &&
+                (monster.ChasesProblemStudent || monster.ChasesMandarinDuckMark) &&
+                lockedBossTargetId != 0 &&
+                TryDecideLockedBossTargetStep(
+                    board,
+                    cur,
+                    isFork,
+                    lockedBossTargetId,
+                    allPlayers,
+                    cache,
+                    monster.ChasesProblemStudent ? "追问题生" : "追标记",
+                    out var turnStartBossOutcome))
+            {
+                return turnStartBossOutcome;
+            }
+
+            // 0b. Taunt override (嘲讽 10011):
+            //     - At turn start (!IsCurrentlyMovingMidTurn): ALL monsters (including Thieves, verified on
+            //       1794740333298128 F1237 & 12 other Thief turn-start Taunt replays) obey Taunt.
+            //     - At mid-walk forks (IsCurrentlyMovingMidTurn && isFork): Thieves (MonsterType == Thief)
+            //       ignore Taunt and chase the nearest player normally (verified on 1794740333298128 F1244
+            //       & 24 other Thief mid-walk Taunt replays), whereas aggressive monsters obey Taunt
+            //       and Taunt takes precedence over retained BossTargetId (1795260241852966 F3972 & F4030).
+            //     - Uses unfiltered trackablePlayers (NOT filtered by RequiresCrimeTarget) so 1067/1068
+            //       still chase a CrimeNum == 0 taunter (1789211303827607 / 1789455248221734).
+            if ((!monster.IsCurrentlyMovingMidTurn || (isFork && !monster.IsThief)) &&
                 !monster.JustFoughtOnCurrentFork && !monster.HasLaunchedFightThisTurn &&
                 monster.IsTaunted && monster.TauntTargetPlayerId != 0 &&
-                TryDecideTauntStep(board, cur, isFork, monster.TauntTargetPlayerId, activePlayers, cache, out var tauntOutcome))
+                TryDecideTauntStep(board, cur, isFork, monster.TauntTargetPlayerId, trackablePlayers, cache, out var tauntOutcome))
             {
                 return tauntOutcome;
             }
 
-            // 0.5 BossTargetId / Marked-target free-direction override:
-            //   - 1018 学院安全官 (魔法学院/海选赛运动场) -> 【问题学生】 (buff 2101001) + Hero.BossTargetId
-            //   - 1047 铜盏鸳鸯 (园林中庭) -> buff 10470101 + Hero.BossTargetId
-            //   At turn start (!IsCurrentlyMovingMidTurn), overrides facing/ForkStart ONLY when a living marked player
-            //   triggers fresh lock-on (otherwise retains old BossTargetId for mid-walk forks while obeying Front/Red>Blue).
-            //   At mid-walk forks (IsCurrentlyMovingMidTurn && isFork), freely U-turns toward lockedBossTargetId
-            //   (including PostNormalCombatMidFork after fighting an unmarked player) until fighting the locked target.
-            int excludedTurnStartLand = ResolveExcludedTurnStartLandId(monster, isMidTurn: monster.IsCurrentlyMovingMidTurn);
-            bool canUseBossTargetAtStep0 = monster.IsCurrentlyMovingMidTurn ? isFork : freshMarkedAtTurnStart;
-            if (canUseBossTargetAtStep0 &&
+            // 0c. Mid-walk fork BossTargetId free-direction chase (1018 / 1047):
+            //     Freely U-turns toward lockedBossTargetId (including PostNormalCombatMidFork after fighting
+            //     an unmarked player) until fighting a marked target clears BossTargetId.
+            if (monster.IsCurrentlyMovingMidTurn && isFork &&
                 !monster.JustFoughtOnCurrentFork &&
                 !bossTargetCleared &&
                 !(monster.HasLaunchedFightThisTurn && postCombatMode == PostCombatMode.RedBlueAfterCombat) &&
@@ -709,6 +743,7 @@ namespace MonsterPathPredictor.Core
             int landId,
             int fromLandId,
             IReadOnlyList<TrackedPlayer> allPlayers,
+            List<TrackedPlayer> trackablePlayers,
             List<TrackedPlayer> activePlayers,
             bool combatHappenedOnThisTile,
             bool isAfterCombat,
@@ -751,10 +786,11 @@ namespace MonsterPathPredictor.Core
                 }
             }
 
-            // Ongoing taunt override at mid-walk forks before combat (consistent with DecideFirstStep)
+            // Ongoing taunt override at mid-walk forks before combat (consistent with DecideFirstStep;
+            // Thieves ignore Taunt; crime-restricted monsters still chase a CrimeNum == 0 taunter).
             if (!isAfterCombat && !combatHappenedOnThisTile && monster != null &&
-                monster.IsTaunted && monster.TauntTargetPlayerId != 0 &&
-                TryDecideTauntStep(board, landId, isForkDecision: true, monster.TauntTargetPlayerId, activePlayers, cache, out var midTauntOutcome))
+                !monster.IsThief && monster.IsTaunted && monster.TauntTargetPlayerId != 0 &&
+                TryDecideTauntStep(board, landId, isForkDecision: true, monster.TauntTargetPlayerId, trackablePlayers, cache, out var midTauntOutcome))
             {
                 return midTauntOutcome;
             }
@@ -805,6 +841,21 @@ namespace MonsterPathPredictor.Core
             var allNeighbors = board.GetValidNeighbors(forkLandId);
             bool incomingIsNeighbor = board.IsValidNeighbor(forkLandId, incomingLandId);
 
+            // Library (82016) crime-only pursuers (1067 before reveal, 1068 before 5 dmg) only evaluate
+            // their single top-ranked CrimeNum > 0 target (ranked[0]); if it lies strictly behind or stands
+            // directly on forkLandId (dist == 0, e.g. stealth/unattackable or post-combat), no cascade occurs.
+            bool restrictToTopTargetOnly = monster != null && monster.RequiresCrimeTarget;
+            if (restrictToTopTargetOnly)
+            {
+                for (int i = 0; i < activePlayers.Count; i++)
+                {
+                    if (activePlayers[i].LandId == forkLandId)
+                    {
+                        return UniformSplit(forward, ForkReasonKind.MidForkAllUTurnFallback, isAfterCombat ? "续行·平分" : "同格平分");
+                    }
+                }
+            }
+
             // Rank reachable trackable players by:
             //   1. Priority mark tier (0 = marked 【问题学生】/【鸳鸯】 for 1018/1047, 1 = normal)
             //   2. Full-board shortest distance ASC
@@ -840,10 +891,6 @@ namespace MonsterPathPredictor.Core
             {
                 return UniformSplit(forward, ForkReasonKind.MidForkNoTargetFallback, isAfterCombat ? "续行·均分" : "无目标·均分");
             }
-
-            // Library (82016) crime-only pursuers (1067 before reveal, 1068 before 5 dmg) only evaluate
-            // their single top-ranked CrimeNum > 0 target (ranked[0]); if it lies strictly behind, no cascade occurs.
-            bool restrictToTopTargetOnly = monster != null && monster.RequiresCrimeTarget;
 
             double logRemainingProb = 0.0; // ln(1.0) = 0; stays finite even when Exp underflows < 4.9e-324
             bool exactOk = true;
@@ -1345,12 +1392,34 @@ namespace MonsterPathPredictor.Core
             return dict;
         }
 
-        private static List<TrackedPlayer> FilterEffectivePlayers(
-            BoardGraph board,
-            MonsterState monster,
-            IReadOnlyList<TrackedPlayer> players)
+        private static void AddTauntTargetToCombatMapIfEligible(
+            Dictionary<int, List<TrackedPlayer>> combatPlayersByLand,
+            List<TrackedPlayer> trackablePlayers,
+            long tauntTargetPlayerId)
         {
-            var trackable = FilterTrackablePlayers(board, players);
+            for (int i = 0; i < trackablePlayers.Count; i++)
+            {
+                var p = trackablePlayers[i];
+                if (p.PlayerId != tauntTargetPlayerId || !p.CanBeAttacked) continue;
+                if (!combatPlayersByLand.TryGetValue(p.LandId, out var list))
+                {
+                    list = new List<TrackedPlayer>();
+                    combatPlayersByLand[p.LandId] = list;
+                }
+                bool exists = false;
+                for (int j = 0; j < list.Count; j++)
+                {
+                    if (list[j].PlayerId == p.PlayerId) { exists = true; break; }
+                }
+                if (!exists) list.Add(p);
+                break;
+            }
+        }
+
+        private static List<TrackedPlayer> FilterEffectivePlayers(
+            MonsterState monster,
+            List<TrackedPlayer> trackable)
+        {
             if (monster == null || !monster.RequiresCrimeTarget) return trackable;
 
             var culprits = new List<TrackedPlayer>(trackable.Count);

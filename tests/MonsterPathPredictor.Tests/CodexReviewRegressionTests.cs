@@ -1592,5 +1592,206 @@ namespace MonsterPathPredictor.Tests
             var freeFront = LiveFacingResolver.ResolveLiveFrontNodeIds(board, 23, hasLiveCharacter: true, liveFromLandId: -1, visualArrowFrontIds: null, explicitFrontNodeIds: null);
             Assert.Equal(new[] { 22, 55, 24 }, freeFront);
         }
+
+        [Fact]
+        public void TauntedThief_ObeysTauntAtTurnStart_ButIgnoresTauntAtMidWalkForks()
+        {
+            // Verified on 82017 (1794740333298128 F1237 & F1244):
+            // Thief (IsThief=true) starts on fork 23 (Red=22, Blue=55) taunted by P2@46 (via 55 -> 45 -> 46).
+            // Step 0 (turn start): Thief OBEYS Taunt -> 23 -> 55 (overriding Red=22).
+            // Step 2 (mid-walk fork 45: Red=46 toward Taunter P2@46, Blue=44 toward closer P1@44):
+            // Thief IGNORES Taunt at mid-walk fork -> chases closer P1@44 (45 -> 44)!
+            var board = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(22, new[] { 23 }),
+                new LandNodeSnapshot(24, new[] { 23 }),
+                new LandNodeSnapshot(23, new[] { 22, 55, 24 }),
+                new LandNodeSnapshot(55, new[] { 45, 23 }),
+                new LandNodeSnapshot(45, new[] { 46, 44, 55 }),
+                new LandNodeSnapshot(46, new[] { 47, 45 }),
+                new LandNodeSnapshot(47, new[] { 46 }),
+                new LandNodeSnapshot(44, new[] { 45 })
+            });
+            var players = new List<TrackedPlayer>
+            {
+                new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = 44, IsAlive = true, IsTargetable = true, Gold = 20 },
+                new TrackedPlayer { PlayerId = 2, Slot = 1, LandId = 47, IsAlive = true, IsTargetable = true, Gold = 10 }
+            };
+            var thiefStart = new MonsterState
+            {
+                MonsterId = 76176,
+                HeroId = 1001,
+                IsNormalAggressive = false,
+                IsThief = true,
+                CurrentLandId = 23,
+                FromLandId = 24,
+                FrontNodeIds = new[] { 22, 55 },
+                IsCurrentlyMovingMidTurn = false,
+                IsTaunted = true,
+                TauntTargetPlayerId = 2
+            };
+
+            var longPlan = MonsterPathEngine.Plan(board, thiefStart, players, new PlanOptions { MaxSteps = 4 });
+            var startFork = longPlan.Forks.Single(f => f.ForkLandId == 23);
+            Assert.Equal(ForkReasonKind.TauntChase, startFork.ReasonKind);
+            Assert.Equal(55, startFork.Exits.Single().NextLandId);
+
+            var midForkLong = longPlan.Forks.Single(f => f.ForkLandId == 45);
+            Assert.Equal(ForkReasonKind.MidForkChasePlayer, midForkLong.ReasonKind);
+            Assert.Equal(44, midForkLong.Exits.Single().NextLandId);
+
+            // Fresh recomputation upon arriving at mid-walk fork 45 must match long forecast identically.
+            var thiefAtMidFork = new MonsterState
+            {
+                MonsterId = 76176,
+                HeroId = 1001,
+                IsNormalAggressive = false,
+                IsThief = true,
+                CurrentLandId = 45,
+                FromLandId = 55,
+                FrontNodeIds = new[] { 46, 44 },
+                IsCurrentlyMovingMidTurn = true,
+                IsTaunted = true,
+                TauntTargetPlayerId = 2
+            };
+            var midPlan = MonsterPathEngine.Plan(board, thiefAtMidFork, players, new PlanOptions { MaxSteps = 1 });
+            Assert.Equal(44, midPlan.Forks.Single(f => f.ForkLandId == 45).Exits.Single().NextLandId);
+        }
+
+        [Fact]
+        public void CrimeRestrictedMonster_TauntBypassesCrimeNumZeroFilter_ForPathAndCombat()
+        {
+            // Verified on 82016 (1789455248221734 F1948/F1958 & 1789211303827607 F1514):
+            // 1067 (RequiresCrimeTarget=true) is taunted by P3 (CrimeNum=0) behind it on tile 32.
+            // Must U-turn toward CrimeNum=0 taunter AND record predicted combat on tile 32!
+            var board = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(30, new[] { 31 }),
+                new LandNodeSnapshot(35, new[] { 31 }),
+                new LandNodeSnapshot(31, new[] { 30, 35, 32 }),
+                new LandNodeSnapshot(32, new[] { 31 })
+            });
+            var players = new List<TrackedPlayer>
+            {
+                new TrackedPlayer { PlayerId = 2, Slot = 1, LandId = 30, IsAlive = true, IsTargetable = true, CrimeNum = 3 },
+                new TrackedPlayer { PlayerId = 3, Slot = 2, LandId = 32, IsAlive = true, IsTargetable = true, CrimeNum = 0 }
+            };
+            var warden = new MonsterState
+            {
+                MonsterId = 21427,
+                HeroId = 1067,
+                CurrentLandId = 31,
+                FromLandId = 32,
+                FrontNodeIds = new[] { 30, 35 },
+                RequiresCrimeTarget = true,
+                IsTaunted = true,
+                TauntTargetPlayerId = 3
+            };
+            var plan = MonsterPathEngine.Plan(board, warden, players, new PlanOptions { MaxSteps = 2 });
+            var fork = plan.Forks.Single(f => f.ForkLandId == 31);
+            Assert.Equal(ForkReasonKind.TauntChase, fork.ReasonKind);
+            Assert.Equal(32, fork.Exits.Single().NextLandId);
+            Assert.Contains(plan.Combats, c => c.LandId == 32);
+        }
+
+        [Fact]
+        public void CrimeRestrictedMonster_LivingCulpritStandingOnForkTile_SplitsUniformlyWithoutCascade()
+        {
+            // Verified on 82016 (1788531088723772 F3648, 1788610615605221 F1618, & 53 other 1067/1068 cases):
+            // When a living, targetable culprit (CrimeNum > 0) stands directly on forkLandId (dist == 0,
+            // e.g. stealthed/unattackable or post-combat), ranked[0] is at distance 0 with zero forward exits
+            // and RequiresCrimeTarget does NOT cascade to ranked[1] -> splits 50%/50% across forward exits!
+            var board = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(14, new[] { 15 }),
+                new LandNodeSnapshot(15, new[] { 16, 42, 14 }),
+                new LandNodeSnapshot(16, new[] { 15 }),
+                new LandNodeSnapshot(42, new[] { 15 })
+            });
+            var players = new List<TrackedPlayer>
+            {
+                new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = 16, IsAlive = true, IsTargetable = true, CrimeNum = 4 },
+                new TrackedPlayer { PlayerId = 2, Slot = 1, LandId = 15, IsAlive = true, IsTargetable = true, CanBeAttacked = false, CrimeNum = 8 }
+            };
+            var guard = new MonsterState
+            {
+                MonsterId = 2742,
+                HeroId = 1068,
+                CurrentLandId = 15,
+                FromLandId = 14,
+                IsCurrentlyMovingMidTurn = true,
+                RequiresCrimeTarget = true
+            };
+            var plan = MonsterPathEngine.Plan(board, guard, players, new PlanOptions { MaxSteps = 1 });
+            var fork = plan.Forks.Single(f => f.ForkLandId == 15);
+            Assert.Equal(2, fork.Exits.Count);
+            Assert.True(fork.IsExactUniformSplit);
+            Assert.All(fork.Exits, e => Assert.Equal(0.5, e.ConditionalProbability, 6));
+
+            // Contrast: if the on-tile player has CrimeNum == 0, they are NOT in culprits -> chases culprit P1@16!
+            players[1].CrimeNum = 0;
+            var planNonCulpritOnTile = MonsterPathEngine.Plan(board, guard, players, new PlanOptions { MaxSteps = 1 });
+            Assert.Equal(16, planNonCulpritOnTile.Forks.Single(f => f.ForkLandId == 15).Exits.Single().NextLandId);
+        }
+
+        [Fact]
+        public void BossTargetMonster_TurnStartFreshMarkBeatsTaunt_WhileMidWalkTauntBeatsBossTarget()
+        {
+            // Verified on 82015 (1795260241852966 F3969->F3972 & F4024->F4030, and 1792397536442877 F3569):
+            // 1047 starts at tile 46 (from=17, front=[48]) while taunted by P3@49 (via 48) AND all players
+            // have fresh mark 10470101 with nearest marked P1@9 (via 17 -> 35 -> 9).
+            // - Step 0 (turn start): freshMarkedAtTurnStart beats Taunt -> U-turns 46 -> 17 toward P1@9!
+            // - Mid-walk fork 17 (exits [35, 0, 46]): Taunt beats locked BossTargetId -> U-turns 17 -> 46 toward P3@49!
+            var board = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(9, new[] { 35 }),
+                new LandNodeSnapshot(35, new[] { 9, 17 }),
+                new LandNodeSnapshot(0, new[] { 17 }),
+                new LandNodeSnapshot(17, new[] { 35, 0, 46 }),
+                new LandNodeSnapshot(46, new[] { 48, 17 }),
+                new LandNodeSnapshot(48, new[] { 49, 46 }),
+                new LandNodeSnapshot(49, new[] { 50, 48 }),
+                new LandNodeSnapshot(50, new[] { 51, 49 }),
+                new LandNodeSnapshot(51, new[] { 50 })
+            });
+            var players = new List<TrackedPlayer>
+            {
+                new TrackedPlayer { PlayerId = 1, Slot = 0, LandId = 9, IsAlive = true, IsTargetable = true, HasMandarinDuckMark = true },
+                new TrackedPlayer { PlayerId = 3, Slot = 2, LandId = 51, IsAlive = true, IsTargetable = true, HasMandarinDuckMark = true }
+            };
+            var duckStart = new MonsterState
+            {
+                MonsterId = 82332,
+                HeroId = 1047,
+                CurrentLandId = 46,
+                FromLandId = 17,
+                FrontNodeIds = new[] { 48 },
+                IsCurrentlyMovingMidTurn = false,
+                ChasesMandarinDuckMark = true,
+                IsTaunted = true,
+                TauntTargetPlayerId = 3
+            };
+            var startPlan = MonsterPathEngine.Plan(board, duckStart, players, new PlanOptions { MaxSteps = 2 });
+            Assert.Contains(startPlan.Edges, e => e.FromLandId == 46 && e.ToLandId == 17 && e.EarliestStep == 0);
+            var midFork17 = startPlan.Forks.Single(f => f.ForkLandId == 17);
+            Assert.Equal(ForkReasonKind.TauntChase, midFork17.ReasonKind);
+            Assert.Equal(46, midFork17.Exits.Single().NextLandId);
+
+            // Fresh arrival recomputation at mid-walk fork 17 must also obey Taunt (46) over locked BossTargetId (P1@9).
+            var duckMid = new MonsterState
+            {
+                MonsterId = 82332,
+                HeroId = 1047,
+                CurrentLandId = 17,
+                FromLandId = 46,
+                IsCurrentlyMovingMidTurn = true,
+                ChasesMandarinDuckMark = true,
+                BossTargetPlayerId = 1,
+                IsTaunted = true,
+                TauntTargetPlayerId = 3
+            };
+            var midPlan = MonsterPathEngine.Plan(board, duckMid, players, new PlanOptions { MaxSteps = 1 });
+            Assert.Equal(46, midPlan.Forks.Single(f => f.ForkLandId == 17).Exits.Single().NextLandId);
+        }
     }
 }

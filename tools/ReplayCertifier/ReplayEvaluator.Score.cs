@@ -108,6 +108,7 @@ namespace MonsterPathPredictor.ReplayCertifier
             dynamic mv, string replayId, int mapId, int curRound, int fi, BoardGraph board,
             Dictionary<long, UnitSim> players, Dictionary<long, UnitSim> monsters, Dictionary<long, int> spawnedAtTile,
             Dictionary<long, Dictionary<int, List<dynamic>>> pendingMoveEffects, long curTurnActor,
+            bool curTurnForceDir, ref bool playerSteppedThisTurn,
             bool startedOnFork, int turnStartLandId, ref bool stepped, ref bool foughtOnTile, bool foughtTurn, ref bool thiefStoleOnTile,
             ref bool bossTargetLockedTurn, bool bossTargetClearedTurn,
             MapStats mapStat, CertificationSummary summary)
@@ -125,7 +126,7 @@ namespace MonsterPathPredictor.ReplayCertifier
             {
                 if (nodeIds.Length == 1)
                 {
-                    if (!board.Contains(nodeIds[0])) summary.IllegalMoveEdges++;
+                    if (!board.Contains(nodeIds[0])) summary.RecordIllegalMoveEdge($"{replayId} map={mapId} R{curRound} F{fi} HandleMove.UnknownMover unit={moverId} node={nodeIds[0]}");
                 }
                 else if (nodeIds.Length >= 2)
                 {
@@ -136,7 +137,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                         if (nid == prev) continue;
                         if (!board.Contains(prev) || !board.Contains(nid) || !board.IsValidNeighbor(prev, nid))
                         {
-                            summary.IllegalMoveEdges++;
+                            summary.RecordIllegalMoveEdge($"{replayId} map={mapId} R{curRound} F{fi} HandleMove.UnknownMover unit={moverId} edge={prev}->{nid}");
                         }
                         prev = nid;
                     }
@@ -185,10 +186,23 @@ namespace MonsterPathPredictor.ReplayCertifier
 
                 int fromTile = mover.BackNodeId;
                 bool validEdge = board.Contains(curTile) && board.Contains(nextTile) && board.IsValidNeighbor(curTile, nextTile);
+                // Verified official-server quirk (1792249843201555 map=82017 R9 F3112): after an event teleport
+                // resets BackNodeId=-1, a player's ForceDir=true (e.g. skill 11903) first step can still accept
+                // their exact pre-teleport BackNodeId without emitting a 1040.Place frame.
+                bool isKnownForceDirStaleBackQuirk =
+                    !validEdge &&
+                    isKnownPlayer &&
+                    moverId == curTurnActor &&
+                    curTurnForceDir &&
+                    !playerSteppedThisTurn &&
+                    mover.BackNodeId < 0 &&
+                    mover.PreTeleportBackNodeId >= 0 &&
+                    nextTile == mover.PreTeleportBackNodeId &&
+                    board.Contains(nextTile);
 
-                if (!validEdge)
+                if (!validEdge && !isKnownForceDirStaleBackQuirk)
                 {
-                    summary.IllegalMoveEdges++;
+                    summary.RecordIllegalMoveEdge($"{replayId} map={mapId} R{curRound} F{fi} HandleMove.Edge unit={mover.Id}(m={mover.IsMonster},h={mover.HeroId}) {curTile}->{nextTile} nodes=[{string.Join(",", nodeIds)}]");
                 }
                 else if (isKnownMonster && (isNormalAggro || isThief) && isActiveTurnMonster)
                 {
@@ -215,6 +229,12 @@ namespace MonsterPathPredictor.ReplayCertifier
 
                 mover.BackNodeId = curTile;
                 mover.NodeId = nextTile;
+                if (isKnownPlayer)
+                {
+                    mover.PreTeleportBackNodeId = -1;
+                    mover.PreTeleportLandingNodeId = -1;
+                    if (moverId == curTurnActor) playerSteppedThisTurn = true;
+                }
                 if (isKnownMonster)
                 {
                     m.FrontNodeIds = board.GetForwardNeighbors(nextTile, curTile).ToArray();

@@ -52,7 +52,7 @@ namespace MonsterPathPredictor.ReplayCertifier
             protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
                 => Task.FromResult(_responder(request.RequestUri!.ToString()));
         }
-        public sealed class StubThrowDice { public long PlayerId { get; set; } }
+        public sealed class StubThrowDice { public long PlayerId { get; set; } public bool ForceDir { get; set; } }
         public sealed class StubMove { public long PlayerId { get; set; } public int[] NodeIds { get; set; } }
         public sealed class StubGold { public int ChangeGold { get; set; } public int CurrGold { get; set; } }
         public sealed class StubPlaceInner { public int NodeId { get; set; } public int BackNodeId { get; set; } = -1; public int[] FrontNodeIds { get; set; } = Array.Empty<int>(); }
@@ -2173,7 +2173,68 @@ namespace MonsterPathPredictor.ReplayCertifier
                 return 1;
             }
 
-            Console.WriteLine("ReplayCertifier self-tests PASSED (62/62).");
+            // Test 63: Official-server ForceDir=true post-teleport stale BackNodeId player quirk (1792249843201555 F3112):
+            //   - Player walks 31 -> 30 (BackNodeId=31), event 1040.Place teleports 30 -> 8 (BackNodeId=-1),
+            //     1113 snapshot preserves pre-teleport back=31, next turn ThrowDice(ForceDir=true) + Move [31] -> 0 IllegalMoveEdges.
+            //   - Arbitrary non-matching destination (e.g. [32]) OR ForceDir=false MUST still fail with IllegalMoveEdges == 1!
+            var cat63 = BuildTestCatalog(82017,
+                "{\"id\":7,\"neighbors\":[8]},{\"id\":8,\"neighbors\":[7,9]},{\"id\":9,\"neighbors\":[8]}," +
+                "{\"id\":30,\"neighbors\":[31]},{\"id\":31,\"neighbors\":[30,32]},{\"id\":32,\"neighbors\":[31]}");
+            var dec63 = new StubDecoder();
+            int run63 = dec63.Register(new StubRunning
+            {
+                Room = new StubRoom
+                {
+                    MapId = 82017, MapIndex = 0, Round = 8,
+                    Players = new List<StubUnit> { new StubUnit { Id = 1377835, Slot = 2, Hero = new StubHero { HeroId = 119, NodeId = 31, BackNodeId = 32, Hp = 10 } } }
+                }
+            });
+            int roll63_a = dec63.Register(new StubThrowDice { PlayerId = 1377835 });
+            int mv63_a = dec63.Register(new StubMove { PlayerId = 1377835, NodeIds = new[] { 30 } });
+            int place63 = dec63.Register(new StubAttr
+            {
+                PlayerId = 1377835, Cause = new StubCause { Id = 30013 },
+                EffectDatas = new List<StubEffect> { new StubEffect { PlayerId = 1377835, Place = new StubPlace { Place = new StubPlaceInner { NodeId = 8, BackNodeId = -1, FrontNodeIds = new[] { 9 } } } } }
+            });
+            int snap63 = dec63.Register(new StubSnap
+            {
+                PlayerId = 1377835,
+                Room = new StubRoom
+                {
+                    MapId = 82017, MapIndex = 0, Round = 9,
+                    Players = new List<StubUnit> { new StubUnit { Id = 1377835, Slot = 2, Hero = new StubHero { HeroId = 119, NodeId = 8, BackNodeId = -1, FrontNodeIds = new[] { 9 }, Hp = 10 } } }
+                }
+            });
+            int roll63_force = dec63.Register(new StubThrowDice { PlayerId = 1377835, ForceDir = true });
+            int roll63_normal = dec63.Register(new StubThrowDice { PlayerId = 1377835, ForceDir = false });
+            int mv63_quirk = dec63.Register(new StubMove { PlayerId = 1377835, NodeIds = new[] { 31 } });
+            int mv63_follow = dec63.Register(new StubMove { PlayerId = 1377835, NodeIds = new[] { 32 } });
+            int mv63_bogus = dec63.Register(new StubMove { PlayerId = 1377835, NodeIds = new[] { 32 } });
+            int fin63 = dec63.Register(new StubFinish());
+            var r63Ok = ReplayEvaluator.EvaluateBytes("forcedir-quirk-ok",
+                ConcatFrames(MakeFrame(1003, run63), MakeFrame(5022, roll63_a), MakeFrame(5028, mv63_a),
+                    MakeFrame(1040, place63), MakeFrame(1113, snap63), MakeFrame(5022, roll63_force),
+                    MakeFrame(5028, mv63_quirk), MakeFrame(5028, mv63_follow), MakeFrame(1016, fin63)),
+                dec63, cat63);
+            var r63WrongTile = ReplayEvaluator.EvaluateBytes("forcedir-quirk-wrong-tile",
+                ConcatFrames(MakeFrame(1003, run63), MakeFrame(5022, roll63_a), MakeFrame(5028, mv63_a),
+                    MakeFrame(1040, place63), MakeFrame(1113, snap63), MakeFrame(5022, roll63_force),
+                    MakeFrame(5028, mv63_bogus), MakeFrame(1016, fin63)),
+                dec63, cat63);
+            var r63NoForce = ReplayEvaluator.EvaluateBytes("forcedir-quirk-no-force",
+                ConcatFrames(MakeFrame(1003, run63), MakeFrame(5022, roll63_a), MakeFrame(5028, mv63_a),
+                    MakeFrame(1040, place63), MakeFrame(1113, snap63), MakeFrame(5022, roll63_normal),
+                    MakeFrame(5028, mv63_quirk), MakeFrame(1016, fin63)),
+                dec63, cat63);
+            if (r63Ok.ReplaysVerified != 1 || r63Ok.IllegalMoveEdges != 0 ||
+                r63WrongTile.IllegalMoveEdges != 1 || r63NoForce.IllegalMoveEdges != 1 ||
+                r63WrongTile.IllegalMoveEdgeSamples.Count != 1)
+            {
+                Console.Error.WriteLine($"SELF-TEST FAILED (Test 63): ForceDir stale-back quirk failed (ok={r63Ok.IllegalMoveEdges}, wrongTile={r63WrongTile.IllegalMoveEdges}, noForce={r63NoForce.IllegalMoveEdges}).");
+                return 1;
+            }
+
+            Console.WriteLine("ReplayCertifier self-tests PASSED (63/63).");
             return 0;
         }
     }

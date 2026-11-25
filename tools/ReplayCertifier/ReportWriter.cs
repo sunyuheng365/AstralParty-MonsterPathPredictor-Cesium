@@ -498,6 +498,11 @@ namespace MonsterPathPredictor.ReplayCertifier
             Console.WriteLine($"  PostCmbt  Front>=2: {fa.PostCombatMultiRedBlue:N0}/{fa.PostCombatMulti:N0} followed RedBlue within FrontNodeIds");
 
             Console.WriteLine("\n=== SAMPLE MISMATCHES ===");
+            if (s.IllegalMoveEdgeSamples.Count > 0)
+            {
+                Console.WriteLine($"--- IllegalMoveEdges (count={s.IllegalMoveEdges}, showing up to {s.IllegalMoveEdgeSamples.Count}) ---");
+                foreach (var sample in s.IllegalMoveEdgeSamples.Take(15)) Console.WriteLine("  " + sample);
+            }
             foreach (var b in s.Buckets.Values)
             {
                 if (b.Mismatches.Count == 0) continue;
@@ -515,7 +520,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                     generatedAtUtc = DateTime.UtcNow.ToString("O"),
                     passed,
                     elapsedSeconds = Math.Round(elapsedSec, 2),
-                    replays = new { s.ReplaysAttempted, uniqueAttempted = eval.UniqueAttempted, s.DuplicateReplays, s.ReplaysVerified, s.SkippedNonPve, s.MissingMap, s.DownloadFailed, s.TruncatedOrCorrupt, s.ParseErrors, s.MissingPredictions, s.OutOfSupportPredictions, s.IllegalMoveEdges },
+                    replays = new { s.ReplaysAttempted, uniqueAttempted = eval.UniqueAttempted, s.DuplicateReplays, s.ReplaysVerified, s.SkippedNonPve, s.MissingMap, s.DownloadFailed, s.TruncatedOrCorrupt, s.ParseErrors, s.MissingPredictions, s.OutOfSupportPredictions, s.IllegalMoveEdges, illegalMoveEdgeSamples = s.IllegalMoveEdgeSamples.Take(15) },
                     gates = new
                     {
                         coverageGate = FormatGate(eval.CoverageGate),

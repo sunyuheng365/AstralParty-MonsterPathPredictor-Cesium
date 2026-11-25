@@ -385,13 +385,27 @@ namespace MonsterPathPredictor.ReplayCertifier
                     // on a loaded board layout MUST exist on that layout; otherwise fail GATE 0 integrity.
                     if (newNode >= 0 && board != null && !board.Contains(newNode))
                     {
-                        if (summary != null) summary.IllegalMoveEdges++;
+                        summary?.RecordIllegalMoveEdge($"{summary.RequestedReplayId} ApplyAttr.Place(fromSkillMove={fromSkillMove},cause={causeSkillId}) unit={target.Id}(m={target.IsMonster},h={target.HeroId}) {oldNode}->{newNode}");
                         continue;
                     }
 
                     bool tileChanged = newNode >= 0 && newNode != oldNode;
+                    int oldBack = target.BackNodeId;
                     if (newNode >= 0) target.NodeId = newNode;
                     target.BackNodeId = newBack;
+                    if (!target.IsMonster)
+                    {
+                        if (tileChanged && newBack < 0 && oldBack >= 0 && board != null && board.Contains(oldBack))
+                        {
+                            target.PreTeleportBackNodeId = oldBack;
+                            target.PreTeleportLandingNodeId = newNode;
+                        }
+                        else if (tileChanged || newBack >= 0)
+                        {
+                            target.PreTeleportBackNodeId = -1;
+                            target.PreTeleportLandingNodeId = -1;
+                        }
+                    }
                     if (tileChanged)
                     {
                         // Always replace FrontNodeIds on tile change (including empty []) so stale old-tile

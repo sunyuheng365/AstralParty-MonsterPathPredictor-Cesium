@@ -37,6 +37,8 @@ namespace MonsterPathPredictor.ReplayCertifier
             public int PendingSkillMoveLandId = -1;
             public int PendingSkillMovePushDirId = -1;
             public int PendingSkillMovePushFromId = -1;
+            public int PreTeleportBackNodeId = -1;
+            public int PreTeleportLandingNodeId = -1;
             public int TauntSkillId;
             public long BossTargetId;
             public bool WardenRevealed;
@@ -65,6 +67,7 @@ namespace MonsterPathPredictor.ReplayCertifier
             int curRound = 0;
             int turnStartLandId = -1;
             bool startedOnFork = false, stepped = false, foughtOnTile = false, foughtTurn = false, thiefStoleOnTile = false;
+            bool curTurnForceDir = false, playerSteppedThisTurn = false;
             bool bossTargetLockedTurn = false, bossTargetClearedTurn = false;
             int foughtTile = -1, foughtLayoutIdx = -1;
             int thiefStoleTile = -1, thiefStoleLayoutIdx = -1;
@@ -116,14 +119,15 @@ namespace MonsterPathPredictor.ReplayCertifier
                 }
             }
 
-            void ValidateUnitPlacement(UnitSim u)
+            int currentFrameIndex = -1;
+            void ValidateUnitPlacement(UnitSim u, string site)
             {
                 if (u == null || u.NodeId < 0 || board == null) return;
                 // Dead monsters (Hp <= 0) can linger in 1113 room.Monsters with old-layout tile IDs after a mid-match layout switch.
                 if (u.IsMonster && u.Hp <= 0) return;
                 if (!board.Contains(u.NodeId))
                 {
-                    summary.IllegalMoveEdges++;
+                    summary.RecordIllegalMoveEdge($"{replayId} map={mapId}[{mapIndex}] R{curRound} F{currentFrameIndex} {site} unit={u.Id}(m={u.IsMonster},h={u.HeroId},hp={u.Hp}) node={u.NodeId}");
                 }
             }
 
@@ -146,7 +150,12 @@ namespace MonsterPathPredictor.ReplayCertifier
                 startedOnFork = false;
                 pendingMoveEffects.Clear();
                 ClearTileScopedTurnFlags();
-                foreach (var pUnit in players.Values) pUnit.PendingDisplacementHops.Clear();
+                foreach (var pUnit in players.Values)
+                {
+                    pUnit.PendingDisplacementHops.Clear();
+                    pUnit.PreTeleportBackNodeId = -1;
+                    pUnit.PreTeleportLandingNodeId = -1;
+                }
                 foreach (var mUnit in monsters.Values)
                 {
                     mUnit.PendingDisplacementHops.Clear();
@@ -181,18 +190,18 @@ namespace MonsterPathPredictor.ReplayCertifier
                 bool preserveSameLayoutHops = preserveDisplacementHops && !layoutChanged;
                 if (!preserveSameLayoutEffects) pendingMoveEffects.Clear();
                 var prevPlayerDisp = new Dictionary<long, List<(int From, int To)>>();
+                var prevPlayerPreTeleport = new Dictionary<long, (int Back, int Landing)>();
                 var prevMonsterState = new Dictionary<long, (List<(int From, int To)> Hops, SkillMoveKind Kind, int Land, int PushDir, int PushFrom)>();
                 if (!layoutChanged)
                 {
                     // PendingDisplacementHops is turn-scoped (discarded on turn/round switches or layout switches),
-                    // whereas PendingSkillMove* persists into a pushed monster's upcoming turn on the same layout.
-                    if (preserveSameLayoutHops)
+                    // whereas PendingSkillMove* and PreTeleportBackNodeId persist on the same layout while standing on that tile.
+                    foreach (var kv in players)
                     {
-                        foreach (var kv in players)
-                        {
-                            if (kv.Value.PendingDisplacementHops.Count > 0)
-                                prevPlayerDisp[kv.Key] = new List<(int, int)>(kv.Value.PendingDisplacementHops);
-                        }
+                        if (preserveSameLayoutHops && kv.Value.PendingDisplacementHops.Count > 0)
+                            prevPlayerDisp[kv.Key] = new List<(int, int)>(kv.Value.PendingDisplacementHops);
+                        if (kv.Value.PreTeleportBackNodeId >= 0 && kv.Value.PreTeleportLandingNodeId >= 0)
+                            prevPlayerPreTeleport[kv.Key] = (kv.Value.PreTeleportBackNodeId, kv.Value.PreTeleportLandingNodeId);
                     }
                     foreach (var kv in monsters)
                     {
@@ -217,10 +226,15 @@ namespace MonsterPathPredictor.ReplayCertifier
                         if (p.Hero != null)
                         {
                             UnitSim u = BuildUnit(p, false);
-                            ValidateUnitPlacement(u);
+                            ValidateUnitPlacement(u, "SyncRoom.Player");
                             if (prevPlayerDisp.TryGetValue(u.Id, out var hops) && hops.Count > 0 && u.NodeId == hops[^1].To)
                             {
                                 u.PendingDisplacementHops.AddRange(hops);
+                            }
+                            if (prevPlayerPreTeleport.TryGetValue(u.Id, out var pt) && u.NodeId == pt.Landing && u.BackNodeId < 0)
+                            {
+                                u.PreTeleportBackNodeId = pt.Back;
+                                u.PreTeleportLandingNodeId = pt.Landing;
                             }
                             players[u.Id] = u;
                         }
@@ -234,7 +248,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                         if (m.Hero != null)
                         {
                             UnitSim u = BuildUnit(m, true);
-                            ValidateUnitPlacement(u);
+                            ValidateUnitPlacement(u, "SyncRoom.Monster");
                             if (prevMonsterState.TryGetValue(u.Id, out var ms))
                             {
                                 if (ms.Hops.Count > 0 && u.NodeId == ms.Hops[^1].To)
@@ -257,6 +271,7 @@ namespace MonsterPathPredictor.ReplayCertifier
 
             for (int fi = 0; fi < frames.Count && !unknownLayout && !decodeFailed && !parseError; fi++)
             {
+                currentFrameIndex = fi;
                 var (cmd, payload) = frames[fi];
                 bool isStateFrame = IsStateFrame(cmd);
                 if (payload.Length == 0)
@@ -379,6 +394,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                     if (!sameOngoingTurn)
                     {
                         stepped = foughtOnTile = foughtTurn = thiefStoleOnTile = false;
+                        curTurnForceDir = playerSteppedThisTurn = false;
                         bossTargetLockedTurn = bossTargetClearedTurn = false;
                         foughtTile = foughtLayoutIdx = thiefStoleTile = thiefStoleLayoutIdx = -1;
                         turnStartLandId = monsters.TryGetValue(curTurnActor, out var am) ? am.NodeId : -1;
@@ -437,7 +453,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                     if (mr.Monster?.Hero != null)
                     {
                         UnitSim u = BuildUnit(mr.Monster, true);
-                        ValidateUnitPlacement(u);
+                        ValidateUnitPlacement(u, "1018.MonsterRefresh");
                         monsters[u.Id] = u;
                         registeredRoomIds.Add(u.Id);
                         seenMonsters.Add(u.Id);
@@ -469,7 +485,9 @@ namespace MonsterPathPredictor.ReplayCertifier
                     if (monsters.TryGetValue(actorId, out var diceMonster)) diceMonster.PendingDisplacementHops.Clear();
                     // Always advance active turn context even when a player (non-monster) rolls dice.
                     curTurnActor = actorId;
-                    stepped = foughtTurn = false;
+                    stepped = foughtTurn = playerSteppedThisTurn = false;
+                    curTurnForceDir = false;
+                    try { curTurnForceDir = (bool)td.ForceDir; } catch { }
                     bossTargetLockedTurn = bossTargetClearedTurn = false;
                     ClearTileScopedTurnFlags();
                     if (monsters.TryGetValue(actorId, out var ma))
@@ -586,7 +604,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                         int nid = (int)mp.NodeId;
                         if (nid >= 0 && board != null && !board.Contains(nid))
                         {
-                            summary.IllegalMoveEdges++;
+                            summary.RecordIllegalMoveEdge($"{replayId} map={mapId}[{mapIndex}] R{curRound} F{fi} 5214.MonsterPursuit unit={targetUnit.Id}(m={targetUnit.IsMonster},h={targetUnit.HeroId}) node={nid}");
                             continue;
                         }
                         if (nid >= 0 && nid != targetUnit.NodeId)
@@ -652,7 +670,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                     dynamic mv = decoder.TryDecode("party.protocol.MoveS2C", payload);
                     if (mv == null) { decodeFailed = true; continue; }
                     if (!HandleMove(mv, replayId, mapId, curRound, fi, board, players, monsters, spawnedAtTile, pendingMoveEffects,
-                            curTurnActor, startedOnFork, turnStartLandId, ref stepped, ref foughtOnTile, foughtTurn, ref thiefStoleOnTile,
+                            curTurnActor, curTurnForceDir, ref playerSteppedThisTurn, startedOnFork, turnStartLandId, ref stepped, ref foughtOnTile, foughtTurn, ref thiefStoleOnTile,
                             ref bossTargetLockedTurn, bossTargetClearedTurn, mapStat, summary))
                     {
                         decodeFailed = true;

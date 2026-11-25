@@ -157,28 +157,27 @@ namespace MonsterPathPredictor.Core
         {
             if (m == null) return string.Empty;
             options = options ?? new PlanOptions();
+            int clampedSteps = Math.Max(0, Math.Min(60, options.MaxSteps));
             double normMinProb = options.MinBranchProbability > 0.0 ? options.MinBranchProbability : 0.0;
-            string mName = m.Name ?? string.Empty;
-            string mDisplay = m.DisplayName ?? string.Empty;
+            string displayName = !string.IsNullOrEmpty(m.DisplayName) ? m.DisplayName : (m.Name ?? string.Empty);
             var sb = new System.Text.StringBuilder(220);
             sb.Append(layoutGen).Append('|')
-              .Append(options.MaxSteps).Append(':')
+              .Append(clampedSteps).Append(':')
               .Append(options.SimulateCombatOnFork ? '1' : '0')
               .Append((int)options.PostCombatMode).Append(':')
               .Append(BitConverter.DoubleToInt64Bits(normMinProb)).Append('|')
               .Append(m.MonsterId).Append(':')
-              .Append(m.HeroId).Append(':')
-              .Append(mName.Length).Append(':').Append(mName).Append(':')
-              .Append(mDisplay.Length).Append(':').Append(mDisplay).Append(':')
+              .Append(displayName.Length).Append(':').Append(displayName).Append(':')
               .Append(m.IsNormalAggressive ? '1' : '0')
               .Append(m.IsThief ? '1' : '0')
               .Append(m.ChasesProblemStudent ? '1' : '0')
               .Append(m.ChasesMandarinDuckMark ? '1' : '0').Append(':')
               .Append(m.CurrentLandId).Append(':')
               .Append(m.FromLandId).Append(':')
-              .Append(m.CanStep).Append(':')
               .Append(m.TurnStartLandId).Append(':')
               .Append(m.IsCurrentlyMovingMidTurn ? '1' : '0')
+              .Append(m.HasStartedMovingThisTurn ? '1' : '0')
+              .Append(m.BossLockInferenceReady ? '1' : '0')
               .Append(m.JustFoughtOnCurrentFork ? '1' : '0')
               .Append(m.HasLaunchedFightThisTurn ? '1' : '0')
               .Append(m.JustSpawnedOnFork ? '1' : '0')
@@ -319,6 +318,9 @@ namespace MonsterPathPredictor.Core
                             {
                                 clearedMarkLandId = state.LandId;
                             }
+                            // Replay-verified on 82015 (1795593160172877 R10 F4138): fighting a player whose mark
+                            // ALREADY expired does NOT clear BossTargetId in multi-step lookahead; only fighting
+                            // a target currently carrying the priority mark clears bossTargetClearedNow.
                             if ((monster.ChasesProblemStudent || monster.ChasesMandarinDuckMark) &&
                                 AnyHasPriorityMark(monster, targetsHere))
                             {
@@ -379,7 +381,12 @@ namespace MonsterPathPredictor.Core
 
                     if (outcome.IsForkDecision)
                     {
-                        var recordedFork = RecordFork(board, forkMap, state.LandId, state.FromLandId, step, arrivalProb, arrivalLogProb, postCombatNow, clearedMarkLandId, bossTargetClearedNow, outcome);
+                        int forkIncomingLandId = (step == 0 &&
+                                                  monster.SkillMoveKind == SkillMoveKind.LinglingPush &&
+                                                  monster.SkillMovePushFromLandId >= 0)
+                            ? monster.SkillMovePushFromLandId
+                            : state.FromLandId;
+                        var recordedFork = RecordFork(board, forkMap, state.LandId, forkIncomingLandId, step, arrivalProb, arrivalLogProb, postCombatNow, clearedMarkLandId, bossTargetClearedNow, outcome);
                         stepForkHitCount++;
                         if (soleStepFork == null) soleStepFork = recordedFork;
                         else if (!ReferenceEquals(soleStepFork, recordedFork)) multipleStepForks = true;
@@ -446,14 +453,34 @@ namespace MonsterPathPredictor.Core
                 {
                     if (stepPositiveEdges.Count == 1)
                     {
-                        foreach (var soleEdge in stepPositiveEdges) edgeHasCertainStep.Add(soleEdge);
+                        foreach (var soleEdge in stepPositiveEdges)
+                        {
+                            edgeHasCertainStep.Add(soleEdge);
+                            // Canonicalize exact mathematical certainty to 1.0 so N-way reconvergence (e.g. 6 * 1/6)
+                            // never suffers floating-point 0.9999999999999999 drift in renderers/formatters.
+                            if (edgeMap.TryGetValue(soleEdge, out var certEdge))
+                            {
+                                certEdge.StepProbabilities[step] = 1.0;
+                                certEdge.Probability = 1.0;
+                            }
+                        }
                     }
                     if (stepPositiveTiles.Count == 1)
                     {
-                        foreach (var soleTile in stepPositiveTiles) tileStepHasCertainStep.Add(soleTile);
+                        foreach (var soleTile in stepPositiveTiles)
+                        {
+                            tileStepHasCertainStep.Add(soleTile);
+                            if (tileStepMap.TryGetValue(soleTile, out var certTile))
+                            {
+                                certTile.StepProbabilities[step + 1] = 1.0;
+                                certTile.Probability = 1.0;
+                            }
+                        }
                     }
                     if (!multipleStepForks && soleStepFork != null && stepActiveStateCount > 0 && stepForkHitCount == stepActiveStateCount)
                     {
+                        soleStepFork.ArrivalProbability = 1.0;
+                        soleStepFork.LogArrivalProbability = 0.0;
                         UpdateExitPositiveFlags(soleStepFork.Exits, arrivalIsCertain: true);
                     }
                 }
@@ -530,7 +557,7 @@ namespace MonsterPathPredictor.Core
                     IsDeadEnd = ep.Key.DeadEnd,
                     StoppedAtCombat = ep.Key.StoppedAtCombat,
                     IsAfterCombat = ep.Key.AfterCombat,
-                    Probability = Math.Min(1.0, ep.Value),
+                    Probability = multipleEndpointsOrPruned ? Math.Min(1.0, ep.Value) : 1.0,
                     HasNonCertainDominantSplit = multipleEndpointsOrPruned
                 });
 
@@ -646,6 +673,7 @@ namespace MonsterPathPredictor.Core
             //       still chase a CrimeNum == 0 taunter (1789211303827607 / 1789455248221734).
             if ((!monster.IsCurrentlyMovingMidTurn || (isFork && !monster.IsThief)) &&
                 !monster.JustFoughtOnCurrentFork && !monster.HasLaunchedFightThisTurn &&
+                monster.SkillMoveKind == SkillMoveKind.None &&
                 monster.IsTaunted && monster.TauntTargetPlayerId != 0 &&
                 TryDecideTauntStep(board, cur, isFork, monster.TauntTargetPlayerId, trackablePlayers, cache, out var tauntOutcome))
             {
@@ -1267,6 +1295,7 @@ namespace MonsterPathPredictor.Core
             double totalLogArrival = BoardGraph.LogAddExp(oldLogArrival, newLogArrival);
             pf.LogArrivalProbability = totalLogArrival;
 
+            int prevExitCount = pf.Exits.Count;
             var updatedExitIds = new HashSet<int>();
             for (int i = 0; i < outcome.Transitions.Count; i++)
             {
@@ -1317,11 +1346,37 @@ namespace MonsterPathPredictor.Core
                 }
             }
 
-            if (newTotalArrival > 0.0)
+            // Preserve IsExactUniformSplit ONLY when both pre-merge and incoming outcomes are exact-uniform
+            // over the EXACT SAME support set (compare original prevExitCount before mutation!).
+            pf.IsExactUniformSplit = pf.IsExactUniformSplit &&
+                                     outcome.IsExactUniformSplit &&
+                                     prevExitCount == pf.Exits.Count &&
+                                     updatedExitIds.Count == prevExitCount &&
+                                     outcome.Transitions.Count == prevExitCount;
+
+            if (pf.IsExactUniformSplit && pf.Exits.Count >= 2)
+            {
+                double uniformP = 1.0 / pf.Exits.Count;
+                for (int i = 0; i < pf.Exits.Count; i++)
+                {
+                    pf.Exits[i].ConditionalProbability = uniformP;
+                }
+            }
+            else if (newTotalArrival > 1e-300)
             {
                 for (int i = 0; i < pf.Exits.Count; i++)
                 {
-                    pf.Exits[i].ConditionalProbability = Math.Min(1.0, pf.Exits[i].CumulativeProbability / newTotalArrival);
+                    var ex = pf.Exits[i];
+                    // If linear cumulative product underflowed (or became subnormal) despite finite log mass,
+                    // derive conditional probability from the merged log probability so 50/50 never becomes 0%!
+                    if ((ex.CumulativeProbability <= 1e-300) && !double.IsNegativeInfinity(ex.LogConditionalProbability))
+                    {
+                        ex.ConditionalProbability = Math.Min(1.0, Math.Exp(ex.LogConditionalProbability));
+                    }
+                    else
+                    {
+                        ex.ConditionalProbability = Math.Min(1.0, ex.CumulativeProbability / newTotalArrival);
+                    }
                 }
             }
             else if (!double.IsNegativeInfinity(totalLogArrival))
@@ -1336,11 +1391,6 @@ namespace MonsterPathPredictor.Core
                 int lc = b.LogConditionalProbability.CompareTo(a.LogConditionalProbability);
                 return lc != 0 ? lc : b.ConditionalProbability.CompareTo(a.ConditionalProbability);
             });
-
-            pf.IsExactUniformSplit = pf.IsExactUniformSplit &&
-                                     outcome.IsExactUniformSplit &&
-                                     updatedExitIds.Count == pf.Exits.Count &&
-                                     outcome.Transitions.Count == pf.Exits.Count;
             UpdateExitPositiveFlags(pf.Exits, arrivalIsCertain: false);
 
             if (outcome.Reason != pf.ReasonKind || !string.Equals(outcome.SummaryLabel, pf.SummaryLabel, StringComparison.Ordinal))
@@ -1379,6 +1429,35 @@ namespace MonsterPathPredictor.Core
             }
 
             return pf;
+        }
+
+        internal static PredictedFork MergeForkOutcomesForTest(
+            BoardGraph board,
+            int forkLandId,
+            int incomingLandId,
+            (double ArrivalProb, double ArrivalLogProb, bool IsExactUniform, (int NextLandId, double Prob, double LogProb)[] Exits)[] arrivals)
+        {
+            var forkMap = new Dictionary<ForkRecordKey, PredictedFork>();
+            PredictedFork last = null;
+            for (int a = 0; a < arrivals.Length; a++)
+            {
+                var item = arrivals[a];
+                var transitions = new List<StepTransition>(item.Exits.Length);
+                for (int i = 0; i < item.Exits.Length; i++)
+                {
+                    transitions.Add(new StepTransition(item.Exits[i].NextLandId, item.Exits[i].Prob, item.Exits[i].LogProb));
+                }
+                var outcome = new StepOutcome
+                {
+                    Transitions = transitions,
+                    IsForkDecision = true,
+                    Reason = ForkReasonKind.MidForkNoTargetFallback,
+                    SummaryLabel = "test",
+                    IsExactUniformSplit = item.IsExactUniform
+                };
+                last = RecordFork(board, forkMap, forkLandId, incomingLandId, stepIndex: 1, item.ArrivalProb, item.ArrivalLogProb, false, -1, false, outcome);
+            }
+            return last;
         }
 
         private static bool TryDecideTauntStep(
@@ -1614,8 +1693,18 @@ namespace MonsterPathPredictor.Core
             if (monster == null || monster.BossTargetClearedThisTurn) return 0;
             if (!monster.ChasesProblemStudent && !monster.ChasesMandarinDuckMark) return 0;
 
-            // Mid-turn: once the server has locked BossTargetId, honor it directly until cleared by fighting it.
-            if (monster.IsCurrentlyMovingMidTurn && monster.BossTargetPlayerId != 0)
+            bool isMidTurnContext = monster.IsCurrentlyMovingMidTurn || monster.HasStartedMovingThisTurn;
+
+            // Mid-turn (including paused mid-turn right after fork combat): once the server or turn-start
+            // lock established BossTargetId, honor it directly until cleared by fighting it.
+            if (isMidTurnContext && monster.BossTargetPlayerId != 0)
+            {
+                return monster.BossTargetPlayerId;
+            }
+
+            // Do not bypass the live tracker's position/turn-start readiness gate, and do not re-infer
+            // a brand-new marked target mid-turn right after fighting an unmarked target on a fork.
+            if (!monster.BossLockInferenceReady || (monster.HasStartedMovingThisTurn && monster.JustFoughtOnCurrentFork))
             {
                 return monster.BossTargetPlayerId;
             }
@@ -1624,7 +1713,7 @@ namespace MonsterPathPredictor.Core
             // outside the monster's turn-start tile; if none exists, retain any previously locked BossTargetPlayerId
             // (which persists across turns for mid-walk forks even after mark expiration or target death,
             // while NOT overriding turn-start Front/ForkStart Red>Blue).
-            int excludedTurnStartLand = ResolveExcludedTurnStartLandId(monster, isMidTurn: monster.IsCurrentlyMovingMidTurn);
+            int excludedTurnStartLand = ResolveExcludedTurnStartLandId(monster, isMidTurn: isMidTurnContext);
             var marked = GetPriorityMarkedPlayers(monster, activePlayers, clearedMarkLandId: -1, excludedTurnStartLandId: excludedTurnStartLand);
             if (marked.Count > 0)
             {
@@ -1653,7 +1742,7 @@ namespace MonsterPathPredictor.Core
                 }
                 if (bestTarget != null)
                 {
-                    freshMarkedAtTurnStart = !monster.IsCurrentlyMovingMidTurn;
+                    freshMarkedAtTurnStart = !isMidTurnContext && !monster.JustFoughtOnCurrentFork;
                     return bestTarget.PlayerId;
                 }
             }
@@ -1739,6 +1828,16 @@ namespace MonsterPathPredictor.Core
                 IsExactUniformSplit = isExactUniform
             };
             return true;
+        }
+
+        private static bool AnyHasPlayerId(List<TrackedPlayer> targets, long playerId)
+        {
+            if (playerId == 0 || targets == null) return false;
+            for (int i = 0; i < targets.Count; i++)
+            {
+                if (targets[i].PlayerId == playerId) return true;
+            }
+            return false;
         }
 
         private static bool AnyHasPriorityMark(MonsterState monster, List<TrackedPlayer> targets)

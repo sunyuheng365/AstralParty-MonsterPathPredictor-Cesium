@@ -228,6 +228,7 @@ namespace MonsterPathPredictor.Core
     /// </summary>
     public interface IConfigStore
     {
+        long StoreRevision { get; }
         bool Has(string key);
         bool GetBool(string key, bool defaultValue);
         int GetInt(string key, int defaultValue);
@@ -240,6 +241,7 @@ namespace MonsterPathPredictor.Core
         bool ReloadIfChanged();
         bool Save();
         bool SaveIfDirty();
+        bool TrySaveIfRevisionMatches(long expectedRevision, out bool revisionConflict);
     }
 
     /// <summary>
@@ -296,7 +298,8 @@ namespace MonsterPathPredictor.Core
             bool isInitial,
             Func<string, string> normalizeHotkeyOrNull,
             Action<IConfigStore, string> applyDefaultsAndDocs,
-            out bool saveOk)
+            out bool saveOk,
+            PredictorSettings fallbackOnError = null)
         {
             var settings = new PredictorSettings();
             if (store == null)
@@ -306,76 +309,45 @@ namespace MonsterPathPredictor.Core
                 return settings;
             }
 
-            saveOk = true;
-            bool migrated = ApplyMigrationsIfNeeded(store, normalizeHotkeyOrNull);
-            if (migrated) _pendingMigrationSave = true;
-
-            string rawClearBefore = store.GetString("clearHotkey", "Escape");
-            string rawPickerBefore = store.Has("pickerHotkey") ? store.GetString("pickerHotkey", "") : null;
-            ConfigMigrationLogic.ResolveEffectiveHotkeys(
-                rawClearBefore,
-                rawPickerBefore,
-                normalizeHotkeyOrNull,
-                out _,
-                out _,
-                out string pickerDefault);
-
-            if (isInitial)
+            try
             {
-                applyDefaultsAndDocs?.Invoke(store, pickerDefault);
-            }
+                saveOk = true;
+                bool migrated = ApplyMigrationsIfNeeded(store, normalizeHotkeyOrNull);
+                if (migrated) _pendingMigrationSave = true;
 
-            settings.Enabled = store.GetBool("enabled", settings.Enabled);
-            settings.PreviewSteps = store.GetInt("previewSteps", settings.PreviewSteps);
-            settings.DashLength = store.GetFloat("dashLength", settings.DashLength);
-            settings.GapLength = store.GetFloat("gapLength", settings.GapLength);
-            settings.DashSpeed = store.GetFloat("dashSpeed", settings.DashSpeed);
-            settings.LineWidth = store.GetFloat("lineWidth", settings.LineWidth);
-            settings.HeightOffset = store.GetFloat("heightOffset", settings.HeightOffset);
-            settings.FontSize = store.GetInt("fontSize", settings.FontSize);
-            settings.ClickRadius = store.GetFloat("clickRadius", settings.ClickRadius);
-            settings.ClearOnEmptyClick = store.GetBool("clearOnEmptyClick", settings.ClearOnEmptyClick);
-            settings.ShowReasonTag = store.GetBool("showReasonTag", settings.ShowReasonTag);
-            settings.ShowStepNumbers = store.GetBool("showStepNumbers", settings.ShowStepNumbers);
-            settings.ShowDeterministicPercent = store.GetBool("showDeterministicPercent", settings.ShowDeterministicPercent);
-            settings.SimulateCombatOnFork = store.GetBool("simulateCombatOnFork", settings.SimulateCombatOnFork);
-            settings.PostCombatMode = PredictorSettings.ParsePostCombatMode(store.GetString("postCombatMode", "continue"));
-            settings.AllowNonAggressiveMonsters = store.GetBool("allowNonAggressiveMonsters", settings.AllowNonAggressiveMonsters);
-            ConfigMigrationLogic.ResolveEffectiveHotkeys(
-                store.GetString("clearHotkey", settings.ClearHotkey),
-                store.Has("pickerHotkey") ? store.GetString("pickerHotkey", "") : null,
-                normalizeHotkeyOrNull,
-                out string effectiveClear,
-                out string effectivePicker,
-                out _);
-            settings.ClearHotkey = effectiveClear;
-            settings.PickerHotkey = effectivePicker;
-            settings.ClosePickerOnSelect = store.GetBool("closePickerOnSelect", settings.ClosePickerOnSelect);
-            settings.ExcludedPlayerBuffIds = PredictorSettings.ParseIdCsv(store.GetString("excludedPlayerBuffIds", ""));
-            settings.DeterministicColorHex = store.GetString("deterministicColor", settings.DeterministicColorHex);
-            settings.MajorBranchColorHex = store.GetString("majorBranchColor", settings.MajorBranchColorHex);
-            settings.MinorBranchColorHex = store.GetString("minorBranchColor", settings.MinorBranchColorHex);
-            settings.PostCombatColorHex = store.GetString("postCombatColor", settings.PostCombatColorHex);
-            settings.GuideRedColorHex = store.GetString("guideRedColor", settings.GuideRedColorHex);
-            settings.GuideBlueColorHex = store.GetString("guideBlueColor", settings.GuideBlueColorHex);
+                string rawClearBefore = store.GetString("clearHotkey", "Escape");
+                string rawPickerBefore = store.Has("pickerHotkey") ? store.GetString("pickerHotkey", "") : null;
+                ConfigMigrationLogic.ResolveEffectiveHotkeys(
+                    rawClearBefore,
+                    rawPickerBefore,
+                    normalizeHotkeyOrNull,
+                    out _,
+                    out _,
+                    out string pickerDefault);
 
-            settings.ClampInPlace();
+                if (isInitial)
+                {
+                    applyDefaultsAndDocs?.Invoke(store, pickerDefault);
+                }
 
-            if (isInitial || migrated || _pendingMigrationSave)
-            {
-                try
+                settings = ReadSettingsOnly(store, normalizeHotkeyOrNull);
+
+                if (isInitial || migrated || _pendingMigrationSave)
                 {
                     saveOk = _pendingMigrationSave ? store.Save() : store.SaveIfDirty();
                     _pendingMigrationSave = !saveOk;
                 }
-                catch
-                {
-                    saveOk = false;
-                    _pendingMigrationSave = true;
-                }
-            }
 
-            return settings;
+                return settings;
+            }
+            catch
+            {
+                saveOk = false;
+                _pendingMigrationSave = true;
+                var safe = fallbackOnError != null ? fallbackOnError.Clone() : new PredictorSettings();
+                safe.ClampInPlace();
+                return safe;
+            }
         }
 
         public bool SaveStylePatch(
@@ -387,38 +359,48 @@ namespace MonsterPathPredictor.Core
             mergedFromDisk = null;
             if (store == null) return false;
 
+            const int MaxCommitAttempts = 3;
             try
             {
-                // Always pick up any external edits on disk before applying the narrow pending patch
-                // so unrelated keys (e.g. previewSteps, clickRadius, hotkeys) are never overwritten.
-                if (store.ReloadIfChanged())
+                for (int attempt = 0; attempt < MaxCommitAttempts; attempt++)
                 {
-                    bool migrated = ApplyMigrationsIfNeeded(store, normalizeHotkeyOrNull);
-                    if (migrated) _pendingMigrationSave = true;
-                    mergedFromDisk = ReadSettingsOnly(store, normalizeHotkeyOrNull);
-                    patch?.ApplyTo(mergedFromDisk);
-                }
-
-                bool dirty = false;
-                if (patch != null && patch.HasPending)
-                {
-                    foreach (var kv in patch.Entries)
+                    if (store.ReloadIfChanged() || attempt > 0)
                     {
-                        if (kv.Value is int iv) { store.Set(kv.Key, iv); dirty = true; }
-                        else if (kv.Value is float fv) { store.Set(kv.Key, fv); dirty = true; }
-                        else if (kv.Value is bool bv) { store.Set(kv.Key, bv); dirty = true; }
-                        else if (kv.Value is string sv) { store.Set(kv.Key, sv); dirty = true; }
+                        bool migrated = ApplyMigrationsIfNeeded(store, normalizeHotkeyOrNull);
+                        if (migrated) _pendingMigrationSave = true;
+                        mergedFromDisk = ReadSettingsOnly(store, normalizeHotkeyOrNull);
+                        patch?.ApplyTo(mergedFromDisk);
                     }
-                }
 
-                if (!dirty && !_pendingMigrationSave) return true;
-                bool ok = store.Save();
-                if (ok)
-                {
-                    _pendingMigrationSave = false;
-                    patch?.Clear();
+                    long expectedRev = store.StoreRevision;
+                    bool dirty = false;
+                    if (patch != null && patch.HasPending)
+                    {
+                        foreach (var kv in patch.Entries)
+                        {
+                            if (kv.Value is int iv) { store.Set(kv.Key, iv); dirty = true; }
+                            else if (kv.Value is float fv) { store.Set(kv.Key, fv); dirty = true; }
+                            else if (kv.Value is bool bv) { store.Set(kv.Key, bv); dirty = true; }
+                            else if (kv.Value is string sv) { store.Set(kv.Key, sv); dirty = true; }
+                        }
+                    }
+
+                    if (!dirty && !_pendingMigrationSave) return true;
+
+                    bool ok = store.TrySaveIfRevisionMatches(expectedRev, out bool conflict);
+                    if (ok)
+                    {
+                        _pendingMigrationSave = false;
+                        patch?.Clear();
+                        return true;
+                    }
+                    if (!conflict)
+                    {
+                        return false;
+                    }
+                    // Concurrent external edit landed between reload and commit: reload and retry cleanly.
                 }
-                return ok;
+                return false;
             }
             catch
             {
@@ -466,6 +448,8 @@ namespace MonsterPathPredictor.Core
             bool isFullReset,
             Func<string, string> normalizeHotkeyOrNull)
         {
+            // Never report a successful mutation with a null patch: allocate a local patch if caller omitted one.
+            var effectivePatch = pendingPatch ?? new StylePendingPatch();
             var working = (currentSettings ?? new PredictorSettings()).Clone();
             bool externalChanged = false;
             bool reloadFailed = false;
@@ -479,7 +463,7 @@ namespace MonsterPathPredictor.Core
                         bool migrated = ApplyMigrationsIfNeeded(store, normalizeHotkeyOrNull);
                         if (migrated) _pendingMigrationSave = true;
                         var reloaded = ReadSettingsOnly(store, normalizeHotkeyOrNull);
-                        pendingPatch?.ApplyTo(reloaded);
+                        effectivePatch.ApplyTo(reloaded);
                         externalChanged = !reloaded.PlanInputsEqual(working) || !reloaded.StyleSettingsEqual(working);
                         working = reloaded;
                     }
@@ -498,14 +482,14 @@ namespace MonsterPathPredictor.Core
             bool planInputsChanged = externalChanged || !working.PlanInputsEqual(before);
             if (isFullReset)
             {
-                pendingPatch?.RecordAllStyleKeys(working);
+                effectivePatch.RecordAllStyleKeys(working);
             }
             else if (styleChanged)
             {
-                pendingPatch?.RecordDiff(before, working);
+                effectivePatch.RecordDiff(before, working);
             }
 
-            bool shouldPersist = isFullReset || styleChanged || (pendingPatch != null && pendingPatch.HasPending) || _pendingMigrationSave;
+            bool shouldPersist = isFullReset || styleChanged || effectivePatch.HasPending || _pendingMigrationSave;
             if (!shouldPersist)
             {
                 return new StylePersistOutcome(working, styleChanged, planInputsChanged, externalChanged, reloadFailed, saveAttempted: false, saveOk: true);
@@ -516,7 +500,7 @@ namespace MonsterPathPredictor.Core
                 return new StylePersistOutcome(working, styleChanged, planInputsChanged, externalChanged, reloadFailed, saveAttempted: true, saveOk: false);
             }
 
-            bool saved = SaveStylePatch(store, pendingPatch, normalizeHotkeyOrNull, out var mergedDisk);
+            bool saved = SaveStylePatch(store, effectivePatch, normalizeHotkeyOrNull, out var mergedDisk);
             if (mergedDisk != null)
             {
                 if (!mergedDisk.PlanInputsEqual(working)) planInputsChanged = true;

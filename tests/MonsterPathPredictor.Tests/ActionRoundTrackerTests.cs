@@ -336,5 +336,37 @@ namespace MonsterPathPredictor.Tests
             tracker.ReconcileServerActionEnd(101, serverActionEnd: false, currentRound: 9);
             Assert.False(tracker.HasActedThisRound(101));
         }
+
+        [Fact]
+        public void SeedInitialServerActionEndRespectsProvisionalRoundAndLatchesActiveConfirmation()
+        {
+            var aliveMonsters = new HashSet<long> { 101, 102, 103 };
+            var tracker = new ActionRoundTracker();
+
+            // Enter provisional Round 8 while Room.Round still reads 7:
+            tracker.ObserveWithOwnedRolls(true, 102, 7, 1, aliveMonsters.Contains, _ => false);
+            tracker.ObserveWithOwnedRolls(true, 101, 7, 1, aliveMonsters.Contains, _ => false, isEarlierRoundPriorityThanPrevious: true);
+            Assert.True(tracker.IsProvisionalNextRoundActive);
+            Assert.Equal(8, tracker.EffectiveRoundNumber);
+
+            // Newly discovered inactive monster 103 carries stale Round-7 ActionEnd=true during provisional Round 8:
+            // must NOT be promoted into provisional Round 8's acted set!
+            tracker.SeedInitialServerActionEnd(103, serverActionEnd: true, currentRound: 7);
+            Assert.False(tracker.HasActedThisRound(103));
+            // Even when Room.Round ticks to 8 and 103 still reads ActionEnd=true, it stays un-acted until false->true!
+            tracker.ObserveWithOwnedRolls(true, 101, 8, 0, aliveMonsters.Contains, _ => false);
+            tracker.ReconcileServerActionEnd(103, serverActionEnd: true, currentRound: 8);
+            Assert.False(tracker.HasActedThisRound(103));
+
+            // Newly discovered ACTIVE monster 101 seeded with ActionEnd=true in Round 8, then actor switches to 102,
+            // then server explicitly resets 101 to ActionEnd=false: must clear inferred completion cleanly!
+            var tActive = new ActionRoundTracker();
+            tActive.ObserveWithOwnedRolls(true, 101, 8, 1, aliveMonsters.Contains, _ => false);
+            tActive.SeedInitialServerActionEnd(101, serverActionEnd: true, currentRound: 8);
+            tActive.ObserveWithOwnedRolls(true, 102, 8, 1, aliveMonsters.Contains, _ => false);
+            Assert.True(tActive.HasActedThisRound(101));
+            tActive.ReconcileServerActionEnd(101, serverActionEnd: false, currentRound: 8);
+            Assert.False(tActive.HasActedThisRound(101));
+        }
     }
 }

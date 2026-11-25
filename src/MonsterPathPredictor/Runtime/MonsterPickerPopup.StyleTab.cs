@@ -503,6 +503,17 @@ namespace MonsterPathPredictor.Runtime
             minus.SetXY(geo.MinusX, geo.MinusY);
             row.AddChild(minus);
 
+            string displayVal;
+            if (!geo.ShowLabel)
+            {
+                // Extreme compact row (<18px tall): prefix 1-char setting identifier onto value so all 6 settings remain distinguishable!
+                string tagPrefix = !string.IsNullOrEmpty(shortLabel) ? shortLabel.Substring(0, 1) : string.Empty;
+                displayVal = tagPrefix + shortValueText;
+            }
+            else
+            {
+                displayVal = geo.ValW < 34f ? shortValueText : valueText;
+            }
             var val = new GTextField
             {
                 touchable = false,
@@ -511,7 +522,7 @@ namespace MonsterPathPredictor.Runtime
                 align = AlignType.Center,
                 verticalAlign = VertAlignType.Middle,
                 textFormat = new TextFormat { size = valFont, bold = true, color = AccentGold },
-                text = geo.ValW < 34f ? shortValueText : valueText
+                text = displayVal
             };
             val.SetXY(geo.ValX, geo.ValY);
             val.SetSize(geo.ValW, geo.ValH);

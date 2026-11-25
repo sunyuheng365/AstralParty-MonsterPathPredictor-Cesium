@@ -158,6 +158,14 @@ namespace MonsterPathPredictor.Core
             if (!board.TryGetNode(targetLandId, out var node) || node.Disabled) return false;
 
             bool hadOverride = _overrides.TryGetValue(playerId, out int existingOverride);
+            // If a redundant override already matches the player's current live tile, clicking that live tile
+            // clears the override cleanly so the player unpins instead of staying stuck if they later move away.
+            if (hadOverride && targetLandId == liveLandId && existingOverride == targetLandId)
+            {
+                _overrides.Remove(playerId);
+                return true;
+            }
+
             int currentLand = hadOverride ? existingOverride : liveLandId;
             if (currentLand == targetLandId) return false;
 

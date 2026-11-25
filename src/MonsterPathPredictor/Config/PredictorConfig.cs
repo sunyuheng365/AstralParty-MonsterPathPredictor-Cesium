@@ -12,7 +12,9 @@ namespace MonsterPathPredictor.Config
         private sealed class ModConfigStoreAdapter : IConfigStore
         {
             private readonly ModConfig _cfg;
+            private long _rev;
             public ModConfigStoreAdapter(ModConfig cfg) { _cfg = cfg; }
+            public long StoreRevision => _rev;
             public bool Has(string key) => _cfg.Has(key);
             public bool GetBool(string key, bool defaultValue) => _cfg.GetBool(key, defaultValue);
             public int GetInt(string key, int defaultValue) => _cfg.GetInt(key, defaultValue);
@@ -22,9 +24,40 @@ namespace MonsterPathPredictor.Config
             public void Set(string key, int value) => _cfg.Set(key, value);
             public void Set(string key, float value) => _cfg.Set(key, value);
             public void Set(string key, string value) => _cfg.Set(key, value);
-            public bool ReloadIfChanged() => _cfg.ReloadIfChanged();
-            public bool Save() => _cfg.Save();
-            public bool SaveIfDirty() => _cfg.SaveIfDirty();
+            public bool ReloadIfChanged()
+            {
+                bool changed = _cfg.ReloadIfChanged();
+                if (changed) _rev++;
+                return changed;
+            }
+            public bool Save()
+            {
+                bool ok = _cfg.Save();
+                if (ok) _rev++;
+                return ok;
+            }
+            public bool SaveIfDirty()
+            {
+                bool ok = _cfg.SaveIfDirty();
+                if (ok) _rev++;
+                return ok;
+            }
+            public bool TrySaveIfRevisionMatches(long expectedRevision, out bool revisionConflict)
+            {
+                revisionConflict = false;
+                if (expectedRevision != _rev)
+                {
+                    revisionConflict = true;
+                    return false;
+                }
+                if (_cfg.ReloadIfChanged())
+                {
+                    _rev++;
+                    revisionConflict = true;
+                    return false;
+                }
+                return Save();
+            }
         }
 
         public static bool HasPendingMigrationSave => Coordinator.HasPendingMigrationSave;
@@ -46,10 +79,10 @@ namespace MonsterPathPredictor.Config
 
         public static PredictorSettings Load(ModConfig config, bool isInitial)
         {
-            return Load(config, isInitial, out _);
+            return Load(config, isInitial, out _, fallbackOnError: null);
         }
 
-        public static PredictorSettings Load(ModConfig config, bool isInitial, out bool saveOk)
+        public static PredictorSettings Load(ModConfig config, bool isInitial, out bool saveOk, PredictorSettings fallbackOnError = null)
         {
             IConfigStore store = config != null ? new ModConfigStoreAdapter(config) : null;
             return Coordinator.Load(
@@ -57,7 +90,8 @@ namespace MonsterPathPredictor.Config
                 isInitial,
                 NormalizeHotkeyOrNull,
                 (s, pickerDefault) => ApplyDefaultsAndDocs(config, pickerDefault),
-                out saveOk);
+                out saveOk,
+                fallbackOnError);
         }
 
         public static ConfigPersistenceCoordinator.StylePersistOutcome ApplyStyleMutationAndPersist(

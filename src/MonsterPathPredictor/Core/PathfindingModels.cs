@@ -93,6 +93,10 @@ namespace MonsterPathPredictor.Core
         public int CanStep { get; set; }
 
         public bool IsCurrentlyMovingMidTurn { get; set; }
+        /// <summary>True when the monster has already moved or taken mid-turn action during this turn (distinguishes turn-start from post-combat fork pause).</summary>
+        public bool HasStartedMovingThisTurn { get; set; }
+        /// <summary>False when live player positions or turn-start anchor are not yet confirmed, preventing premature planner boss-lock inference.</summary>
+        public bool BossLockInferenceReady { get; set; } = true;
         /// <summary>Tile where the monster started its current turn (-1 if unknown / turn has not started yet).</summary>
         public int TurnStartLandId { get; set; } = -1;
         public bool JustFoughtOnCurrentFork { get; set; }

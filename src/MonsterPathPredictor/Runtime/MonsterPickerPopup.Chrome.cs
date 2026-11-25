@@ -12,7 +12,17 @@ namespace MonsterPathPredictor.Runtime
         private void EnsureCreated()
         {
             if (_root != null && !_root.isDisposed && _root.parent == GRoot.inst && _footerHost != null && !_footerHost.isDisposed)
+            {
+                if (Stage.inst != _hookedStage)
+                {
+                    try { if (_hookedStage != null) _hookedStage.onTouchEnd.Remove(OnStageTouchEnd); } catch { }
+                    _hookedStage = Stage.inst;
+                    if (_hookedStage != null) _hookedStage.onTouchEnd.Add(OnStageTouchEnd);
+                    _activePopupTouchIds.Clear();
+                    _mouseOriginatedTouchIds.Clear();
+                }
                 return;
+            }
             Dispose();
             if (GRoot.inst == null) return;
 
@@ -123,7 +133,26 @@ namespace MonsterPathPredictor.Runtime
             _plusBtn = CreateMiniButton("+", 26f, 24f, () => StepsDeltaRequested?.Invoke(1));
             _footerHost.AddChild(_plusBtn);
 
-            _clearBtn = CreateMiniButton("清除预览", 76f, 24f, () => ClearRequested?.Invoke());
+            _clearBtn = CreateMiniButton("清除预览", 76f, 24f, () =>
+            {
+                if (_clearPressCaptured)
+                {
+                    _clearPressCaptured = false;
+                    ClearRequested?.Invoke(_clearPressSelectedMonsterId, _clearPressHadVirtualState, _clearPressMatchGen, _clearPressLayoutGen);
+                }
+                else
+                {
+                    ClearRequested?.Invoke(_currentSelectedMonsterId, _currentHadVirtualState, _currentMatchGen, _currentLayoutGen);
+                }
+            });
+            _clearBtn.onTouchBegin.Add(_ =>
+            {
+                _clearPressSelectedMonsterId = _currentSelectedMonsterId;
+                _clearPressHadVirtualState = _currentHadVirtualState;
+                _clearPressMatchGen = _currentMatchGen;
+                _clearPressLayoutGen = _currentLayoutGen;
+                _clearPressCaptured = true;
+            });
             _footerHost.AddChild(_clearBtn);
 
             _root.AddChild(_footerHost);
@@ -365,9 +394,19 @@ namespace MonsterPathPredictor.Runtime
             PopupPagination.ClampChildVertical(layout.FooterH, (layout.FooterH - 20f) * 0.5f, Math.Min(22f, layout.FooterH), out float sLblY, out float sLblH);
             _stepsLabel.SetXY(stepsX, sLblY);
             _stepsLabel.SetSize(stepsW, sLblH);
+            var stepsFmt = _stepsLabel.textFormat;
+            stepsFmt.size = (stepsW < 24f || sLblH < 14f) ? Math.Max(8, Math.Min(10, (int)Math.Max(8f, sLblH - 1f))) : 14;
+            _stepsLabel.textFormat = stepsFmt;
             ResizeMiniButton(_plusBtn, stepBtnW, fBtnH);
             _plusBtn.SetXY(plusX, fBtnY);
             ResizeMiniButton(_clearBtn, clearW, fBtnH);
+            if (_clearBtn != null && !_clearBtn.isDisposed && _clearBtn.numChildren >= 2 && _clearBtn.GetChildAt(1) is GTextField clearTf)
+            {
+                clearTf.text = clearW < 26f ? "×" : (clearW < 52f ? "清除" : "清除预览");
+                var cf = clearTf.textFormat;
+                cf.size = (clearW < 26f || fBtnH < 14f) ? Math.Max(8, Math.Min(10, (int)Math.Max(8f, fBtnH - 1f))) : 13;
+                clearTf.textFormat = cf;
+            }
             _clearBtn.SetXY(clearX, fBtnY);
         }
 

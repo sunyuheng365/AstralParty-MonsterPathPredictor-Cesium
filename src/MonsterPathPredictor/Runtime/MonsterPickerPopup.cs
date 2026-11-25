@@ -82,6 +82,14 @@ namespace MonsterPathPredictor.Runtime
         private Stage _hookedStage;
         private bool _hasRenderedContent;
         private int _currentMatchGen;
+        private int _currentLayoutGen;
+        private long _currentSelectedMonsterId;
+        private bool _currentHadVirtualState;
+        private bool _clearPressCaptured;
+        private long _clearPressSelectedMonsterId;
+        private bool _clearPressHadVirtualState;
+        private int _clearPressMatchGen;
+        private int _clearPressLayoutGen;
         private int _popupLocalRevision;
         private int _lastRefreshDataRev = -1;
         private int _lastRefreshLocalRev = -1;
@@ -112,12 +120,13 @@ namespace MonsterPathPredictor.Runtime
         {
             _activePopupTouchIds.Clear();
             _mouseOriginatedTouchIds.Clear();
+            _clearPressCaptured = false;
             _popupLocalRevision++;
             _lastSignature = string.Empty;
         }
 
         public event Action<long, int> MonsterSelected;
-        public event Action ClearRequested;
+        public event Action<long, bool, int, int> ClearRequested;
         public event Action<int> StepsDeltaRequested;
 
         public event Action<long, int, int> VirtualPlayerSelected;
@@ -223,6 +232,9 @@ namespace MonsterPathPredictor.Runtime
             if (_root == null || _root.isDisposed) return;
 
             _currentMatchGen = matchGeneration;
+            _currentLayoutGen = sandbox != null ? sandbox.LayoutGeneration : 0;
+            _currentSelectedMonsterId = selectedMonsterId;
+            _currentHadVirtualState = sandbox != null && sandbox.HasAnyState;
 
             float stageWidth = GRoot.inst != null && GRoot.inst.width > 0f ? GRoot.inst.width : PanelWidth;
             float stageHeight = GRoot.inst != null && GRoot.inst.height > 0f ? GRoot.inst.height : 720f;
@@ -326,8 +338,8 @@ namespace MonsterPathPredictor.Runtime
 
             bool showPager = totalPages > 1;
 
-            _titleText.text = "怪物寻路 [" + settings.PickerHotkey + "]";
-            _stepsLabel.text = "延伸 " + settings.PreviewSteps + " 格";
+            _titleText.text = panelW < 100f ? settings.PickerHotkey : ("怪物寻路 [" + settings.PickerHotkey + "]");
+            _stepsLabel.text = panelW < 100f ? settings.PreviewSteps.ToString() : (panelW < 180f ? (settings.PreviewSteps + "格") : ("延伸 " + settings.PreviewSteps + " 格"));
             ApplyChromeLayout(layout, panelW, padX, sandbox != null ? sandbox.OverrideCount : 0);
 
             _contentHost.RemoveChildren(0, -1, true);
@@ -437,8 +449,9 @@ namespace MonsterPathPredictor.Runtime
             if (_activePopupTouchIds.Count == 0) return;
             if (ctx == null || ctx.inputEvent == null)
             {
-                _activePopupTouchIds.Clear();
-                _mouseOriginatedTouchIds.Clear();
+                // Unidentified end event: reconcile against live Stage.touchCount instead of blindly
+                // wiping other still-held fingers!
+                ReconcileActiveTouchesWithStage();
                 return;
             }
             int tid = ctx.inputEvent.touchId;
@@ -446,35 +459,48 @@ namespace MonsterPathPredictor.Runtime
             _mouseOriginatedTouchIds.Remove(tid);
         }
 
+        private void ReconcileActiveTouchesWithStage()
+        {
+            try
+            {
+                bool mouseHeld = InputService.IsMouseButtonHeld(0) || InputService.IsMouseButtonPressed(0);
+                if (!mouseHeld && _mouseOriginatedTouchIds.Count > 0)
+                {
+                    foreach (int mid in _mouseOriginatedTouchIds) _activePopupTouchIds.Remove(mid);
+                    _mouseOriginatedTouchIds.Clear();
+                }
+                if (Stage.inst != null && Stage.inst.touchCount == 0 && !mouseHeld)
+                {
+                    _activePopupTouchIds.Clear();
+                    _mouseOriginatedTouchIds.Clear();
+                }
+            }
+            catch { }
+        }
+
         private bool IsPopupPressActive()
         {
-            if (_root == null || _root.isDisposed || !_root.visible ||
-                (_hookedStage != null && Stage.inst != _hookedStage))
+            if (_root == null || _root.isDisposed || !_root.visible)
             {
                 _activePopupTouchIds.Clear();
                 _mouseOriginatedTouchIds.Clear();
                 return false;
             }
-
-            if (_mouseOriginatedTouchIds.Count > 0)
+            if (_hookedStage != null && Stage.inst != _hookedStage)
             {
-                // Auto-recover mouse-originated presses if focus loss dropped Stage.onTouchEnd,
-                // without ever clearing concurrent non-mouse finger touches.
-                try
-                {
-                    if (!InputService.IsMouseButtonHeld(0) && !InputService.IsMouseButtonPressed(0))
-                    {
-                        foreach (int mid in _mouseOriginatedTouchIds)
-                        {
-                            _activePopupTouchIds.Remove(mid);
-                        }
-                        _mouseOriginatedTouchIds.Clear();
-                    }
-                }
-                catch { }
+                try { _hookedStage.onTouchEnd.Remove(OnStageTouchEnd); } catch { }
+                _hookedStage = Stage.inst;
+                if (_hookedStage != null) _hookedStage.onTouchEnd.Add(OnStageTouchEnd);
+                _activePopupTouchIds.Clear();
+                _mouseOriginatedTouchIds.Clear();
+                return false;
             }
 
-            if (_activePopupTouchIds.Count > 0) return true;
+            if (_activePopupTouchIds.Count > 0)
+            {
+                ReconcileActiveTouchesWithStage();
+                if (_activePopupTouchIds.Count > 0) return true;
+            }
 
             try
             {

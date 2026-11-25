@@ -207,9 +207,33 @@ namespace MonsterPathPredictor.Core
         public void SeedInitialServerActionEnd(long monsterId, bool serverActionEnd, int currentRound)
         {
             if (monsterId == 0) return;
+            // Reject regressing round samples on initial seeding as well.
+            if (currentRound >= 0 && _lastObservedRound >= 0 && currentRound < _lastObservedRound)
+            {
+                return;
+            }
+
+            bool laggingRoundDuringProvisional =
+                _hasProvisionalNextRound && currentRound >= 0 && currentRound < _provisionalNextRoundNumber;
+
             int roundKey = currentRound >= 0 ? currentRound : EffectiveRoundNumber;
+            if (monsterId == EffectiveActiveActorId)
+            {
+                int activeRoundKey = _activeActorStartedRound >= 0 ? _activeActorStartedRound : roundKey;
+                _serverActionEndHistory[monsterId] = (serverActionEnd, activeRoundKey, false);
+                _activeActorSawServerActionEndTrue = serverActionEnd;
+                return;
+            }
+
+            if (laggingRoundDuringProvisional)
+            {
+                // Record raw baseline on the lagging round without miscrediting provisional next-round acted set!
+                _serverActionEndHistory[monsterId] = (serverActionEnd, currentRound, false);
+                return;
+            }
+
             _serverActionEndHistory[monsterId] = (serverActionEnd, roundKey, false);
-            if (serverActionEnd && monsterId != EffectiveActiveActorId)
+            if (serverActionEnd)
             {
                 MarkActedThisRound(monsterId);
             }

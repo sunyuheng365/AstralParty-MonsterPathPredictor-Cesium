@@ -316,5 +316,30 @@ namespace MonsterPathPredictor.Tests
             Assert.Equal(4, Assert.Single(planLive.Forks).Exits[0].NextLandId);
             Assert.Contains(planLive.Combats, c => c.LandId == 6 && c.TargetLabel == "P2");
         }
+
+        [Fact]
+        public void ClickingLiveTileClearsRedundantPinnedOverrideEvenBeforeReconcile()
+        {
+            var board = BuildForkBoard();
+            var sandbox = new VirtualPlayerSandbox();
+
+            // Live at 5 -> move virtually to 3
+            Assert.True(sandbox.SetVirtualLand(1001, targetLandId: 3, liveLandId: 5, board));
+            Assert.True(sandbox.HasOverrides);
+
+            // Real player arrives at 3 between snapshots BEFORE Reconcile runs; user clicks tile 3:
+            // must clear the redundant pinned override rather than returning false and leaving it pinned!
+            Assert.True(sandbox.SetVirtualLand(1001, targetLandId: 3, liveLandId: 3, board));
+            Assert.False(sandbox.HasOverrides);
+            Assert.False(sandbox.TryGetVirtualLand(1001, out _));
+
+            // If real player later walks to 4, sandbox follows live (4) instead of remaining pinned to 3!
+            var playersMoved = new List<TrackedPlayer>
+            {
+                new TrackedPlayer { PlayerId = 1001, Slot = 0, Name = "P1", LandId = 4, IsAlive = true }
+            };
+            var eff = sandbox.ApplyOverrides(playersMoved, board);
+            Assert.Equal(4, eff[0].LandId);
+        }
     }
 }

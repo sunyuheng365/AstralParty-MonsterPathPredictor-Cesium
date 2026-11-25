@@ -147,20 +147,31 @@ namespace MonsterPathPredictor.Runtime
                 return false;
             }
 
-            // Prefer the monster cleanly hit on MouseDown if still alive AND still eligible against the LIVE roster
-            // (never trusting a stale 120ms snapshot cache if the monster died before mouse-up!).
-            long hitMonsterId = (IsMonsterEligible(monsters, outcome.DownHitMonsterId, settings) &&
-                                 MonsterStateTracker.TryIsMonsterLiveAndEligible(outcome.DownHitMonsterId, settings.AllowNonAggressiveMonsters))
-                ? outcome.DownHitMonsterId
-                : 0;
-            if (hitMonsterId == 0)
+            // Revalidate MouseDown hit against the LIVE roster (distinguishing unavailable roster from dead/empty).
+            long hitMonsterId = 0;
+            bool liveLookupIndeterminate = false;
+            if (IsMonsterEligible(monsters, outcome.DownHitMonsterId, settings))
             {
-                long fallbackHit = HitTestMonsters(layer, camera, monsters, localPos, settings);
-                if (fallbackHit != 0 &&
-                    MonsterStateTracker.TryIsMonsterLiveAndEligible(fallbackHit, settings.AllowNonAggressiveMonsters))
+                var liveCheck = MonsterStateTracker.CheckMonsterLiveAndEligible(outcome.DownHitMonsterId, settings.AllowNonAggressiveMonsters);
+                if (liveCheck == LiveMonsterCheckResult.Eligible)
                 {
-                    hitMonsterId = fallbackHit;
+                    hitMonsterId = outcome.DownHitMonsterId;
                 }
+                else if (liveCheck == LiveMonsterCheckResult.Indeterminate)
+                {
+                    liveLookupIndeterminate = true;
+                }
+            }
+            if (hitMonsterId == 0 && !liveLookupIndeterminate)
+            {
+                // Fallback hit test filters candidates through live eligibility so a dead foreground sprite
+                // never hides a living stacked monster underneath it!
+                hitMonsterId = HitTestMonsters(layer, camera, monsters, localPos, settings, requireLiveEligible: true, out liveLookupIndeterminate);
+            }
+            if (liveLookupIndeterminate)
+            {
+                // Indeterminate live roster lookup must NEVER masquerade as an empty-board click!
+                return false;
             }
 
             long nextSelected = PointerClickTracker.ApplyBoardClickSelection(
@@ -379,6 +390,19 @@ namespace MonsterPathPredictor.Runtime
             Vector2 clickLocal,
             PredictorSettings settings)
         {
+            return HitTestMonsters(layer, camera, monsters, clickLocal, settings, requireLiveEligible: false, out _);
+        }
+
+        private static long HitTestMonsters(
+            GComponent layer,
+            Camera camera,
+            IReadOnlyList<LiveMonsterInfo> monsters,
+            Vector2 clickLocal,
+            PredictorSettings settings,
+            bool requireLiveEligible,
+            out bool liveLookupIndeterminate)
+        {
+            liveLookupIndeterminate = false;
             if (monsters == null || monsters.Count == 0 || camera == null) return 0;
 
             var camTr = UnityObject.GetTransform(camera);
@@ -391,6 +415,17 @@ namespace MonsterPathPredictor.Runtime
                 var m = monsters[i];
                 if (m == null || m.State == null) continue;
                 if (!settings.AllowNonAggressiveMonsters && !m.State.IsNormalAggressive) continue;
+
+                if (requireLiveEligible)
+                {
+                    var chk = MonsterStateTracker.CheckMonsterLiveAndEligible(m.State.MonsterId, settings.AllowNonAggressiveMonsters);
+                    if (chk == LiveMonsterCheckResult.Indeterminate)
+                    {
+                        liveLookupIndeterminate = true;
+                        return 0;
+                    }
+                    if (chk != LiveMonsterCheckResult.Eligible) continue;
+                }
 
                 // Refresh live visual bounds right on click so moving/stacked sprites are pixel-accurate
                 var bounds = m.CharacterRef != null

@@ -55,6 +55,7 @@ namespace MonsterPathPredictor.Runtime
             public Color LastColor;
             public bool LastCompact;
             public float LastMaxWidth;
+            public float LastMaxHeight;
             public float Width;
             public float Height;
             public float LastX;
@@ -154,7 +155,20 @@ namespace MonsterPathPredictor.Runtime
 
         public void HideAll(bool force = false)
         {
-            if (!force && !_hasVisibleWidgets) return;
+            // Even when idle (!_hasVisibleWidgets), inspect pooled pills for any externally reparented
+            // Bg/Text children so a child detached after hide can never remain visible.
+            if (!force && !_hasVisibleWidgets)
+            {
+                for (int i = 0; i < _pillPool.Count; i++)
+                {
+                    var p = _pillPool[i];
+                    if (p == null) continue;
+                    bool detachedBg = p.Bg != null && !p.Bg.isDisposed && p.Bg.parent != p.Root;
+                    bool detachedText = p.Text != null && !p.Text.isDisposed && p.Text.parent != p.Root;
+                    if (detachedBg || detachedText) HidePooledPill(p);
+                }
+                return;
+            }
             for (int i = 0; i < _lineGraphPool.Count; i++)
             {
                 try
@@ -837,7 +851,7 @@ namespace MonsterPathPredictor.Runtime
             if (!g.visible) g.visible = true;
         }
 
-        private PooledPill PreparePill(string text, int fontSize, Color textColor, bool compact, float maxPillWidth = 0f)
+        private PooledPill PreparePill(string text, int fontSize, Color textColor, bool compact, float maxPillWidth = 0f, float maxPillHeight = 0f)
         {
             var pill = AcquirePill();
             text = text ?? string.Empty;
@@ -846,6 +860,7 @@ namespace MonsterPathPredictor.Runtime
                 pill.LastFontSize != fontSize ||
                 pill.LastCompact != compact ||
                 Math.Abs(pill.LastMaxWidth - maxPillWidth) >= 1f ||
+                Math.Abs(pill.LastMaxHeight - maxPillHeight) >= 1f ||
                 !string.Equals(pill.LastText, text, StringComparison.Ordinal) ||
                 !ColorsEqual(pill.LastColor, textColor);
 
@@ -858,9 +873,15 @@ namespace MonsterPathPredictor.Runtime
                 var bgColor = new Color(BadgeBg.r, BadgeBg.g, BadgeBg.b, BadgeBg.a * alphaFactor);
                 var outlineCol = new Color(0f, 0f, 0f, alphaFactor);
 
+                int effFontSize = fontSize;
+                if (maxPillHeight > 0f && maxPillHeight < fontSize + padY * 2f + 2f)
+                {
+                    effFontSize = Math.Max(8, (int)Math.Floor(maxPillHeight - padY * 2f));
+                }
+
                 pill.Text.textFormat = new TextFormat
                 {
-                    size = fontSize,
+                    size = effFontSize,
                     bold = true,
                     color = textColor,
                     outline = 1.5f,
@@ -869,16 +890,19 @@ namespace MonsterPathPredictor.Runtime
                 pill.Text.autoSize = AutoSizeType.Both;
                 pill.Text.text = text;
 
-                float h = (float)Math.Ceiling(Math.Max(compact ? 18f : 16f, pill.Text.height + padY * 2f));
-                float minW = compact ? h : 18f;
+                float measuredH = (float)Math.Ceiling(Math.Max(compact ? 18f : 16f, pill.Text.height + padY * 2f));
+                float maxAllowedH = maxPillHeight > 8f ? maxPillHeight : float.MaxValue;
+                float h = Math.Min(measuredH, maxAllowedH);
+                float minW = compact ? Math.Min(h, 24f) : 18f;
                 float maxAllowedW = maxPillWidth > 20f ? maxPillWidth : float.MaxValue;
                 float measuredW = (float)Math.Ceiling(Math.Max(minW, pill.Text.width + padX * 2f));
                 float w = Math.Min(measuredW, maxAllowedW);
-                if (measuredW > maxAllowedW)
+                if (measuredW > maxAllowedW || measuredH > maxAllowedH)
                 {
                     pill.Text.autoSize = AutoSizeType.None;
                     pill.Text.singleLine = true;
-                    pill.Text.SetSize(Math.Max(8f, w - padX * 2f), pill.Text.height);
+                    pill.Text.verticalAlign = VertAlignType.Middle;
+                    pill.Text.SetSize(Math.Max(8f, w - padX * 2f), Math.Max(6f, h - padY * 2f));
                 }
 
                 pill.Root.SetSize(w, h);
@@ -895,6 +919,7 @@ namespace MonsterPathPredictor.Runtime
                 pill.LastColor = textColor;
                 pill.LastCompact = compact;
                 pill.LastMaxWidth = maxPillWidth;
+                pill.LastMaxHeight = maxPillHeight;
                 pill.HasContent = true;
             }
 
@@ -926,8 +951,16 @@ namespace MonsterPathPredictor.Runtime
         {
             if (textColor.a <= 0f || !IsAnchorNearViewport(center, viewW, viewH)) return;
             float maxW = Math.Max(24f, viewW - 8f);
-            var pill = PreparePill(text, fontSize, textColor, compact, maxW);
-            var chosen = FindNonOverlappingPillCenter(center, pill.Width, pill.Height, compact ? 2f : 4f, viewW, viewH);
+            float maxH = Math.Max(10f, viewH - 4f);
+            var pill = PreparePill(text, fontSize, textColor, compact, maxW, maxH);
+            var chosen = FindNonOverlappingPillCenter(center, pill.Width, pill.Height, compact ? 2f : 4f, viewW, viewH, out bool hasOverlap);
+            // When viewport is saturated, suppress low-priority compact step badges instead of drawing over primary labels.
+            if (compact && hasOverlap)
+            {
+                _usedPills--;
+                HidePooledPill(pill);
+                return;
+            }
             PlacePill(pill, chosen);
         }
 
@@ -946,7 +979,8 @@ namespace MonsterPathPredictor.Runtime
             placedTopY = hasPriorTop ? priorTopY : baseCenter.Y;
             if (textColor.a <= 0f || !IsAnchorNearViewport(baseCenter, viewW, viewH)) return false;
             float maxW = Math.Max(24f, viewW - 8f);
-            var pill = PreparePill(text, fontSize, textColor, compact: false, maxW);
+            float maxH = Math.Max(10f, viewH - 4f);
+            var pill = PreparePill(text, fontSize, textColor, compact: false, maxW, maxH);
             float prefY = hasPriorTop
                 ? (priorTopY - gapPx - pill.Height * 0.5f)
                 : baseCenter.Y;
@@ -956,7 +990,8 @@ namespace MonsterPathPredictor.Runtime
                 pill.Height,
                 gapPx,
                 viewW,
-                viewH);
+                viewH,
+                out _);
             PlacePill(pill, chosen);
             placedTopY = chosen.Y - pill.Height * 0.5f;
             return true;
@@ -973,8 +1008,9 @@ namespace MonsterPathPredictor.Runtime
         {
             if (textColor.a <= 0f || !IsAnchorNearViewport(baseCenter, viewW, viewH)) return;
             float maxW = Math.Max(24f, viewW - 8f);
-            var pill = PreparePill(text, fontSize, textColor, compact: false, maxW);
-            var chosen = FindNonOverlappingPillCenter(baseCenter, pill.Width, pill.Height, gapPx, viewW, viewH);
+            float maxH = Math.Max(10f, viewH - 4f);
+            var pill = PreparePill(text, fontSize, textColor, compact: false, maxW, maxH);
+            var chosen = FindNonOverlappingPillCenter(baseCenter, pill.Width, pill.Height, gapPx, viewW, viewH, out _);
             PlacePill(pill, chosen);
         }
 
@@ -984,7 +1020,8 @@ namespace MonsterPathPredictor.Runtime
             float h,
             float gapPx,
             float viewW,
-            float viewH)
+            float viewH,
+            out bool hasOverlap)
         {
             const float Pad = 4f;
             float halfW = w * 0.5f;
@@ -1024,10 +1061,12 @@ namespace MonsterPathPredictor.Runtime
             float stepX = w + 6f;
             Point2 bestCenter = ClampCenter(prefCenter.X, prefCenter.Y);
             float bestScore = OverlapScore(bestCenter);
-            if (bestScore <= 0f) return bestCenter;
+            if (bestScore <= 0f)
+            {
+                hasOverlap = false;
+                return bestCenter;
+            }
 
-            // Evaluate in-viewport candidates in deterministic priority order:
-            // upward stack -> below anchor -> right/left beside anchor -> diagonal offsets.
             bool TryCandidate(float cx, float cy)
             {
                 var cand = ClampCenter(cx, cy);
@@ -1043,43 +1082,45 @@ namespace MonsterPathPredictor.Runtime
 
             for (int k = 1; k <= 5; k++)
             {
-                if (TryCandidate(prefCenter.X, prefCenter.Y - k * stepY)) return bestCenter;
+                if (TryCandidate(prefCenter.X, prefCenter.Y - k * stepY)) { hasOverlap = false; return bestCenter; }
             }
             for (int k = 1; k <= 4; k++)
             {
-                if (TryCandidate(prefCenter.X, prefCenter.Y + k * stepY)) return bestCenter;
+                if (TryCandidate(prefCenter.X, prefCenter.Y + k * stepY)) { hasOverlap = false; return bestCenter; }
             }
-            if (TryCandidate(prefCenter.X + stepX, prefCenter.Y)) return bestCenter;
-            if (TryCandidate(prefCenter.X - stepX, prefCenter.Y)) return bestCenter;
-            if (TryCandidate(prefCenter.X + stepX, prefCenter.Y - stepY)) return bestCenter;
-            if (TryCandidate(prefCenter.X - stepX, prefCenter.Y - stepY)) return bestCenter;
-            if (TryCandidate(prefCenter.X + stepX, prefCenter.Y + stepY)) return bestCenter;
-            if (TryCandidate(prefCenter.X - stepX, prefCenter.Y + stepY)) return bestCenter;
+            if (TryCandidate(prefCenter.X + stepX, prefCenter.Y)) { hasOverlap = false; return bestCenter; }
+            if (TryCandidate(prefCenter.X - stepX, prefCenter.Y)) { hasOverlap = false; return bestCenter; }
+            if (TryCandidate(prefCenter.X + stepX, prefCenter.Y - stepY)) { hasOverlap = false; return bestCenter; }
+            if (TryCandidate(prefCenter.X - stepX, prefCenter.Y - stepY)) { hasOverlap = false; return bestCenter; }
+            if (TryCandidate(prefCenter.X + stepX, prefCenter.Y + stepY)) { hasOverlap = false; return bestCenter; }
+            if (TryCandidate(prefCenter.X - stepX, prefCenter.Y + stepY)) { hasOverlap = false; return bestCenter; }
 
-            // Expand search to additional horizontal columns and edge-adjacent positions of already placed
-            // pills within the viewport so dense projected tile clusters utilize nearby free screen space.
             for (int col = 2; col <= 3; col++)
             {
-                if (TryCandidate(prefCenter.X + col * stepX, prefCenter.Y)) return bestCenter;
-                if (TryCandidate(prefCenter.X - col * stepX, prefCenter.Y)) return bestCenter;
-                if (TryCandidate(prefCenter.X + col * stepX, prefCenter.Y - stepY)) return bestCenter;
-                if (TryCandidate(prefCenter.X - col * stepX, prefCenter.Y - stepY)) return bestCenter;
-                if (TryCandidate(prefCenter.X + col * stepX, prefCenter.Y + stepY)) return bestCenter;
-                if (TryCandidate(prefCenter.X - col * stepX, prefCenter.Y + stepY)) return bestCenter;
+                if (TryCandidate(prefCenter.X + col * stepX, prefCenter.Y)) { hasOverlap = false; return bestCenter; }
+                if (TryCandidate(prefCenter.X - col * stepX, prefCenter.Y)) { hasOverlap = false; return bestCenter; }
+                if (TryCandidate(prefCenter.X + col * stepX, prefCenter.Y - stepY)) { hasOverlap = false; return bestCenter; }
+                if (TryCandidate(prefCenter.X - col * stepX, prefCenter.Y - stepY)) { hasOverlap = false; return bestCenter; }
+                if (TryCandidate(prefCenter.X + col * stepX, prefCenter.Y + stepY)) { hasOverlap = false; return bestCenter; }
+                if (TryCandidate(prefCenter.X - col * stepX, prefCenter.Y + stepY)) { hasOverlap = false; return bestCenter; }
             }
 
-            float pillHalfW = w * 0.5f;
-            float pillHalfH = h * 0.5f;
+            // Bounded edge-adjacent search over at most the 6 most recently placed nearby rects (keeps work O(N), never cubic).
             float hGap = 4f;
-            for (int i = 0; i < _placedPillRects.Count; i++)
+            int inspected = 0;
+            for (int i = _placedPillRects.Count - 1; i >= 0 && inspected < 6; i--)
             {
                 var r = _placedPillRects[i];
-                if (TryCandidate(r.xMax + pillHalfW + hGap, r.center.y)) return bestCenter;
-                if (TryCandidate(r.xMin - pillHalfW - hGap, r.center.y)) return bestCenter;
-                if (TryCandidate(r.center.x, r.yMin - pillHalfH - gapPx)) return bestCenter;
-                if (TryCandidate(r.center.x, r.yMax + pillHalfH + gapPx)) return bestCenter;
+                if (Math.Abs(r.center.x - prefCenter.X) > stepX * 4f || Math.Abs(r.center.y - prefCenter.Y) > stepY * 5f)
+                    continue;
+                inspected++;
+                if (TryCandidate(r.xMax + halfW + hGap, r.center.y)) { hasOverlap = false; return bestCenter; }
+                if (TryCandidate(r.xMin - halfW - hGap, r.center.y)) { hasOverlap = false; return bestCenter; }
+                if (TryCandidate(r.center.x, r.yMin - halfH - gapPx)) { hasOverlap = false; return bestCenter; }
+                if (TryCandidate(r.center.x, r.yMax + halfH + gapPx)) { hasOverlap = false; return bestCenter; }
             }
 
+            hasOverlap = bestScore > 0f;
             return bestCenter;
         }
 

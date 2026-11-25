@@ -155,34 +155,49 @@ namespace MonsterPathPredictor.Tests
                 new System.Collections.Generic.Dictionary<string, object>(System.StringComparer.Ordinal);
             private System.Collections.Generic.Dictionary<string, object> _mem =
                 new System.Collections.Generic.Dictionary<string, object>(System.StringComparer.Ordinal);
+            private long _diskRevision;
+            private long _memRevision;
             private bool _diskChangedExternally;
             private bool _memDirty;
             public bool FailSave;
             public bool ThrowOnReload;
+            public bool ThrowOnHas;
+            public bool ThrowOnSet;
             public int ReloadCallCount;
+            public int CommitAttemptCount;
             public System.Action<FakeConfigStore> OnReloadBeforeCheck;
+            public System.Action<FakeConfigStore> OnBeforeCommit;
+
+            public long StoreRevision => _memRevision;
 
             public void SeedDisk(string key, object value)
             {
                 Disk[key] = value;
                 _mem[key] = value;
+                _diskRevision++;
+                _memRevision = _diskRevision;
             }
 
             public void ExternalEditDisk(string key, object value)
             {
                 Disk[key] = value;
+                _diskRevision++;
                 _diskChangedExternally = true;
             }
 
-            public bool Has(string key) => _mem.ContainsKey(key);
+            public bool Has(string key)
+            {
+                if (ThrowOnHas) throw new System.InvalidOperationException("simulated Has failure");
+                return _mem.ContainsKey(key);
+            }
             public bool GetBool(string key, bool defaultValue) => _mem.TryGetValue(key, out var v) && v is bool b ? b : defaultValue;
             public int GetInt(string key, int defaultValue) => _mem.TryGetValue(key, out var v) && v is int i ? i : defaultValue;
             public float GetFloat(string key, float defaultValue) => _mem.TryGetValue(key, out var v) && v is float f ? f : defaultValue;
             public string GetString(string key, string defaultValue) => _mem.TryGetValue(key, out var v) && v is string s ? s : defaultValue;
-            public void Set(string key, bool value) { _mem[key] = value; _memDirty = true; }
-            public void Set(string key, int value) { _mem[key] = value; _memDirty = true; }
-            public void Set(string key, float value) { _mem[key] = value; _memDirty = true; }
-            public void Set(string key, string value) { _mem[key] = value; _memDirty = true; }
+            public void Set(string key, bool value) { if (ThrowOnSet) throw new System.InvalidOperationException("simulated Set failure"); _mem[key] = value; _memDirty = true; }
+            public void Set(string key, int value) { if (ThrowOnSet) throw new System.InvalidOperationException("simulated Set failure"); _mem[key] = value; _memDirty = true; }
+            public void Set(string key, float value) { if (ThrowOnSet) throw new System.InvalidOperationException("simulated Set failure"); _mem[key] = value; _memDirty = true; }
+            public void Set(string key, string value) { if (ThrowOnSet) throw new System.InvalidOperationException("simulated Set failure"); _mem[key] = value; _memDirty = true; }
 
             public bool ReloadIfChanged()
             {
@@ -191,6 +206,7 @@ namespace MonsterPathPredictor.Tests
                 if (ThrowOnReload) throw new System.IO.IOException("simulated disk read error");
                 if (!_diskChangedExternally) return false;
                 _mem = new System.Collections.Generic.Dictionary<string, object>(Disk, System.StringComparer.Ordinal);
+                _memRevision = _diskRevision;
                 _diskChangedExternally = false;
                 _memDirty = false;
                 return true;
@@ -201,11 +217,26 @@ namespace MonsterPathPredictor.Tests
                 if (FailSave) return false;
                 Disk.Clear();
                 foreach (var kv in _mem) Disk[kv.Key] = kv.Value;
+                _diskRevision++;
+                _memRevision = _diskRevision;
                 _memDirty = false;
                 return true;
             }
 
             public bool SaveIfDirty() => _memDirty ? Save() : true;
+
+            public bool TrySaveIfRevisionMatches(long expectedRevision, out bool revisionConflict)
+            {
+                CommitAttemptCount++;
+                OnBeforeCommit?.Invoke(this);
+                if (_diskRevision != expectedRevision)
+                {
+                    revisionConflict = true;
+                    return false;
+                }
+                revisionConflict = false;
+                return Save();
+            }
         }
 
         [Fact]
@@ -292,6 +323,67 @@ namespace MonsterPathPredictor.Tests
             Assert.True(r4.SaveOk);
             Assert.False(patch.HasPending);
             Assert.Equal(20.0f, (float)store.Disk["dashLength"]);
+        }
+
+        [Fact]
+        public void CommitTimeRevisionConflictRetriesWithoutLosingExternalEditAndLoadErrorsFallBackCleanly()
+        {
+            var coord = new ConfigPersistenceCoordinator();
+            var patch = new StylePendingPatch();
+            var store = new FakeConfigStore();
+            store.SeedDisk("configVersion", 3);
+            store.SeedDisk("pickerHotkey", "F10");
+            store.SeedDisk("clearHotkey", "Escape");
+            store.SeedDisk("lineWidth", 4.5f);
+            store.SeedDisk("heightOffset", 0.18f);
+
+            var current = coord.Load(store, isInitial: true, FakeNormalizeKey, null, out bool initOk);
+            Assert.True(initOk);
+
+            // R6-H13: Inject an external edit AFTER ReloadIfChanged() returns and IMMEDIATELY BEFORE commit!
+            bool injectedConflict = false;
+            store.OnBeforeCommit = st =>
+            {
+                if (!injectedConflict)
+                {
+                    injectedConflict = true;
+                    st.ExternalEditDisk("heightOffset", 0.65f);
+                }
+            };
+
+            var res = coord.ApplyStyleMutationAndPersist(store, current, patch, s => s.LineWidth = 8.0f, isFullReset: false, FakeNormalizeKey);
+            Assert.True(injectedConflict);
+            Assert.True(store.CommitAttemptCount >= 2);
+            Assert.True(res.SaveOk);
+            Assert.False(patch.HasPending);
+            Assert.Equal(8.0f, (float)store.Disk["lineWidth"]);
+            Assert.Equal(0.65f, (float)store.Disk["heightOffset"]); // Concurrent edit preserved!
+            Assert.Equal(0.65f, res.Settings.HeightOffset);
+
+            // R6-L10: Calling ApplyStyleMutationAndPersist with pendingPatch=null MUST still persist the edit!
+            store.OnBeforeCommit = null;
+            var nullPatchRes = coord.ApplyStyleMutationAndPersist(store, res.Settings, pendingPatch: null, s => s.DashSpeed = 52.0f, isFullReset: false, FakeNormalizeKey);
+            Assert.True(nullPatchRes.SaveAttempted);
+            Assert.True(nullPatchRes.SaveOk);
+            Assert.Equal(52.0f, (float)store.Disk["dashSpeed"]);
+
+            // R6-M22: Throwing Has() on first load returns clamped defaults cleanly with saveOk=false.
+            var brokenStore = new FakeConfigStore { ThrowOnHas = true };
+            var firstFallback = coord.Load(brokenStore, isInitial: true, FakeNormalizeKey, null, out bool brokenInitOk);
+            Assert.False(brokenInitOk);
+            Assert.Equal("F10", firstFallback.PickerHotkey);
+            Assert.True(coord.HasPendingMigrationSave);
+
+            // R6-M22: Throwing Set() during migration on reload preserves fallbackOnError without crashing.
+            var migStore = new FakeConfigStore { ThrowOnSet = true };
+            migStore.SeedDisk("configVersion", 1);
+            migStore.SeedDisk("pickerHotkey", "F8");
+            var prevAccepted = new PredictorSettings { LineWidth = 6.5f, PreviewSteps = 18 };
+            var reloadFallback = coord.Load(migStore, isInitial: false, FakeNormalizeKey, null, out bool migOk, fallbackOnError: prevAccepted);
+            Assert.False(migOk);
+            Assert.Equal(6.5f, reloadFallback.LineWidth);
+            Assert.Equal(18, reloadFallback.PreviewSteps);
+            Assert.True(coord.HasPendingMigrationSave);
         }
     }
 }

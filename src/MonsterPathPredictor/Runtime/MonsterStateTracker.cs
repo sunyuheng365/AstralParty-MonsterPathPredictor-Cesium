@@ -45,6 +45,9 @@ namespace MonsterPathPredictor.Runtime
             public int SkillMoveLandId = -1;
             public int SkillMovePushDirId = -1;
             public int SkillMovePushFromId = -1;
+            public int[] ExplicitFrontNodeIds;
+            public int ExplicitFrontLandId = -1;
+            public int ExplicitFrontFromLandId = -1;
         }
 
         private sealed class SkillCastRecord
@@ -65,6 +68,7 @@ namespace MonsterPathPredictor.Runtime
             public int SkillId;
             public int NewLandId;
             public int BackLandId;
+            public int[] FrontNodeIds;
             public long MatchRoomId;
             public long MatchStartTime;
             public int MatchGeneration;
@@ -213,6 +217,9 @@ namespace MonsterPathPredictor.Runtime
                 mem.SkillMoveLandId = -1;
                 mem.SkillMovePushDirId = -1;
                 mem.SkillMovePushFromId = -1;
+                mem.ExplicitFrontNodeIds = null;
+                mem.ExplicitFrontLandId = -1;
+                mem.ExplicitFrontFromLandId = -1;
             }
         }
 
@@ -367,6 +374,17 @@ namespace MonsterPathPredictor.Runtime
                 // Negative NodeId (< 0) is a protocol sentinel (no destination tile): never enqueue as a wildcard tile match.
                 if (eff.Place != null && eff.Place.Place != null && eff.Place.Place.NodeId >= 0 && eff.PlayerId != 0 && !TryIsUnitHero(eff.PlayerId))
                 {
+                    int[] placeFrontIds = Array.Empty<int>();
+                    try
+                    {
+                        var rf = eff.Place.Place.FrontNodeIds;
+                        if (rf != null && rf.Count > 0)
+                        {
+                            placeFrontIds = new int[rf.Count];
+                            for (int fi = 0; fi < rf.Count; fi++) placeFrontIds[fi] = rf[fi];
+                        }
+                    }
+                    catch { }
                     if (_placeQueue.Count >= MaxQueuedEvents) _placeQueue.TryDequeue(out _);
                     _placeQueue.Enqueue(new SkillDisplacementRecord
                     {
@@ -375,6 +393,7 @@ namespace MonsterPathPredictor.Runtime
                         SkillId = causeId,
                         NewLandId = eff.Place.Place.NodeId,
                         BackLandId = eff.Place.Place.BackNodeId,
+                        FrontNodeIds = placeFrontIds,
                         MatchRoomId = matchRoomId,
                         MatchStartTime = matchStartTime,
                         MatchGeneration = matchGen,
@@ -606,26 +625,37 @@ namespace MonsterPathPredictor.Runtime
                 int landId = SafeLandId(pd);
                 if (!board.Contains(landId)) continue;
 
+                var chForFacing = pd.CharacterInst;
+                bool hasLiveChar = UnityObject.IsAlive(chForFacing);
                 int fromLandId = SafeFromLandId(pd);
-                int[] frontIds = SafeFrontNodeIds(pd);
                 bool isThief = IsThiefMonster(pd);
 
                 // Update logical monster memory & queued combat/steal/displacement events BEFORE visual model checks
                 // so a momentarily unrendered CharacterInst never drops combat/steal flags.
                 bool isNew = !_memories.TryGetValue(mid, out var mem);
                 bool movedSinceLastSnapshot = false;
+                int[] frontIds;
                 if (isNew)
                 {
+                    int serverNodeId = SafeRoomPlayerNodeId(pd);
+                    int[] initialExplicitFront = LiveFacingResolver.TryAcceptInitialProtocolFrontIds(
+                        board, landId, serverNodeId, fromLandId, SafeRawProtocolFrontNodeIds(pd));
                     mem = new MonsterMemory
                     {
                         LastLandId = landId,
                         LastFromLandId = fromLandId,
-                        JustSpawnedOnFork = board.IsFork(landId) && (frontIds.Length == 1 || !board.IsValidNeighbor(landId, fromLandId))
+                        ExplicitFrontNodeIds = initialExplicitFront,
+                        ExplicitFrontLandId = initialExplicitFront != null ? landId : -1,
+                        ExplicitFrontFromLandId = initialExplicitFront != null ? fromLandId : -1
                     };
                     _memories[mid] = mem;
                     // On first observation, consume a pending Place ONLY if it already matches landId;
                     // never delete an ahead-of-visual Place whose CharacterInst.standLand has not updated yet.
-                    TryConsumeExactPlaceDisplacement(board, mid, mem, fromLandId, landId, leftPreviousTile: false, playerPositions, allUnits);
+                    TryConsumeExactPlaceDisplacement(board, mid, mem, fromLandId, landId, fromLandId, leftPreviousTile: false, playerPositions, allUnits);
+                    frontIds = ResolveMonsterFrontNodeIds(board, chForFacing, hasLiveChar, landId, fromLandId, mem);
+                    mem.JustSpawnedOnFork = board.IsFork(landId) &&
+                                            serverNodeId == landId &&
+                                            (frontIds.Length == 1 || !board.IsValidNeighbor(landId, fromLandId));
                 }
                 else
                 {
@@ -648,8 +678,8 @@ namespace MonsterPathPredictor.Runtime
                         bool isMonsterOwnTurn = (curActorId == mid);
                         bool movedNonAdjacently = prevLandId >= 0 && !board.IsValidNeighbor(prevLandId, landId);
 
-                        // Leaving a tile ALWAYS clears prior tile-bound spawn/combat/skill tags unconditionally
-                        // so revisiting the same fork later in the turn can NEVER reactivate an expired post-combat tag.
+                        // Leaving a tile ALWAYS clears prior tile-bound spawn/combat/skill/explicit-front tags unconditionally
+                        // so normal walking NEVER reuses stale RoomPlayer.FrontIds left over from spawn or prior Place.
                         mem.JustSpawnedOnFork = false;
                         mem.JustFoughtOnFork = false;
                         mem.CombatForkLandId = -1;
@@ -657,11 +687,14 @@ namespace MonsterPathPredictor.Runtime
                         mem.SkillMoveLandId = -1;
                         mem.SkillMovePushDirId = -1;
                         mem.SkillMovePushFromId = -1;
+                        mem.ExplicitFrontNodeIds = null;
+                        mem.ExplicitFrontLandId = -1;
+                        mem.ExplicitFrontFromLandId = -1;
 
                         // Always check exact target-bound 1040.Place displacement first (even on own-turn adjacent moves);
                         // only fall back to the time-window SkillUsed heuristic when no matching exact Place record exists
                         // (never overwrite a KnownOtherCause exact Place with an unrelated cast from the time window).
-                        var exactLookup = TryConsumeExactPlaceDisplacement(board, mid, mem, prevLandId, landId, leftPreviousTile: true, playerPositions, allUnits);
+                        var exactLookup = TryConsumeExactPlaceDisplacement(board, mid, mem, prevLandId, landId, fromLandId, leftPreviousTile: true, playerPositions, allUnits);
                         if (exactLookup == ExactPlaceLookup.NotFound && (!isMonsterOwnTurn || movedNonAdjacently))
                         {
                             TryTagSkillDisplacementFromWindow(board, mid, mem, prevLandId, landId, playerPositions, allUnits);
@@ -672,8 +705,25 @@ namespace MonsterPathPredictor.Runtime
                     }
                     else if (_pendingPlaceByMonster.ContainsKey(mid))
                     {
-                        TryConsumeExactPlaceDisplacement(board, mid, mem, mem.LastLandId, landId, leftPreviousTile: false, playerPositions, allUnits);
+                        var sameTileLookup = TryConsumeExactPlaceDisplacement(board, mid, mem, mem.LastLandId, landId, fromLandId, leftPreviousTile: false, playerPositions, allUnits);
+                        if (sameTileLookup == ExactPlaceLookup.NotFound && mem.LastFromLandId != fromLandId)
+                        {
+                            mem.ExplicitFrontNodeIds = null;
+                            mem.ExplicitFrontLandId = -1;
+                            mem.ExplicitFrontFromLandId = -1;
+                        }
+                        mem.LastFromLandId = fromLandId;
                     }
+                    else if (mem.LastFromLandId != fromLandId)
+                    {
+                        // In-place facing reversal (e.g. Card_20011 / ResetFromLandId + ShowWalkDirections(null))
+                        mem.ExplicitFrontNodeIds = null;
+                        mem.ExplicitFrontLandId = -1;
+                        mem.ExplicitFrontFromLandId = -1;
+                        mem.LastFromLandId = fromLandId;
+                    }
+
+                    frontIds = ResolveMonsterFrontNodeIds(board, chForFacing, hasLiveChar, landId, fromLandId, mem);
                 }
 
                 int heroId = SafeHeroId(pd);
@@ -1064,6 +1114,7 @@ namespace MonsterPathPredictor.Runtime
             MonsterMemory mem,
             int oldLandId,
             int newLandId,
+            int liveFromLandId,
             bool leftPreviousTile,
             Dictionary<long, int> playerPositions,
             IReadOnlyList<BattlePlayerData> allUnits)
@@ -1119,6 +1170,15 @@ namespace MonsterPathPredictor.Runtime
                     mem.SkillMoveLandId = -1;
                     mem.SkillMovePushDirId = -1;
                     mem.SkillMovePushFromId = -1;
+                    mem.ExplicitFrontNodeIds = null;
+                    mem.ExplicitFrontLandId = -1;
+                    mem.ExplicitFrontFromLandId = -1;
+                }
+                if (rec.FrontNodeIds != null && rec.FrontNodeIds.Length > 0)
+                {
+                    mem.ExplicitFrontNodeIds = rec.FrontNodeIds;
+                    mem.ExplicitFrontLandId = nextLand;
+                    mem.ExplicitFrontFromLandId = liveFromLandId;
                 }
 
                 // Exact 1040.Place records MUST specify an explicit active displacement SkillId;
@@ -1828,13 +1888,25 @@ namespace MonsterPathPredictor.Runtime
             return -1;
         }
 
+        private static int SafeRoomPlayerNodeId(BattlePlayerData pd)
+        {
+            if (pd == null) return -1;
+            try
+            {
+                if (pd.player != null) return pd.player.NodeId;
+            }
+            catch { }
+            return -1;
+        }
+
         private static int SafeFromLandId(BattlePlayerData pd)
         {
             if (pd == null) return -1;
             try
             {
-                if (pd.CharacterInst != null && pd.CharacterInst.fromLandId >= 0)
-                    return pd.CharacterInst.fromLandId;
+                var ch = pd.CharacterInst;
+                if (UnityObject.IsAlive(ch))
+                    return ch.fromLandId; // Trust live Character.fromLandId directly (including explicit -1!)
             }
             catch { }
             try
@@ -1852,48 +1924,75 @@ namespace MonsterPathPredictor.Runtime
             return -1;
         }
 
-        private static readonly MethodInfo CharacterGetFrontNodeIds = typeof(Character).GetMethod(
-            "GetFrontNodeIds",
-            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
-            binder: null,
-            types: Type.EmptyTypes,
-            modifiers: null);
+        private static readonly FieldInfo CharacterMoveField = typeof(Character).GetField(
+            "move",
+            BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
 
-        private static int[] SafeFrontNodeIds(BattlePlayerData pd)
+        private static FieldInfo _walkDirectionsField;
+        private static bool _walkDirectionsFieldResolved;
+
+        private static int[] TryReadLiveWalkDirectionArrows(BoardGraph board, Character ch, int landId)
         {
-            // 1. Live visual facing arrows from Character.GetFrontNodeIds() (authoritative on forks!)
+            if (board == null || !UnityObject.IsAlive(ch) || CharacterMoveField == null) return null;
             try
             {
-                var ch = pd.CharacterInst;
-                if (CharacterGetFrontNodeIds != null && UnityObject.IsAlive(ch))
+                object moveComp = CharacterMoveField.GetValue(ch);
+                if (moveComp == null) return null;
+                if (!_walkDirectionsFieldResolved)
                 {
-                    object raw = CharacterGetFrontNodeIds.Invoke(ch, null);
-                    if (raw is int[] intArr && intArr.Length > 0)
-                    {
-                        var copy = new int[intArr.Length];
-                        Array.Copy(intArr, copy, intArr.Length);
-                        return copy;
-                    }
-                    if (raw is IList<int> intList && intList.Count > 0)
-                    {
-                        var arr = new int[intList.Count];
-                        for (int i = 0; i < intList.Count; i++) arr[i] = intList[i];
-                        return arr;
-                    }
-                    if (raw is System.Collections.IEnumerable seq)
-                    {
-                        var buf = new List<int>();
-                        foreach (var item in seq)
-                        {
-                            if (item != null) buf.Add(Convert.ToInt32(item));
-                        }
-                        if (buf.Count > 0) return buf.ToArray();
-                    }
+                    _walkDirectionsFieldResolved = true;
+                    _walkDirectionsField = moveComp.GetType().GetField(
+                        "_walkDirections",
+                        BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
                 }
-            }
-            catch { }
+                if (_walkDirectionsField == null) return null;
+                if (!(_walkDirectionsField.GetValue(moveComp) is System.Collections.IList arrows) || arrows.Count == 0)
+                    return null;
 
-            // 2. RoomPlayer.FrontIds
+                var forwards = new List<(float ForwardX, float ForwardZ)>(arrows.Count);
+                for (int i = 0; i < arrows.Count; i++)
+                {
+                    if (!(arrows[i] is UnityEngine.Object uObj) || !UnityObject.IsAlive(uObj)) continue;
+                    var tr = UnityObject.GetTransform(uObj);
+                    if (tr == null) continue;
+                    Vector3 fwd = TransformService.GetForward(tr);
+                    forwards.Add((fwd.x, fwd.z));
+                }
+                if (forwards.Count == 0) return null;
+                return LiveFacingResolver.MatchVisualArrowsToNeighbors(board, landId, forwards);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static int[] ResolveMonsterFrontNodeIds(
+            BoardGraph board,
+            Character ch,
+            bool hasLiveChar,
+            int landId,
+            int fromLandId,
+            MonsterMemory mem)
+        {
+            int[] visualArrows = hasLiveChar ? TryReadLiveWalkDirectionArrows(board, ch, landId) : null;
+            int[] explicitFront = (mem != null &&
+                                   mem.ExplicitFrontNodeIds != null &&
+                                   mem.ExplicitFrontLandId == landId &&
+                                   mem.ExplicitFrontFromLandId == fromLandId)
+                ? mem.ExplicitFrontNodeIds
+                : null;
+            return LiveFacingResolver.ResolveLiveFrontNodeIds(
+                board,
+                landId,
+                hasLiveChar,
+                fromLandId,
+                visualArrows,
+                explicitFront);
+        }
+
+        private static int[] SafeRawProtocolFrontNodeIds(BattlePlayerData pd)
+        {
             try
             {
                 if (pd.player != null && pd.player.FrontIds != null && pd.player.FrontIds.Count > 0)
@@ -1906,7 +2005,6 @@ namespace MonsterPathPredictor.Runtime
             }
             catch { }
 
-            // 3. Protobuf Hero.FrontNodeIds
             try
             {
                 if (pd.player != null && pd.player.Hero != null && pd.player.Hero.FrontNodeIds != null && pd.player.Hero.FrontNodeIds.Count > 0)

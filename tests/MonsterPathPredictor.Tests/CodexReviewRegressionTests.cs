@@ -1506,5 +1506,70 @@ namespace MonsterPathPredictor.Tests
             var plan = MonsterPathEngine.Plan(board, officer, players, new PlanOptions { MaxSteps = 1 });
             Assert.Equal(1, plan.Forks.Single(f => f.ForkLandId == 2).Exits.Single().NextLandId);
         }
+
+        [Fact]
+        public void LiveFacingResolver_IgnoresStaleRoomPlayerFrontIdsAfterNormalWalk_AndMatchesLiveWalkDirectionArrows()
+        {
+            // Exact live-client bug reproduction from match 1795627583480413 (82017 森秋幻境, 玩具恐龙):
+            // Dinosaur spawns at 25 (RoomPlayer.NodeId=25, RoomPlayer.FrontIds=[24]), then walks 25 -> 24 -> 23.
+            // On fork 23 (neighbors [22(Red), 55(Blue), 24]), live Character has standLand=23, fromLandId=24,
+            // while RoomPlayer.NodeId stays stale at 25 and RoomPlayer.FrontIds stays stale at [24]!
+            var board = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(22, new[] { 23 }, false, 1f, 0f, -1f),
+                new LandNodeSnapshot(23, new[] { 22, 55, 24 }, false, 0f, 0f, 0f),
+                new LandNodeSnapshot(55, new[] { 23 }, false, 1f, 0f, 1f),
+                new LandNodeSnapshot(24, new[] { 23, 25 }, false, -1f, 0f, 1f),
+                new LandNodeSnapshot(25, new[] { 24 }, false, -2f, 0f, 2f)
+            });
+
+            // 1. Initial protocol FrontIds=[24] MUST be rejected because serverNodeId (25) != currentLandId (23)
+            var accepted = LiveFacingResolver.TryAcceptInitialProtocolFrontIds(board, currentLandId: 23, serverNodeId: 25, liveFromLandId: 24, rawProtocolFrontIds: new[] { 24 });
+            Assert.Null(accepted);
+
+            // 2. Topological fallback (even when _walkDirections is empty) MUST return [22, 55] (NEVER stale [24]!)
+            var topoFront = LiveFacingResolver.ResolveLiveFrontNodeIds(board, currentLandId: 23, hasLiveCharacter: true, liveFromLandId: 24, visualArrowFrontIds: null, explicitFrontNodeIds: accepted);
+            Assert.Equal(new[] { 22, 55 }, topoFront);
+
+            // 3. Visual _walkDirections forward vectors pointing to 22 (1,-1) and 55 (1,1) MUST match [22, 55] in Red>Blue order
+            var visualFront = LiveFacingResolver.MatchVisualArrowsToNeighbors(board, 23, new[] { (1f, 1f), (1f, -1f) });
+            Assert.Equal(new[] { 22, 55 }, visualFront);
+
+            // 4. Feeding resolved front [22, 55] into MonsterPathEngine predicts Red arrow 22 (起步·红箭), NEVER backwards 24!
+            var dino = new MonsterState
+            {
+                MonsterId = 71025,
+                HeroId = 1072,
+                CurrentLandId = 23,
+                FromLandId = 24,
+                FrontNodeIds = topoFront,
+                IsCurrentlyMovingMidTurn = false
+            };
+            var plan = MonsterPathEngine.Plan(board, dino, new List<TrackedPlayer>(), new PlanOptions { MaxSteps = 1 });
+            Assert.Equal(22, plan.Forks.Single(f => f.ForkLandId == 23).Exits.Single().NextLandId);
+
+            // 5. Loop-back to spawn tile 25 coming FROM 24 (serverNodeId==25, liveFromLandId==24, stale Front=[24]):
+            //    MUST ALSO reject stale [24] because it points backwards to liveFromLandId!
+            var loopBoard = new BoardGraph(new[]
+            {
+                new LandNodeSnapshot(24, new[] { 25 }),
+                new LandNodeSnapshot(25, new[] { 24, 26 }),
+                new LandNodeSnapshot(26, new[] { 25 })
+            });
+            Assert.Null(LiveFacingResolver.TryAcceptInitialProtocolFrontIds(loopBoard, 25, 25, liveFromLandId: 24, rawProtocolFrontIds: new[] { 24 }));
+            var loopFront = LiveFacingResolver.ResolveLiveFrontNodeIds(loopBoard, 25, hasLiveCharacter: true, liveFromLandId: 24, visualArrowFrontIds: null, explicitFrontNodeIds: null);
+            Assert.Equal(new[] { 26 }, loopFront);
+
+            // 6. Fresh spawn on fork 23 with single arrow Front=[24] (serverNodeId==23, UpdateLand set fromLandId=22 != 24):
+            //    MUST accept [24]!
+            var spawnAccepted = LiveFacingResolver.TryAcceptInitialProtocolFrontIds(board, 23, 23, liveFromLandId: 22, rawProtocolFrontIds: new[] { 24 });
+            Assert.Equal(new[] { 24 }, spawnAccepted);
+            var spawnFront = LiveFacingResolver.ResolveLiveFrontNodeIds(board, 23, hasLiveCharacter: true, liveFromLandId: 22, visualArrowFrontIds: null, explicitFrontNodeIds: spawnAccepted);
+            Assert.Equal(new[] { 24 }, spawnFront);
+
+            // 7. Explicit ResetFromLandId(-1) -> all neighbors of fork 23 are valid forward exits!
+            var freeFront = LiveFacingResolver.ResolveLiveFrontNodeIds(board, 23, hasLiveCharacter: true, liveFromLandId: -1, visualArrowFrontIds: null, explicitFrontNodeIds: null);
+            Assert.Equal(new[] { 22, 55, 24 }, freeFront);
+        }
     }
 }

@@ -861,42 +861,62 @@ namespace MonsterPathPredictor.Runtime
             hasProblemStudent = null;
             hasMandarinDuck = null;
             if (unitId == 0) return;
-            bool readAnySource = false;
+            bool readLiveSource = false;
             bool foundPs = false;
             bool foundMd = false;
             try
             {
-                var buffs = Players.BuffsOf(unitId);
-                if (buffs != null)
-                {
-                    readAnySource = true;
-                    for (int i = 0; i < buffs.Count; i++)
-                    {
-                        int bid = buffs[i].BuffId;
-                        if (bid == 2101001) foundPs = true;
-                        else if (bid == 10470101) foundMd = true;
-                    }
-                }
-            }
-            catch { }
-            try
-            {
                 var pd = Players.Get(unitId);
-                var hero = pd != null && pd.player != null ? pd.player.Hero : null;
-                if (hero != null && hero.Buffs != null)
+                var bc = pd != null ? pd.buffContainer : null;
+                if (bc != null)
                 {
-                    readAnySource = true;
-                    foreach (var kv in hero.Buffs)
-                    {
-                        var b = kv.Value;
-                        if (b == null) continue;
-                        if (b.BuffId == 2101001) foundPs = true;
-                        else if (b.BuffId == 10470101) foundMd = true;
-                    }
+                    readLiveSource = true;
+                    foundPs = bc.Contain(2101001);
+                    foundMd = bc.Contain(10470101);
                 }
             }
             catch { }
-            if (readAnySource)
+            if (!readLiveSource)
+            {
+                try
+                {
+                    var buffs = Players.BuffsOf(unitId);
+                    if (buffs != null)
+                    {
+                        readLiveSource = true;
+                        for (int i = 0; i < buffs.Count; i++)
+                        {
+                            int bid = buffs[i].BuffId;
+                            if (bid == 2101001) foundPs = true;
+                            else if (bid == 10470101) foundMd = true;
+                        }
+                    }
+                }
+                catch { }
+            }
+            // Only fall back to spawn/reconnect snapshot Hero.Buffs when live buffContainer/BuffsOf is unavailable
+            // (Hero.Buffs is never mutated on mid-match buff expiry in AstralParty.Runtime.dll).
+            if (!readLiveSource)
+            {
+                try
+                {
+                    var pd = Players.Get(unitId);
+                    var hero = pd != null && pd.player != null ? pd.player.Hero : null;
+                    if (hero != null && hero.Buffs != null)
+                    {
+                        readLiveSource = true;
+                        foreach (var kv in hero.Buffs)
+                        {
+                            var b = kv.Value;
+                            if (b == null) continue;
+                            if (b.BuffId == 2101001) foundPs = true;
+                            else if (b.BuffId == 10470101) foundMd = true;
+                        }
+                    }
+                }
+                catch { }
+            }
+            if (readLiveSource)
             {
                 hasProblemStudent = foundPs;
                 hasMandarinDuck = foundMd;
@@ -4128,7 +4148,8 @@ namespace MonsterPathPredictor.Runtime
                     }
                 }
                 catch { }
-                if (!notSelect)
+                // Only fall back to spawn/reconnect snapshot Hero.NotSelect when live Property.NotSelect was unavailable.
+                if (!notSelectReadOk)
                 {
                     try
                     {
@@ -4172,32 +4193,71 @@ namespace MonsterPathPredictor.Runtime
                 }
                 catch { }
 
+                // Read live crime buff progress (10013) directly from live BuffContainer (Hero.Buffs is frozen at spawn/reconnect).
                 try
                 {
-                    if (p.Hero != null && p.Hero.Buffs != null)
+                    var bc = pd.buffContainer;
+                    if (bc != null)
                     {
-                        anyBuffSourceRead = true;
-                        foreach (var kv in p.Hero.Buffs)
+                        if (!anyBuffSourceRead)
                         {
-                            var b = kv.Value;
-                            if (b == null) continue;
-                            int bid = b.BuffId;
-                            if (bid == 2101001) hasProblemStudent = true;
-                            else if (bid == 10470101) hasMandarinDuck = true;
-                            else if (bid == 10671302) isTrueCulprit = true;
-                            else if (bid == 1270202) hasUnchallengeableStealth = true;
-                            else if (bid == 10013 && b.Progress > crimeFromBuff) crimeFromBuff = b.Progress;
-
-                            if (!notSelect && settings != null && settings.ExcludedPlayerBuffIds != null &&
-                                settings.ExcludedPlayerBuffIds.Contains(bid))
+                            anyBuffSourceRead = true;
+                            hasProblemStudent = bc.Contain(2101001);
+                            hasMandarinDuck = bc.Contain(10470101);
+                            isTrueCulprit = bc.Contain(10671302);
+                            hasUnchallengeableStealth = bc.Contain(1270202);
+                            if (!notSelect && settings != null && settings.ExcludedPlayerBuffIds != null)
                             {
-                                notSelect = true;
-                                notSelectReadOk = true;
+                                foreach (int exId in settings.ExcludedPlayerBuffIds)
+                                {
+                                    if (bc.Contain(exId))
+                                    {
+                                        notSelect = true;
+                                        notSelectReadOk = true;
+                                        break;
+                                    }
+                                }
                             }
+                        }
+                        var crimeBuff = bc.GetBuff(10013);
+                        if (crimeBuff != null && crimeBuff.Progress > crimeFromBuff)
+                        {
+                            crimeFromBuff = crimeBuff.Progress;
                         }
                     }
                 }
                 catch { }
+
+                // Only fall back to spawn/reconnect snapshot Hero.Buffs when BOTH live buff sources were unavailable!
+                if (!anyBuffSourceRead)
+                {
+                    try
+                    {
+                        if (p.Hero != null && p.Hero.Buffs != null)
+                        {
+                            anyBuffSourceRead = true;
+                            foreach (var kv in p.Hero.Buffs)
+                            {
+                                var b = kv.Value;
+                                if (b == null) continue;
+                                int bid = b.BuffId;
+                                if (bid == 2101001) hasProblemStudent = true;
+                                else if (bid == 10470101) hasMandarinDuck = true;
+                                else if (bid == 10671302) isTrueCulprit = true;
+                                else if (bid == 1270202) hasUnchallengeableStealth = true;
+                                else if (bid == 10013 && b.Progress > crimeFromBuff) crimeFromBuff = b.Progress;
+
+                                if (!notSelect && settings != null && settings.ExcludedPlayerBuffIds != null &&
+                                    settings.ExcludedPlayerBuffIds.Contains(bid))
+                                {
+                                    notSelect = true;
+                                    notSelectReadOk = true;
+                                }
+                            }
+                        }
+                    }
+                    catch { }
+                }
 
                 // Merge buff-derived and targetability fields with last confirmed values when sources failed.
                 if (anyBuffSourceRead)
@@ -4653,14 +4713,29 @@ namespace MonsterPathPredictor.Runtime
 
         private static bool IsWardenTrueCulpritRevealed(BattlePlayerData pd)
         {
+            bool readLive = false;
             try
             {
-                long pid = pd.player != null ? pd.player.Id : 0;
+                var bc = pd != null ? pd.buffContainer : null;
+                if (bc != null)
+                {
+                    readLive = true;
+                    if (bc.Contain(10671303)) return true;
+                    var b1301 = bc.GetBuff(10671301);
+                    if (b1301 != null && b1301.Progress > 0) return true;
+                    return false;
+                }
+            }
+            catch { }
+            try
+            {
+                long pid = pd != null && pd.player != null ? pd.player.Id : 0;
                 if (pid != 0)
                 {
                     var buffs = Players.BuffsOf(pid);
                     if (buffs != null)
                     {
+                        readLive = true;
                         for (int i = 0; i < buffs.Count; i++)
                         {
                             if (buffs[i].BuffId == 10671303) return true;
@@ -4669,67 +4744,88 @@ namespace MonsterPathPredictor.Runtime
                 }
             }
             catch { }
-            try
+            if (!readLive)
             {
-                var hero = pd.player != null ? pd.player.Hero : null;
-                if (hero != null && hero.Buffs != null)
+                try
                 {
-                    foreach (var kv in hero.Buffs)
+                    var hero = pd != null && pd.player != null ? pd.player.Hero : null;
+                    if (hero != null && hero.Buffs != null)
                     {
-                        var b = kv.Value;
-                        if (b == null) continue;
-                        if (b.BuffId == 10671303 || (b.BuffId == 10671301 && b.Progress > 0)) return true;
+                        foreach (var kv in hero.Buffs)
+                        {
+                            var b = kv.Value;
+                            if (b == null) continue;
+                            if (b.BuffId == 10671303 || (b.BuffId == 10671301 && b.Progress > 0)) return true;
+                        }
                     }
                 }
+                catch { }
             }
-            catch { }
             return false;
         }
 
         private static bool HasMonsterBuff(BattlePlayerData pd, int buffId)
         {
+            bool readLive = false;
             try
             {
-                long pid = pd.player != null ? pd.player.Id : 0;
+                var bc = pd != null ? pd.buffContainer : null;
+                if (bc != null)
+                {
+                    readLive = true;
+                    return bc.Contain(buffId);
+                }
+            }
+            catch { }
+            try
+            {
+                long pid = pd != null && pd.player != null ? pd.player.Id : 0;
                 if (pid != 0)
                 {
                     var buffs = Players.BuffsOf(pid);
                     if (buffs != null)
                     {
+                        readLive = true;
                         for (int i = 0; i < buffs.Count; i++)
                         {
                             if (buffs[i].BuffId == buffId) return true;
                         }
+                        return false;
                     }
                 }
             }
             catch { }
-            try
+            if (!readLive)
             {
-                var hero = pd.player != null ? pd.player.Hero : null;
-                if (hero != null && hero.Buffs != null)
+                try
                 {
-                    foreach (var kv in hero.Buffs)
+                    var hero = pd != null && pd.player != null ? pd.player.Hero : null;
+                    if (hero != null && hero.Buffs != null)
                     {
-                        if (kv.Value != null && kv.Value.BuffId == buffId) return true;
+                        foreach (var kv in hero.Buffs)
+                        {
+                            if (kv.Value != null && kv.Value.BuffId == buffId) return true;
+                        }
                     }
                 }
+                catch { }
             }
-            catch { }
             return false;
         }
 
         private static bool TryReadTauntTarget(BattlePlayerData pd, Dictionary<int, long> heroIdToPlayerId, out long targetPlayerId)
         {
             targetPlayerId = 0;
+            bool readLive = false;
+            // Read live BuffContainer FIRST so mid-match Taunt (10011) is detected and expired Taunt clears immediately!
             try
             {
-                var hero = pd.player != null ? pd.player.Hero : null;
-                if (hero == null || hero.Buffs == null) return false;
-                foreach (var kv in hero.Buffs)
+                var bc = pd != null ? pd.buffContainer : null;
+                if (bc != null)
                 {
-                    var buff = kv.Value;
-                    if (buff == null || buff.BuffId != 10011) continue;
+                    readLive = true;
+                    var buff = bc.GetBuff(10011);
+                    if (buff == null) return false;
                     int skillId = buff.Source != null ? buff.Source.Id : 0;
                     if (skillId >= 10000)
                     {
@@ -4744,6 +4840,31 @@ namespace MonsterPathPredictor.Runtime
                 }
             }
             catch { }
+            if (!readLive)
+            {
+                try
+                {
+                    var hero = pd != null && pd.player != null ? pd.player.Hero : null;
+                    if (hero == null || hero.Buffs == null) return false;
+                    foreach (var kv in hero.Buffs)
+                    {
+                        var buff = kv.Value;
+                        if (buff == null || buff.BuffId != 10011) continue;
+                        int skillId = buff.Source != null ? buff.Source.Id : 0;
+                        if (skillId >= 10000)
+                        {
+                            int casterHeroId = skillId / 100;
+                            if (heroIdToPlayerId.TryGetValue(casterHeroId, out long pid))
+                            {
+                                targetPlayerId = pid;
+                                return true;
+                            }
+                        }
+                        return true;
+                    }
+                }
+                catch { }
+            }
             return false;
         }
 

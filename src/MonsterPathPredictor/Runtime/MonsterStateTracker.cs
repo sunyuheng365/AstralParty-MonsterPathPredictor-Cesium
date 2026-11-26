@@ -274,7 +274,7 @@ namespace MonsterPathPredictor.Runtime
         private readonly Dictionary<long, int> _lastHeroProtoNodeId = new Dictionary<long, int>();
         private readonly Dictionary<long, int> _preLayoutHeroProtoNodeId = new Dictionary<long, int>();
         private readonly HashSet<long> _heroConfirmedOnCurrentLayout = new HashSet<long>();
-        private readonly HashSet<long> _heroProtoConfirmedOnCurrentLayout = new HashSet<long>();
+        private readonly HashSet<long> _heroVisualConfirmedOnCurrentLayout = new HashSet<long>();
         private readonly Dictionary<long, ConfirmedHeroCache> _confirmedHeroFields = new Dictionary<long, ConfirmedHeroCache>();
         private readonly Dictionary<int, object> _currentLayoutLandById = new Dictionary<int, object>();
         private bool _awaitingPostLayoutHeroConfirmation;
@@ -513,7 +513,7 @@ namespace MonsterPathPredictor.Runtime
             _lastHeroProtoNodeId.Clear();
             _preLayoutHeroProtoNodeId.Clear();
             _heroConfirmedOnCurrentLayout.Clear();
-            _heroProtoConfirmedOnCurrentLayout.Clear();
+            _heroVisualConfirmedOnCurrentLayout.Clear();
             _confirmedHeroFields.Clear();
             _currentLayoutLandById.Clear();
             _awaitingPostLayoutHeroConfirmation = false;
@@ -595,7 +595,7 @@ namespace MonsterPathPredictor.Runtime
             _preLayoutHeroProtoNodeId.Clear();
             foreach (var kv in _lastHeroProtoNodeId) _preLayoutHeroProtoNodeId[kv.Key] = kv.Value;
             _heroConfirmedOnCurrentLayout.Clear();
-            _heroProtoConfirmedOnCurrentLayout.Clear();
+            _heroVisualConfirmedOnCurrentLayout.Clear();
             foreach (var hc in _confirmedHeroFields.Values) hc.LandId = -1;
             _awaitingPostLayoutHeroConfirmation = newBoard != null;
             Interlocked.Increment(ref _boardScanRevision);
@@ -775,9 +775,9 @@ namespace MonsterPathPredictor.Runtime
                     var pd = all[i];
                     if (pd != null && pd.player != null && pd.player.Id == unitId)
                     {
-                        // Prefer authoritative protocol NodeId for event stamping so animation lag on standLand
-                        // never pins combat onto the previous tile instead of the actual fork tile.
-                        if (pd.player.NodeId >= 0) return pd.player.NodeId;
+                        // Normal walking (MoveS2C -> CharacterMove.Move) ONLY updates Character.standLand
+                        // and NEVER updates RoomPlayer.NodeId (which stays frozen at the spawn / last 1040.Place tile).
+                        // Always prefer live standLand.Id first, falling back to RoomPlayer.NodeId only if unavailable.
                         return SafeLandId(pd);
                     }
                 }
@@ -1623,7 +1623,7 @@ namespace MonsterPathPredictor.Runtime
                         _lastHeroProtoNodeId.Remove(dep);
                         _preLayoutHeroProtoNodeId.Remove(dep);
                         _heroConfirmedOnCurrentLayout.Remove(dep);
-                        _heroProtoConfirmedOnCurrentLayout.Remove(dep);
+                        _heroVisualConfirmedOnCurrentLayout.Remove(dep);
                         _confirmedHeroFields.Remove(dep);
                     }
                     _knownPlayerCount = _knownPlayerIds.Count;
@@ -2627,7 +2627,7 @@ namespace MonsterPathPredictor.Runtime
             _lastHeroProtoNodeId.Clear();
             _preLayoutHeroProtoNodeId.Clear();
             _heroConfirmedOnCurrentLayout.Clear();
-            _heroProtoConfirmedOnCurrentLayout.Clear();
+            _heroVisualConfirmedOnCurrentLayout.Clear();
             _confirmedHeroFields.Clear();
             _currentLayoutLandById.Clear();
             _awaitingPostLayoutHeroConfirmation = false;
@@ -4832,9 +4832,11 @@ namespace MonsterPathPredictor.Runtime
         }
 
         /// <summary>
-        /// Per-source authoritative hero tile resolver: tracks current-layout evidence for the protocol
-        /// (<c>player.NodeId</c>) and visual (<c>standLand</c>) sources independently so verified visual evidence
-        /// never certifies a disagreeing stale protocol tile, even after the global post-layout gate opens.
+        /// Authoritative live hero tile resolver verified against <c>AstralParty.Runtime.dll</c> movement semantics:
+        /// prefers <c>Character.standLand</c> verified on the current <c>LandManager</c> (because normal dice
+        /// movement <c>MoveS2C</c> only updates <c>Character.standLand</c> and leaves <c>RoomPlayer.NodeId</c>
+        /// frozen at the hero's spawn or last <c>1040.Place</c> tile), falling back to <c>RoomPlayer.NodeId</c>
+        /// only when <c>standLand</c> is unavailable and <c>RoomPlayer.NodeId</c> is proven fresh.
         /// </summary>
         private int SafeAuthoritativeHeroLandId(BattlePlayerData pd, BoardGraph board, out bool confirmedOnCurrentLayout)
         {
@@ -4870,51 +4872,41 @@ namespace MonsterPathPredictor.Runtime
             }
             catch { }
 
-            bool protoOnBoard = protoNode >= 0 && (board == null || board.Contains(protoNode));
-            bool standOnBoard = standLandId >= 0 && standLandVerifiedOnCurrentManager && (board == null || board.Contains(standLandId));
             bool hasPriorLayout = _previousBoardBeforeTopologyChange != null || _preLayoutHeroProtoNodeId.Count > 0;
+            bool prevBoardContainsProto = protoNode >= 0 &&
+                                          _previousBoardBeforeTopologyChange != null &&
+                                          _previousBoardBeforeTopologyChange.Contains(protoNode);
+            int? preLayoutProto = (pid > 0 && _preLayoutHeroProtoNodeId.TryGetValue(pid, out int oldProto)) ? (int?)oldProto : null;
+            int? lastSeenProto = (pid > 0 && _lastHeroProtoNodeId.TryGetValue(pid, out int prevProto)) ? (int?)prevProto : null;
+            bool visualConfirmedBefore = pid > 0 && _heroVisualConfirmedOnCurrentLayout.Contains(pid);
 
-            bool protoConfirmed = protoOnBoard && (
-                !hasPriorLayout ||
-                (pid > 0 && _heroProtoConfirmedOnCurrentLayout.Contains(pid)) ||
-                (_previousBoardBeforeTopologyChange != null && !_previousBoardBeforeTopologyChange.Contains(protoNode)) ||
-                (pid > 0 && _preLayoutHeroProtoNodeId.TryGetValue(pid, out int oldProto) && protoNode != oldProto) ||
-                (standOnBoard && protoNode == standLandId));
+            var resolved = HeroPositionResolver.Resolve(
+                board,
+                standLandId,
+                standLandVerifiedOnCurrentManager,
+                hasCurrentManagerLandMap: _currentLayoutLandById.Count > 0,
+                protoNodeId: protoNode,
+                hasPriorLayout: hasPriorLayout,
+                prevBoardContainsProto: prevBoardContainsProto,
+                preLayoutProtoNodeId: preLayoutProto,
+                lastSeenProtoNodeId: lastSeenProto,
+                visualConfirmedOnCurrentLayout: visualConfirmedBefore);
 
-            if (hasPriorLayout && protoOnBoard && !protoConfirmed && pid > 0 && !_preLayoutHeroProtoNodeId.ContainsKey(pid))
+            if (resolved.ShouldBaselineUnconfirmedPostLayoutProto && pid > 0 && protoNode >= 0)
             {
-                // Baseline a newly sighted overlapping post-layout protocol ID so a later protocol change promotes it.
                 _preLayoutHeroProtoNodeId[pid] = protoNode;
             }
 
-            if (protoConfirmed)
+            if (resolved.ConfirmedOnCurrentLayout && resolved.LandId >= 0)
             {
                 if (pid > 0)
                 {
                     _heroConfirmedOnCurrentLayout.Add(pid);
-                    _heroProtoConfirmedOnCurrentLayout.Add(pid);
-                    _lastHeroProtoNodeId[pid] = protoNode;
+                    if (resolved.UsedVerifiedVisual) _heroVisualConfirmedOnCurrentLayout.Add(pid);
+                    if (protoNode >= 0) _lastHeroProtoNodeId[pid] = protoNode;
                 }
                 confirmedOnCurrentLayout = true;
-                return protoNode;
-            }
-
-            if (standOnBoard)
-            {
-                // Visual standLand is verified on the replacement manager, while protocol is still stale/disagreeing:
-                // return the verified visual tile and do NOT promote the unconfirmed protocol source!
-                if (pid > 0)
-                {
-                    _heroConfirmedOnCurrentLayout.Add(pid);
-                }
-                confirmedOnCurrentLayout = true;
-                return standLandId;
-            }
-
-            if (!hasPriorLayout && _currentLayoutLandById.Count == 0 && standLandId >= 0 && (board == null || board.Contains(standLandId)))
-            {
-                confirmedOnCurrentLayout = true;
-                return standLandId;
+                return resolved.LandId;
             }
 
             return -1;

@@ -414,6 +414,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                 FromLandId = fromTile,
                 FrontNodeIds = m.FrontNodeIds,
                 IsCurrentlyMovingMidTurn = stepped && !thiefStoleHere,
+                HasStartedMovingThisTurn = stepped || isPostCombat || thiefStoleHere || foughtTurn,
                 TurnStartLandId = turnStartLandId,
                 JustFoughtOnCurrentFork = isPostCombat || thiefStoleHere,
                 HasLaunchedFightThisTurn = foughtTurn,

@@ -71,6 +71,8 @@ namespace MonsterPathPredictor.Runtime
             public int LastLandId = -1;
             public int LastVisualLandId = -1;
             public int LastFromLandId = -1;
+            public bool ArrivedByNormalWalk;
+            public bool WardenRevealedLatched;
             public int MoveSequence;
             public long LastAppliedPlaceSeq;
             public bool JustSpawnedOnFork;
@@ -78,19 +80,10 @@ namespace MonsterPathPredictor.Runtime
             public int CombatForkLandId = -1;
             public int CombatTurnSequence = -1;
             public int LaunchedFightTurnSequence = -1;
-            public int BossTargetLockTurnSequence = -1;
-            public int BossTargetClearedTurnSequence = -1;
-            public bool HasLastRawServerBossTarget;
-            public long LastRawServerBossTargetId;
-            public long EffectiveServerBossTargetId;
-            public int BossTargetAssignedTurnSeq = -1;
-            public long BossTargetAssignedOrderSeq;
-            public int BossTargetAssignmentVersion;
-            public long InferredBossTargetId;
-            public bool HasPendingServerBossTarget;
-            public long PendingServerBossTargetId;
-            public long PendingServerBossTargetOrderSeq;
-            public readonly List<(long OpponentId, int TurnSeq, int Version)> RecentClearedBossFights = new List<(long, int, int)>(8);
+            public LaunchFightTurnGuard LaunchFightGuard;
+            public BossTargetLockState BossLock;
+            public int LastObservedSnapshotGen;
+            public object LastHeroRef;
             public int StolenTurnSequence = -1;
             public SkillMoveKind SkillMoveKind = SkillMoveKind.None;
             public bool SkillMoveFromHeuristic;
@@ -109,7 +102,7 @@ namespace MonsterPathPredictor.Runtime
             public int ExplicitFrontLandId = -1;
             public int ExplicitFrontFromLandId = -1;
 
-            public long EffectiveBossTargetId => EffectiveServerBossTargetId != 0 ? EffectiveServerBossTargetId : InferredBossTargetId;
+            public long EffectiveBossTargetId => BossLock.ActiveBossTargetId;
         }
 
         private sealed class ConfirmedHeroCache
@@ -130,6 +123,12 @@ namespace MonsterPathPredictor.Runtime
             public int CrimeNum;
             public bool HasProblemStudentMark;
             public bool HasMandarinDuckMark;
+            public object LastHeroRef;
+            public int SnapshotGen;
+            public long PendingLogicalEventSeq;
+            public int PendingLogicalLandId = -1;
+            public long AcknowledgedLogicalEventSeq;
+            public bool ObservedWalkSinceSnapshot;
         }
 
         private struct DiceRollRecord
@@ -241,6 +240,85 @@ namespace MonsterPathPredictor.Runtime
 
         private const int MaxQueuedEvents = 256;
         private const double RetiredMonsterGraceSec = 30.0;
+
+        private struct ProtocolTurnEvent
+        {
+            public int Kind; // 1 = ActionStart(1026), 2 = RoundChange(1015/1117), 3 = FullSnapshot
+            public long ActorId;
+            public int Round;
+            public long MatchRoomId;
+            public long MatchStartTime;
+            public int MatchGeneration;
+        }
+
+        private struct UnitRelocationEvent
+        {
+            public long Seq;
+            public long UnitId;
+            public int LandId;
+            public int BackLandId;
+            public int[] FrontNodeIds;
+            public bool IsPursuit;
+            public bool IsExitPursuit;
+            public bool IsSpawn;
+            public long MatchRoomId;
+            public long MatchStartTime;
+            public int MatchGeneration;
+            public int LayoutGeneration;
+        }
+
+        private struct LiveAttrEvent
+        {
+            public long UnitId;
+            public bool HasHp;
+            public int RealHp;
+            public int RealChangeHp;
+            public int MaxHp;
+            public bool HasGold;
+            public int CurrGold;
+            public int ChangeGold;
+            public bool HasCrimeNum;
+            public int CrimeNum;
+            public bool HasNotSelect;
+            public bool NotSelect;
+            public bool HasDisappear;
+            public long DisappearUnitId;
+            public bool HasBuff;
+            public int BuffOp;
+            public List<LiveBuffEntry> BuffEntries;
+            public long MatchRoomId;
+            public long MatchStartTime;
+            public int MatchGeneration;
+        }
+
+        private readonly RpcProtocolHookBridge _rpcHooks = new RpcProtocolHookBridge();
+        private readonly UnitPresenceLedger _presenceLedger = new UnitPresenceLedger();
+        private readonly CombatBattleRegistry _battleRegistry = new CombatBattleRegistry();
+        private readonly Dictionary<long, LiveBuffMap> _unitBuffLedgers = new Dictionary<long, LiveBuffMap>();
+        private readonly SkillMoveEffectLedger<UpdateHeroAttrS2C> _skillMoveEffects = new SkillMoveEffectLedger<UpdateHeroAttrS2C>();
+        private readonly ConcurrentQueue<ProtocolTurnEvent> _protocolTurnQueue = new ConcurrentQueue<ProtocolTurnEvent>();
+        private readonly ConcurrentQueue<UnitRelocationEvent> _relocationQueue = new ConcurrentQueue<UnitRelocationEvent>();
+        private readonly ConcurrentQueue<LiveAttrEvent> _liveAttrQueue = new ConcurrentQueue<LiveAttrEvent>();
+        private readonly ConcurrentQueue<(long UnitId, int MatchGen)> _moveWalkQueue = new ConcurrentQueue<(long, int)>();
+        private readonly ConcurrentQueue<(long MoverId, int TriggerLandId, UpdateHeroAttrS2C Attr, int MatchGen)> _skillMoveQueue =
+            new ConcurrentQueue<(long, int, UpdateHeroAttrS2C, int)>();
+        private readonly Dictionary<long, int> _eventHpByUnit = new Dictionary<long, int>();
+        private readonly Dictionary<long, int> _eventMaxHpByUnit = new Dictionary<long, int>();
+        private readonly Dictionary<long, int> _eventGoldByUnit = new Dictionary<long, int>();
+        private readonly Dictionary<long, int> _eventCrimeByUnit = new Dictionary<long, int>();
+        private readonly Dictionary<long, bool> _eventNotSelectByUnit = new Dictionary<long, bool>();
+        private readonly Dictionary<long, (int LandId, long Seq, int LayoutGen)> _latestLogicalLandByUnit =
+            new Dictionary<long, (int, long, int)>();
+        private readonly Dictionary<long, double> _lastWalkEventSecByUnit = new Dictionary<long, double>();
+        private readonly HashSet<long> _freshSpawnedMonsterIds = new HashSet<long>();
+        private long _nextRelocationSeq;
+        private int _rosterSnapshotGeneration = 1;
+        private bool _hasSeenFreshFullSnapshot;
+        private volatile bool _pendingMapLayoutTransition;
+        private volatile int _mapIndexTransitionVersion;
+        private int _ackedMapIndexTransitionVersion;
+        private object _lastCapturedLandManager;
+        private object _lastCapturedNodeDict;
 
         private readonly object _diceQueueLock = new object();
         private readonly Queue<DiceRollRecord> _diceQueue = new Queue<DiceRollRecord>(16);
@@ -359,7 +437,45 @@ namespace MonsterPathPredictor.Runtime
             }
         }
 
+        private double _mapIndexTransitionSec;
+
         public int MatchGeneration => Volatile.Read(ref _matchGeneration);
+        public bool HasPendingMapLayoutTransition => _pendingMapLayoutTransition;
+
+        public bool IsLandManagerInstanceReplaced(LandManager manager)
+        {
+            if (manager == null) return false;
+            if (_lastCapturedLandManager != null && !ReferenceEquals(_lastCapturedLandManager, manager))
+            {
+                return true;
+            }
+            if (_lastCapturedNodeDict != null && manager.NodeDict != null && !ReferenceEquals(_lastCapturedNodeDict, manager.NodeDict))
+            {
+                return true;
+            }
+            return false;
+        }
+
+        public bool IsAwaitingMapLayoutReplacement(LandManager manager)
+        {
+            if (!_pendingMapLayoutTransition) return false;
+            if (IsLandManagerInstanceReplaced(manager)) return false;
+            return (MonotonicSeconds() - _mapIndexTransitionSec) < 2.0;
+        }
+
+        public bool ShouldForceTopologyReplaced(LandManager manager)
+        {
+            if (IsLandManagerInstanceReplaced(manager)) return true;
+            return _pendingMapLayoutTransition && _mapIndexTransitionVersion > _ackedMapIndexTransitionVersion;
+        }
+
+        public void MarkMapLayoutCaptured(LandManager manager)
+        {
+            _lastCapturedLandManager = manager;
+            _lastCapturedNodeDict = manager != null ? manager.NodeDict : null;
+            _ackedMapIndexTransitionVersion = _mapIndexTransitionVersion;
+            _pendingMapLayoutTransition = false;
+        }
 
         public void AcknowledgeBoardValidatedUpTo(BoardGraph completeBoard, long placeSeq)
         {
@@ -426,11 +542,16 @@ namespace MonsterPathPredictor.Runtime
             if (rec == null || newBoard == null) return false;
             if (!IsPlaceCompatibleWithBoard(rec, newBoard)) return false;
 
-            // Positive new-layout evidence: previously observed incompatible with oldBoard, OR
-            // directly incompatible with oldBoard (including distinguishing FrontNodeIds outgoing exits!).
+            // Positive new-layout evidence: previously observed incompatible with oldBoard,
+            // directly incompatible with oldBoard, OR part of the unvalidated relocation batch right around 1086!
+            bool recentUnvalidatedRelocation =
+                !rec.ValidatedForCurrentLayout &&
+                rec.PlaceSeq > oldValidatedSeq &&
+                (MonotonicSeconds() - rec.TimestampSec) <= 2.5;
             bool positiveNewLayoutEvidence =
                 rec.ObservedIncompatibleWithPreviousBoard ||
-                (oldBoard != null && !IsPlaceCompatibleWithBoard(rec, oldBoard));
+                (oldBoard != null && !IsPlaceCompatibleWithBoard(rec, oldBoard)) ||
+                recentUnvalidatedRelocation;
 
             if (positiveNewLayoutEvidence)
             {
@@ -445,15 +566,28 @@ namespace MonsterPathPredictor.Runtime
             return false;
         }
 
+        private static MonsterStateTracker _activeInstance;
+
         public void Start()
         {
             if (_hooked) return;
             _hooked = true;
+            _activeInstance = this;
             GameEvents.FightResolved += OnFightResolved;
             GameEvents.BattleUpdate += OnBattleUpdate;
             GameEvents.SkillUsed += OnSkillUsed;
-            GameEvents.DiceResult += OnDiceResult;
             GameEvents.HeroAttrUpdated += OnHeroAttrUpdated;
+            GameEvents.Move += OnGameMove;
+            _rpcHooks.ActionStarted += OnActionStartNotify;
+            _rpcHooks.RoundStarted += OnRoundStartNotify;
+            _rpcHooks.GameRoundChanged += OnGameRoundChangedNotify;
+            _rpcHooks.DiceThrown += OnThrowDiceNotify;
+            _rpcHooks.MonsterPursuit += OnMonsterPursuitNotify;
+            _rpcHooks.MapIndexChanged += OnMapIndexChangedNotify;
+            _rpcHooks.MonsterRefreshed += OnMonsterRefreshNotify;
+            _rpcHooks.SkillMoveEffectsQueued += OnSkillMoveEffectsNotify;
+            _rpcHooks.FullRoomSnapshotReceived += OnFullRoomSnapshotNotify;
+            _rpcHooks.EnsureHooked();
             GameEvents.StartAutoHook();
         }
 
@@ -462,11 +596,22 @@ namespace MonsterPathPredictor.Runtime
             _acceptEvents = false;
             if (!_hooked) return;
             _hooked = false;
+            if (ReferenceEquals(_activeInstance, this)) _activeInstance = null;
             GameEvents.FightResolved -= OnFightResolved;
             GameEvents.BattleUpdate -= OnBattleUpdate;
             GameEvents.SkillUsed -= OnSkillUsed;
-            GameEvents.DiceResult -= OnDiceResult;
             GameEvents.HeroAttrUpdated -= OnHeroAttrUpdated;
+            GameEvents.Move -= OnGameMove;
+            _rpcHooks.ActionStarted -= OnActionStartNotify;
+            _rpcHooks.RoundStarted -= OnRoundStartNotify;
+            _rpcHooks.GameRoundChanged -= OnGameRoundChangedNotify;
+            _rpcHooks.DiceThrown -= OnThrowDiceNotify;
+            _rpcHooks.MonsterPursuit -= OnMonsterPursuitNotify;
+            _rpcHooks.MapIndexChanged -= OnMapIndexChangedNotify;
+            _rpcHooks.MonsterRefreshed -= OnMonsterRefreshNotify;
+            _rpcHooks.SkillMoveEffectsQueued -= OnSkillMoveEffectsNotify;
+            _rpcHooks.FullRoomSnapshotReceived -= OnFullRoomSnapshotNotify;
+            _rpcHooks.Unhook();
             Reset();
         }
 
@@ -518,6 +663,29 @@ namespace MonsterPathPredictor.Runtime
             _currentLayoutLandById.Clear();
             _awaitingPostLayoutHeroConfirmation = false;
             _retiredMonsterSec.Clear();
+            _presenceLedger.Reset();
+            _battleRegistry.Reset();
+            _unitBuffLedgers.Clear();
+            _skillMoveEffects.Clear();
+            _eventHpByUnit.Clear();
+            _eventMaxHpByUnit.Clear();
+            _eventGoldByUnit.Clear();
+            _eventCrimeByUnit.Clear();
+            _eventNotSelectByUnit.Clear();
+            _latestLogicalLandByUnit.Clear();
+            _lastWalkEventSecByUnit.Clear();
+            _freshSpawnedMonsterIds.Clear();
+            while (_protocolTurnQueue.TryDequeue(out _)) { }
+            while (_relocationQueue.TryDequeue(out _)) { }
+            while (_liveAttrQueue.TryDequeue(out _)) { }
+            while (_moveWalkQueue.TryDequeue(out _)) { }
+            while (_skillMoveQueue.TryDequeue(out _)) { }
+            _hasSeenFreshFullSnapshot = false;
+            _pendingMapLayoutTransition = false;
+            _ackedMapIndexTransitionVersion = _mapIndexTransitionVersion;
+            _lastCapturedLandManager = null;
+            _lastCapturedNodeDict = null;
+            _rosterSnapshotGeneration++;
             _pendingDiceByOwner.Clear();
             _recentSkills.Clear();
             _recentExactDisplacements.Clear();
@@ -698,11 +866,18 @@ namespace MonsterPathPredictor.Runtime
                     matched = pd;
                 }
                 if (matched == null) return false;
+                if (IsUnitAbsentFromBoard(playerId, matched))
+                {
+                    isAlive = false;
+                    authoritativeLandId = -1;
+                    return true;
+                }
                 var verdict = TryEvaluateUnitLiveness(matched);
                 // Require a fresh authoritative liveness verdict for live-owner mutations (never fall back to cached alive).
                 if (!verdict.HasValue) return false;
                 isAlive = verdict.Value;
-                authoritativeLandId = SafeAuthoritativeHeroLandId(matched, board, out bool posConfirmed);
+                // Read-only UI validation MUST NEVER mutate _lastHeroProtoNodeId or acknowledge pending teleports!
+                authoritativeLandId = SafeAuthoritativeHeroLandId(matched, board, out bool posConfirmed, readOnly: true);
                 if (isAlive && !posConfirmed) authoritativeLandId = -1;
                 return true;
             }
@@ -710,15 +885,39 @@ namespace MonsterPathPredictor.Runtime
             return false;
         }
 
+        private static bool IsAnimatorHidden(BattlePlayerData pd)
+        {
+            if (pd == null) return false;
+            try
+            {
+                var ch = pd.CharacterInst;
+                if (!UnityObject.IsAlive(ch)) return false;
+                var anim = ch.characterAnimator;
+                if (!UnityObject.IsAlive(anim)) return false;
+                return anim.IsHide();
+            }
+            catch { return false; }
+        }
+
+        private bool IsUnitAbsentFromBoard(long unitId, BattlePlayerData pd)
+        {
+            return _presenceLedger.IsEffectivelyAbsent(unitId, IsAnimatorHidden(pd));
+        }
+
         /// <summary>
         /// Checks live monster roster presence &amp; eligibility across the full unit list (rejecting cross-type
-        /// or same-type duplicate IDs and distinguishing unavailable roster from dead/ineligible).
+        /// or same-type duplicate IDs, absorbed/hidden units, and distinguishing unavailable roster from dead/ineligible).
         /// </summary>
         public static LiveMonsterCheckResult CheckMonsterLiveAndEligible(long monsterId, bool allowNonAggressive)
         {
             if (monsterId <= 0) return LiveMonsterCheckResult.DeadOrIneligible;
             try
             {
+                var activeInst = _activeInstance;
+                if (activeInst != null && activeInst._presenceLedger.IsMarkedDisappeared(monsterId))
+                {
+                    return LiveMonsterCheckResult.DeadOrIneligible;
+                }
                 var all = Players.All();
                 if (all == null || all.Count == 0) return LiveMonsterCheckResult.Indeterminate;
                 BattlePlayerData matched = null;
@@ -742,6 +941,7 @@ namespace MonsterPathPredictor.Runtime
                 {
                     return anyUnreadableEntry ? LiveMonsterCheckResult.Indeterminate : LiveMonsterCheckResult.DeadOrIneligible;
                 }
+                if (IsAnimatorHidden(matched)) return LiveMonsterCheckResult.DeadOrIneligible;
                 if (!TryCheckRosterMonsterAlive(matched, out bool alive)) return LiveMonsterCheckResult.Indeterminate;
                 if (!alive) return LiveMonsterCheckResult.DeadOrIneligible;
                 if (!allowNonAggressive)
@@ -763,27 +963,64 @@ namespace MonsterPathPredictor.Runtime
             return CheckMonsterLiveAndEligible(monsterId, allowNonAggressive) == LiveMonsterCheckResult.Eligible;
         }
 
-        public static int TryReadLiveUnitLandId(long unitId)
+        public int TryReadLiveUnitLandId(long unitId)
         {
             if (unitId == 0) return -1;
+            int curLayoutGen = Volatile.Read(ref _layoutGeneration);
             try
             {
                 var all = Players.All();
-                if (all == null) return -1;
-                for (int i = 0; i < all.Count; i++)
+                if (all != null)
                 {
-                    var pd = all[i];
-                    if (pd != null && pd.player != null && pd.player.Id == unitId)
+                    for (int i = 0; i < all.Count; i++)
                     {
-                        // Normal walking (MoveS2C -> CharacterMove.Move) ONLY updates Character.standLand
-                        // and NEVER updates RoomPlayer.NodeId (which stays frozen at the spawn / last 1040.Place tile).
-                        // Always prefer live standLand.Id first, falling back to RoomPlayer.NodeId only if unavailable.
-                        return SafeLandId(pd);
+                        var pd = all[i];
+                        if (pd != null && pd.player != null && pd.player.Id == unitId)
+                        {
+                            // For heroes, route through read-only HeroPositionResolver (honors pending 1040.Place / 5214.Pursuit
+                            // and current-manager standLand verification without mutating provenance!).
+                            if (pd.characterType == CharacterType.Hero)
+                            {
+                                int heroLand = SafeAuthoritativeHeroLandId(pd, _lastValidatedBoard, out bool confirmed, readOnly: true);
+                                if (confirmed && heroLand >= 0) return heroLand;
+                                if (_confirmedHeroFields.TryGetValue(unitId, out var hc) && hc.LandId >= 0) return hc.LandId;
+                                return -1;
+                            }
+                            int verifiedLand = ReadUnitLandIdVerified(pd, out bool fromVis);
+                            if (fromVis && verifiedLand >= 0) return verifiedLand;
+                            if (_latestLogicalLandByUnit.TryGetValue(unitId, out var logRec) && logRec.LayoutGen == curLayoutGen && logRec.LandId >= 0)
+                                return logRec.LandId;
+                            if (_memories.TryGetValue(unitId, out var mem) && mem.LastLandId >= 0) return mem.LastLandId;
+                            return verifiedLand;
+                        }
                     }
                 }
             }
             catch { }
+            if (_latestLogicalLandByUnit.TryGetValue(unitId, out var fallbackLog) && fallbackLog.LayoutGen == curLayoutGen && fallbackLog.LandId >= 0)
+                return fallbackLog.LandId;
             return -1;
+        }
+
+        private static readonly FieldInfo BattleCurPlayerIdField = typeof(BattleLogic).GetField(
+            "CurPlayerId",
+            BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+
+        private static long TryReadRawCurPlayerId(BattleLogic battle)
+        {
+            if (battle == null) return 0;
+            try
+            {
+                if (BattleCurPlayerIdField != null && BattleCurPlayerIdField.GetValue(battle) is long rawId)
+                {
+                    // Raw BattleLogic.CurPlayerId preserves 0 (no active actor) instead of get_curPlayerId()'s
+                    // PlayerDatas[0] fallback!
+                    return rawId > 0 ? rawId : 0;
+                }
+            }
+            catch { }
+            var cur = SafeGetCurrentPlayer(battle);
+            return (cur != null && cur.player != null) ? cur.player.Id : 0;
         }
 
         private static long TryReadCurrentActorId()
@@ -791,8 +1028,7 @@ namespace MonsterPathPredictor.Runtime
             try
             {
                 if (!Tools.SimpleSingletonProvider<GameLogicManager>.hasInstance) return 0;
-                var cur = SafeGetCurrentPlayer(Tools.SimpleSingletonProvider<GameLogicManager>.inst.battle);
-                return (cur != null && cur.player != null) ? cur.player.Id : 0;
+                return TryReadRawCurPlayerId(Tools.SimpleSingletonProvider<GameLogicManager>.inst.battle);
             }
             catch { return 0; }
         }
@@ -856,91 +1092,278 @@ namespace MonsterPathPredictor.Runtime
             catch { return false; }
         }
 
-        private static void TryReadUnitBossMarks(long unitId, out bool? hasProblemStudent, out bool? hasMandarinDuck)
+        private static readonly FieldInfo BuffContainerDictField = typeof(BuffContainer).GetField(
+            "_buffDict",
+            BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+
+        private static bool TryReadDirectLiveBuffEntries(BattlePlayerData pd, out List<LiveBuffEntry> entries)
+        {
+            entries = null;
+            if (pd == null) return false;
+            try
+            {
+                var bc = pd.buffContainer;
+                if (bc == null || BuffContainerDictField == null) return false;
+                if (!(BuffContainerDictField.GetValue(bc) is System.Collections.IDictionary dict)) return false;
+                var list = new List<LiveBuffEntry>(dict.Count);
+                foreach (System.Collections.DictionaryEntry de in dict)
+                {
+                    if (!(de.Value is Buff b)) continue;
+                    int bid = b.BuffId;
+                    if (bid <= 0) continue;
+                    int prog = b.Progress;
+                    int srcSkill = b.Source != null ? b.Source.Id : 0;
+                    long uid = b.UniqueId != 0 ? b.UniqueId : (de.Key is long lk ? lk : 0L);
+                    list.Add(new LiveBuffEntry(uid, bid, prog, srcSkill));
+                }
+                entries = list;
+                return true;
+            }
+            catch
+            {
+                entries = null;
+                return false;
+            }
+        }
+
+        private void TryReadUnitBossMarks(long unitId, out bool? hasProblemStudent, out bool? hasMandarinDuck)
         {
             hasProblemStudent = null;
             hasMandarinDuck = null;
             if (unitId == 0) return;
-            bool readLiveSource = false;
-            bool foundPs = false;
-            bool foundMd = false;
+
+            // 1. Direct live BuffContainer._buffDict read (complete traversal before publishing!).
             try
             {
                 var pd = Players.Get(unitId);
-                var bc = pd != null ? pd.buffContainer : null;
-                if (bc != null)
+                if (TryReadDirectLiveBuffEntries(pd, out var directEntries))
                 {
-                    readLiveSource = true;
-                    foundPs = bc.Contain(2101001);
-                    foundMd = bc.Contain(10470101);
+                    bool foundPs = false;
+                    bool foundMd = false;
+                    for (int i = 0; i < directEntries.Count; i++)
+                    {
+                        int bid = directEntries[i].BuffId;
+                        if (bid == 2101001) foundPs = true;
+                        else if (bid == 10470101) foundMd = true;
+                    }
+                    hasProblemStudent = foundPs;
+                    hasMandarinDuck = foundMd;
+                    return;
                 }
             }
             catch { }
-            if (!readLiveSource)
+
+            // 2. Fallback to event-driven live buff ledger (populated from 1040/1096 BuffChange op 0/1/2/3).
+            if (_unitBuffLedgers.TryGetValue(unitId, out var ledger) && ledger.HasConfirmedState)
             {
-                try
-                {
-                    var buffs = Players.BuffsOf(unitId);
-                    if (buffs != null)
-                    {
-                        readLiveSource = true;
-                        for (int i = 0; i < buffs.Count; i++)
-                        {
-                            int bid = buffs[i].BuffId;
-                            if (bid == 2101001) foundPs = true;
-                            else if (bid == 10470101) foundMd = true;
-                        }
-                    }
-                }
-                catch { }
+                var summary = ledger.BuildSummary();
+                hasProblemStudent = summary.HasProblemStudent;
+                hasMandarinDuck = summary.HasMandarinDuck;
+                return;
             }
-            // Only fall back to spawn/reconnect snapshot Hero.Buffs when live buffContainer/BuffsOf is unavailable
-            // (Hero.Buffs is never mutated on mid-match buff expiry in AstralParty.Runtime.dll).
-            if (!readLiveSource)
+
+            // 3. Fallback to last confirmed hero cache (never falling back to frozen Hero.Buffs mid-match).
+            if (_confirmedHeroFields.TryGetValue(unitId, out var hc) && hc.HasBuffRead)
             {
-                try
-                {
-                    var pd = Players.Get(unitId);
-                    var hero = pd != null && pd.player != null ? pd.player.Hero : null;
-                    if (hero != null && hero.Buffs != null)
-                    {
-                        readLiveSource = true;
-                        foreach (var kv in hero.Buffs)
-                        {
-                            var b = kv.Value;
-                            if (b == null) continue;
-                            if (b.BuffId == 2101001) foundPs = true;
-                            else if (b.BuffId == 10470101) foundMd = true;
-                        }
-                    }
-                }
-                catch { }
-            }
-            if (readLiveSource)
-            {
-                hasProblemStudent = foundPs;
-                hasMandarinDuck = foundMd;
+                hasProblemStudent = hc.HasProblemStudentMark;
+                hasMandarinDuck = hc.HasMandarinDuckMark;
             }
         }
 
-        private void OnDiceResult(long playerId, int dice1, int dice2)
+        private void OnThrowDiceNotify(ThrowDiceS2C msg)
         {
-            if (!_acceptEvents) return;
+            if (!_acceptEvents || msg == null || msg.PlayerId <= 0) return;
             TryStampCurrentMatch(out long matchRoomId, out long matchStartTime);
             int matchGen = Volatile.Read(ref _matchGeneration);
-            // Publish DiceSeq and enqueue atomically so sequence order and queue order can never diverge.
+            // Publish DiceSeq and enqueue atomically for real 5022 ThrowDiceS2C movement rolls!
             lock (_diceQueueLock)
             {
                 int diceSeq = ++_totalDiceSeq;
                 if (_diceQueue.Count >= MaxQueuedEvents) _diceQueue.Dequeue();
                 _diceQueue.Enqueue(new DiceRollRecord
                 {
-                    OwnerId = playerId,
+                    OwnerId = msg.PlayerId,
                     MatchRoomId = matchRoomId,
                     MatchStartTime = matchStartTime,
                     MatchGeneration = matchGen,
                     DiceSeq = diceSeq
                 });
+            }
+        }
+
+        private void OnActionStartNotify(ActionStartNotifyS2C msg)
+        {
+            if (!_acceptEvents || msg == null || msg.PlayerId <= 0) return;
+            TryStampCurrentMatch(out long matchRoomId, out long matchStartTime);
+            int matchGen = Volatile.Read(ref _matchGeneration);
+            if (_protocolTurnQueue.Count >= MaxQueuedEvents) _protocolTurnQueue.TryDequeue(out _);
+            _protocolTurnQueue.Enqueue(new ProtocolTurnEvent
+            {
+                Kind = 1,
+                ActorId = msg.PlayerId,
+                Round = -1,
+                MatchRoomId = matchRoomId,
+                MatchStartTime = matchStartTime,
+                MatchGeneration = matchGen
+            });
+        }
+
+        private void OnRoundStartNotify(RoundStartS2C msg)
+        {
+            if (!_acceptEvents || msg == null || msg.Round < 0) return;
+            TryStampCurrentMatch(out long matchRoomId, out long matchStartTime);
+            int matchGen = Volatile.Read(ref _matchGeneration);
+            if (_protocolTurnQueue.Count >= MaxQueuedEvents) _protocolTurnQueue.TryDequeue(out _);
+            _protocolTurnQueue.Enqueue(new ProtocolTurnEvent
+            {
+                Kind = 2,
+                ActorId = 0,
+                Round = msg.Round,
+                MatchRoomId = matchRoomId,
+                MatchStartTime = matchStartTime,
+                MatchGeneration = matchGen
+            });
+        }
+
+        private void OnGameRoundChangedNotify(GameRoundChangeS2C msg)
+        {
+            if (!_acceptEvents || msg == null || msg.Round < 0) return;
+            TryStampCurrentMatch(out long matchRoomId, out long matchStartTime);
+            int matchGen = Volatile.Read(ref _matchGeneration);
+            if (_protocolTurnQueue.Count >= MaxQueuedEvents) _protocolTurnQueue.TryDequeue(out _);
+            _protocolTurnQueue.Enqueue(new ProtocolTurnEvent
+            {
+                Kind = 2,
+                ActorId = 0,
+                Round = msg.Round,
+                MatchRoomId = matchRoomId,
+                MatchStartTime = matchStartTime,
+                MatchGeneration = matchGen
+            });
+        }
+
+        private void OnFullRoomSnapshotNotify()
+        {
+            if (!_acceptEvents) return;
+            TryStampCurrentMatch(out long matchRoomId, out long matchStartTime);
+            int matchGen = Volatile.Read(ref _matchGeneration);
+            _protocolTurnQueue.Enqueue(new ProtocolTurnEvent
+            {
+                Kind = 3,
+                ActorId = 0,
+                Round = TryReadCurrentRound(),
+                MatchRoomId = matchRoomId,
+                MatchStartTime = matchStartTime,
+                MatchGeneration = matchGen
+            });
+        }
+
+        private void OnGameMove(long playerId, int nodeCount, bool isEnd)
+        {
+            if (!_acceptEvents || playerId <= 0) return;
+            if (_moveWalkQueue.Count >= MaxQueuedEvents) _moveWalkQueue.TryDequeue(out _);
+            _moveWalkQueue.Enqueue((playerId, Volatile.Read(ref _matchGeneration)));
+        }
+
+        private void OnMapIndexChangedNotify(MapIndexChangeS2C msg)
+        {
+            if (!_acceptEvents || msg == null) return;
+            _mapIndexTransitionSec = MonotonicSeconds();
+            Interlocked.Increment(ref _mapIndexTransitionVersion);
+            _pendingMapLayoutTransition = true;
+        }
+
+        private void OnMonsterPursuitNotify(MonsterPursuitS2C msg)
+        {
+            if (!_acceptEvents || msg == null || msg.PlayerId <= 0 || msg.NodeId < 0) return;
+            TryStampCurrentMatch(out long matchRoomId, out long matchStartTime);
+            int matchGen = Volatile.Read(ref _matchGeneration);
+            int layoutGen = Volatile.Read(ref _layoutGeneration);
+            int[] frontIds = Array.Empty<int>();
+            try
+            {
+                if (msg.FrontIds != null && msg.FrontIds.Count > 0)
+                {
+                    frontIds = new int[msg.FrontIds.Count];
+                    for (int i = 0; i < msg.FrontIds.Count; i++) frontIds[i] = msg.FrontIds[i];
+                }
+            }
+            catch { }
+            long seq = Interlocked.Increment(ref _nextRelocationSeq);
+            if (_relocationQueue.Count >= MaxQueuedEvents) _relocationQueue.TryDequeue(out _);
+            _relocationQueue.Enqueue(new UnitRelocationEvent
+            {
+                Seq = seq,
+                UnitId = msg.PlayerId,
+                LandId = msg.NodeId,
+                BackLandId = msg.BackId,
+                FrontNodeIds = frontIds,
+                IsPursuit = true,
+                IsExitPursuit = msg.Exit,
+                MatchRoomId = matchRoomId,
+                MatchStartTime = matchStartTime,
+                MatchGeneration = matchGen,
+                LayoutGeneration = layoutGen
+            });
+        }
+
+        private void OnMonsterRefreshNotify(MonsterRefreshS2C msg)
+        {
+            if (!_acceptEvents || msg == null || msg.Monster == null || msg.Monster.Id <= 0) return;
+            TryStampCurrentMatch(out long matchRoomId, out long matchStartTime);
+            int matchGen = Volatile.Read(ref _matchGeneration);
+            int layoutGen = Volatile.Read(ref _layoutGeneration);
+            int nodeId = -1;
+            int backId = -1;
+            int[] frontIds = Array.Empty<int>();
+            try
+            {
+                var h = msg.Monster.Hero;
+                if (h != null)
+                {
+                    nodeId = h.NodeId;
+                    backId = h.BackNodeId;
+                    if (h.FrontNodeIds != null && h.FrontNodeIds.Count > 0)
+                    {
+                        frontIds = new int[h.FrontNodeIds.Count];
+                        for (int i = 0; i < h.FrontNodeIds.Count; i++) frontIds[i] = h.FrontNodeIds[i];
+                    }
+                }
+            }
+            catch { }
+            long seq = Interlocked.Increment(ref _nextRelocationSeq);
+            if (_relocationQueue.Count >= MaxQueuedEvents) _relocationQueue.TryDequeue(out _);
+            _relocationQueue.Enqueue(new UnitRelocationEvent
+            {
+                Seq = seq,
+                UnitId = msg.Monster.Id,
+                LandId = nodeId,
+                BackLandId = backId,
+                FrontNodeIds = frontIds,
+                IsSpawn = true,
+                MatchRoomId = matchRoomId,
+                MatchStartTime = matchStartTime,
+                MatchGeneration = matchGen,
+                LayoutGeneration = layoutGen
+            });
+        }
+
+        private void OnSkillMoveEffectsNotify(HeroSkillMoveEffectS2C msg)
+        {
+            if (!_acceptEvents || msg == null || msg.PlayerId <= 0 || msg.EffectData == null || msg.EffectData.Count == 0) return;
+            int matchGen = Volatile.Read(ref _matchGeneration);
+            foreach (var kv in msg.EffectData)
+            {
+                int triggerTile = kv.Key;
+                var bundle = kv.Value;
+                if (triggerTile < 0 || bundle == null || bundle.Effects == null) continue;
+                for (int i = 0; i < bundle.Effects.Count; i++)
+                {
+                    var effAttr = bundle.Effects[i];
+                    if (effAttr == null) continue;
+                    if (_skillMoveQueue.Count >= MaxQueuedEvents) _skillMoveQueue.TryDequeue(out _);
+                    _skillMoveQueue.Enqueue((msg.PlayerId, triggerTile, effAttr, matchGen));
+                }
             }
         }
 
@@ -962,6 +1385,12 @@ namespace MonsterPathPredictor.Runtime
         private void OnHeroAttrUpdated(UpdateHeroAttrS2C attr)
         {
             if (!_acceptEvents || attr == null || attr.EffectDatas == null || attr.EffectDatas.Count == 0) return;
+            IngestHeroAttrEffects(attr, allowThiefSteal: true);
+        }
+
+        private void IngestHeroAttrEffects(UpdateHeroAttrS2C attr, bool allowThiefSteal)
+        {
+            if (attr == null || attr.EffectDatas == null || attr.EffectDatas.Count == 0) return;
 
             long ownerId = attr.PlayerId;
             var pubTurn = Volatile.Read(ref _publishedTurn);
@@ -972,8 +1401,6 @@ namespace MonsterPathPredictor.Runtime
             int causeId = attr.Cause != null ? (int)attr.Cause.Id : 0;
             TryStampCurrentMatch(out long matchRoomId, out long matchStartTime);
             int matchGen = Volatile.Read(ref _matchGeneration);
-            // Capture the event's layout epoch ONCE at receipt (never replacing it with a newer layout
-            // epoch at enqueue time if a topology switch raced while processing EffectDatas).
             int eventLayoutGen = Volatile.Read(ref _layoutGeneration);
             double nowSec = MonotonicSeconds();
 
@@ -982,9 +1409,10 @@ namespace MonsterPathPredictor.Runtime
                 var eff = attr.EffectDatas[i];
                 if (eff == null) continue;
 
+                EnqueueLiveAttrDeltas(eff, matchRoomId, matchStartTime, matchGen);
+
                 // Protocol-authoritative Thief gold steal (cmd 1040 ONLY; excludes 1096 pass-by aura effects).
-                // Defer thief/victim type classification to snapshot consumption if live lookup is unavailable now.
-                if (ownerId > 0 && eff.Gold != null && eff.Gold.ChangeGold < 0 && eff.PlayerId > 0 && eff.PlayerId != ownerId && !TryIsUnitHero(ownerId))
+                if (allowThiefSteal && ownerId > 0 && eff.Gold != null && eff.Gold.ChangeGold < 0 && eff.PlayerId > 0 && eff.PlayerId != ownerId && !TryIsUnitHero(ownerId))
                 {
                     if (_thiefStealQueue.Count >= MaxQueuedEvents) _thiefStealQueue.TryDequeue(out _);
                     _thiefStealQueue.Enqueue(new ThiefStealRecord
@@ -1006,9 +1434,8 @@ namespace MonsterPathPredictor.Runtime
                     });
                 }
 
-                // Target-bound skill displacement (cmd 1040 Place effect carries exact victim MonsterId + caster + Cause).
-                // Negative NodeId (< 0) is a protocol sentinel (no destination tile): never enqueue as a wildcard tile match.
-                if (eff.Place != null && eff.Place.Place != null && eff.Place.Place.NodeId >= 0 && eff.PlayerId != 0 && !TryIsUnitHero(eff.PlayerId))
+                // Target-bound 1040.Place for BOTH heroes AND monsters (never dropping hero teleports or same-number Places!).
+                if (eff.Place != null && eff.Place.Place != null && eff.Place.Place.NodeId >= 0 && eff.PlayerId != 0)
                 {
                     int[] placeFrontIds = Array.Empty<int>();
                     try
@@ -1021,29 +1448,124 @@ namespace MonsterPathPredictor.Runtime
                         }
                     }
                     catch { }
-                    // Assign PlaceSeq and enqueue atomically while preserving the receipt's original eventLayoutGen
-                    // so any raced topology switch routes this record through evidence-based migration!
-                    lock (_placeQueueLock)
+
+                    long relocSeq = Interlocked.Increment(ref _nextRelocationSeq);
+                    if (_relocationQueue.Count >= MaxQueuedEvents) _relocationQueue.TryDequeue(out _);
+                    _relocationQueue.Enqueue(new UnitRelocationEvent
                     {
-                        long placeSeq = ++_nextPlaceSeq;
-                        if (_placeQueue.Count >= MaxQueuedEvents) _placeQueue.Dequeue();
-                        _placeQueue.Enqueue(new SkillDisplacementRecord
+                        Seq = relocSeq,
+                        UnitId = eff.PlayerId,
+                        LandId = eff.Place.Place.NodeId,
+                        BackLandId = eff.Place.Place.BackNodeId,
+                        FrontNodeIds = placeFrontIds,
+                        MatchRoomId = matchRoomId,
+                        MatchStartTime = matchStartTime,
+                        MatchGeneration = matchGen,
+                        LayoutGeneration = eventLayoutGen
+                    });
+
+                    if (!TryIsUnitHero(eff.PlayerId))
+                    {
+                        lock (_placeQueueLock)
                         {
-                            PlaceSeq = placeSeq,
-                            TargetMonsterId = eff.PlayerId,
-                            CasterPlayerId = ownerId,
-                            SkillId = causeId,
-                            NewLandId = eff.Place.Place.NodeId,
-                            BackLandId = eff.Place.Place.BackNodeId,
-                            FrontNodeIds = placeFrontIds,
-                            MatchRoomId = matchRoomId,
-                            MatchStartTime = matchStartTime,
-                            MatchGeneration = matchGen,
-                            LayoutGeneration = eventLayoutGen,
-                            TimestampSec = nowSec
-                        });
+                            long placeSeq = ++_nextPlaceSeq;
+                            if (_placeQueue.Count >= MaxQueuedEvents) _placeQueue.Dequeue();
+                            _placeQueue.Enqueue(new SkillDisplacementRecord
+                            {
+                                PlaceSeq = placeSeq,
+                                TargetMonsterId = eff.PlayerId,
+                                CasterPlayerId = ownerId,
+                                SkillId = causeId,
+                                NewLandId = eff.Place.Place.NodeId,
+                                BackLandId = eff.Place.Place.BackNodeId,
+                                FrontNodeIds = placeFrontIds,
+                                MatchRoomId = matchRoomId,
+                                MatchStartTime = matchStartTime,
+                                MatchGeneration = matchGen,
+                                LayoutGeneration = eventLayoutGen,
+                                TimestampSec = nowSec
+                            });
+                        }
                     }
                 }
+            }
+        }
+
+        private void EnqueueLiveAttrDeltas(HeroAttrEffect eff, long matchRoomId, long matchStartTime, int matchGen)
+        {
+            long targetId = eff.PlayerId;
+            bool any = false;
+            var rec = new LiveAttrEvent
+            {
+                UnitId = targetId,
+                MatchRoomId = matchRoomId,
+                MatchStartTime = matchStartTime,
+                MatchGeneration = matchGen
+            };
+
+            if (eff.Hp != null)
+            {
+                rec.HasHp = true;
+                rec.RealHp = eff.Hp.RealHp;
+                rec.RealChangeHp = eff.Hp.RealChangeHp;
+                rec.MaxHp = eff.Hp.MaxHp;
+                if (eff.Hp.PlayerId > 0) rec.UnitId = eff.Hp.PlayerId;
+                any = true;
+            }
+            if (eff.Gold != null)
+            {
+                rec.HasGold = true;
+                rec.CurrGold = eff.Gold.CurrGold;
+                rec.ChangeGold = eff.Gold.ChangeGold;
+                any = true;
+            }
+            if (eff.CrimeNum != null)
+            {
+                rec.HasCrimeNum = true;
+                rec.CrimeNum = Math.Max(0, eff.CrimeNum.CurrNum);
+                any = true;
+            }
+            if (eff.NotSelect != null)
+            {
+                rec.HasNotSelect = true;
+                rec.NotSelect = eff.NotSelect.NotSelect;
+                any = true;
+            }
+            if (eff.Disappear != null)
+            {
+                rec.HasDisappear = true;
+                rec.DisappearUnitId = eff.Disappear.PlayerId > 0 ? eff.Disappear.PlayerId : targetId;
+                any = true;
+            }
+            if (eff.Buff != null)
+            {
+                rec.HasBuff = true;
+                rec.BuffOp = (int)eff.Buff.Op;
+                if (eff.Buff.PlayerId > 0) rec.UnitId = eff.Buff.PlayerId;
+                var entries = new List<LiveBuffEntry>(4);
+                if (eff.Buff.Buff != null)
+                {
+                    var b = eff.Buff.Buff;
+                    entries.Add(new LiveBuffEntry(b.UniqueId, b.BuffId, b.Progress, b.Source != null ? b.Source.Id : 0));
+                }
+                else if (eff.Buff.Buffs != null)
+                {
+                    foreach (var kv in eff.Buff.Buffs)
+                    {
+                        var b = kv.Value;
+                        if (b == null) continue;
+                        long uid = b.UniqueId != 0 ? b.UniqueId : kv.Key;
+                        entries.Add(new LiveBuffEntry(uid, b.BuffId, b.Progress, b.Source != null ? b.Source.Id : 0));
+                    }
+                }
+                rec.BuffEntries = entries;
+                any = true;
+            }
+
+            if (any)
+            {
+                if (_liveAttrQueue.Count >= MaxQueuedEvents) _liveAttrQueue.TryDequeue(out _);
+                _liveAttrQueue.Enqueue(rec);
             }
         }
 
@@ -1051,6 +1573,9 @@ namespace MonsterPathPredictor.Runtime
         {
             if (!_acceptEvents) return;
             if (snap.AttackerPlayerId == 0 && snap.DefenderPlayerId == 0) return;
+            // Deduplicate against earlier BattleUpdate(1007) by BattleId so delayed FightResolved
+            // never binds the same battle onto a later actor's turn or post-combat marks!
+            if (!_battleRegistry.TryRegisterFirstReceipt(snap.BattleId)) return;
             TryStampCurrentMatch(out long matchRoomId, out long matchStartTime);
             int matchGen = Volatile.Read(ref _matchGeneration);
             int layoutGen = Volatile.Read(ref _layoutGeneration);
@@ -1093,6 +1618,8 @@ namespace MonsterPathPredictor.Runtime
             long def = b.Defender != null ? b.Defender.PlayerId : 0;
             if (atk != 0 || def != 0)
             {
+                // Bind actor, turn, logical tile, and combat-start marks strictly on first BattleId receipt!
+                if (!_battleRegistry.TryRegisterFirstReceipt(b.BattleId)) return;
                 TryStampCurrentMatch(out long matchRoomId, out long matchStartTime);
                 int matchGen = Volatile.Read(ref _matchGeneration);
                 int layoutGen = Volatile.Read(ref _layoutGeneration);
@@ -1179,6 +1706,146 @@ namespace MonsterPathPredictor.Runtime
             return curMem.SpawnSequence > 0 && prevMem.SpawnSequence > 0 && curMem.SpawnSequence < prevMem.SpawnSequence;
         }
 
+        private bool DrainProtocolTurnQueue()
+        {
+            bool anyExplicitActionReset = false;
+            while (_protocolTurnQueue.TryDequeue(out var ev))
+            {
+                if (!IsMatchingEventStamp(ev.MatchRoomId, ev.MatchStartTime, ev.MatchGeneration)) continue;
+                if (ev.Kind == 2 && ev.Round >= 0)
+                {
+                    _roundTracker.ObserveExplicitRoundChange(ev.Round);
+                }
+                else if (ev.Kind == 1 && ev.ActorId > 0)
+                {
+                    long prevActor = _roundTracker.ActiveActorId;
+                    bool earlier = IsEarlierMonsterPriority(ev.ActorId, prevActor);
+                    var res = _roundTracker.ObserveExplicitActionStart(
+                        ev.ActorId,
+                        ev.Round,
+                        id => _rosterAliveMonsterIds.Contains(id),
+                        TryIsUnitHero,
+                        earlier);
+                    if (res.ShouldResetMovementState)
+                    {
+                        anyExplicitActionReset = true;
+                        _pendingDiceByOwner.Remove(prevActor);
+                        _currentTurnOwnerStartDiceSeq = 0;
+                    }
+                }
+                else if (ev.Kind == 3)
+                {
+                    _rosterSnapshotGeneration++;
+                    _hasSeenFreshFullSnapshot = true;
+                    _presenceLedger.Reset();
+                }
+            }
+            return anyExplicitActionReset;
+        }
+
+        private void DrainLiveAttrAndRelocationQueues()
+        {
+            int curLayoutGen = Volatile.Read(ref _layoutGeneration);
+            double nowSec = MonotonicSeconds();
+
+            while (_moveWalkQueue.TryDequeue(out var mv))
+            {
+                if (mv.MatchGen != Volatile.Read(ref _matchGeneration) || mv.UnitId <= 0) continue;
+                _lastWalkEventSecByUnit[mv.UnitId] = nowSec;
+                if (_confirmedHeroFields.TryGetValue(mv.UnitId, out var hc))
+                {
+                    hc.ObservedWalkSinceSnapshot = true;
+                    // A genuine walk supersedes any older unacknowledged Place/Pursuit once movement starts.
+                    if (hc.PendingLogicalEventSeq > hc.AcknowledgedLogicalEventSeq)
+                    {
+                        hc.AcknowledgedLogicalEventSeq = hc.PendingLogicalEventSeq;
+                    }
+                }
+            }
+
+            while (_skillMoveQueue.TryDequeue(out var sm))
+            {
+                if (sm.MatchGen != Volatile.Read(ref _matchGeneration)) continue;
+                _skillMoveEffects.Enqueue(sm.MoverId, sm.TriggerLandId, sm.Attr);
+            }
+
+            while (_liveAttrQueue.TryDequeue(out var la))
+            {
+                if (!IsMatchingEventStamp(la.MatchRoomId, la.MatchStartTime, la.MatchGeneration)) continue;
+                if (la.HasDisappear && la.DisappearUnitId > 0)
+                {
+                    _presenceLedger.MarkDisappeared(la.DisappearUnitId);
+                }
+                long uid = la.UnitId;
+                if (uid <= 0) continue;
+                if (la.HasHp)
+                {
+                    _eventHpByUnit.TryGetValue(uid, out int prevHp);
+                    _eventMaxHpByUnit.TryGetValue(uid, out int prevMax);
+                    int nextHp = LiveHpFormula.Apply(prevHp, prevMax, la.RealHp, la.RealChangeHp, la.MaxHp);
+                    _eventHpByUnit[uid] = nextHp;
+                    if (la.MaxHp > 0) _eventMaxHpByUnit[uid] = la.MaxHp;
+                }
+                if (la.HasGold) _eventGoldByUnit[uid] = Math.Max(0, la.CurrGold);
+                if (la.HasCrimeNum) _eventCrimeByUnit[uid] = la.CrimeNum;
+                if (la.HasNotSelect) _eventNotSelectByUnit[uid] = la.NotSelect;
+                if (la.HasBuff)
+                {
+                    if (!_unitBuffLedgers.TryGetValue(uid, out var map))
+                    {
+                        map = new LiveBuffMap();
+                        _unitBuffLedgers[uid] = map;
+                    }
+                    map.ApplyOperation(la.BuffOp, la.BuffEntries);
+                }
+            }
+
+            while (_relocationQueue.TryDequeue(out var rel))
+            {
+                if (!IsMatchingEventStamp(rel.MatchRoomId, rel.MatchStartTime, rel.MatchGeneration)) continue;
+                if (rel.UnitId <= 0 || rel.LandId < 0) continue;
+                if (rel.IsSpawn)
+                {
+                    _presenceLedger.MarkPresent(rel.UnitId);
+                    _freshSpawnedMonsterIds.Add(rel.UnitId);
+                }
+                if (rel.LayoutGeneration == curLayoutGen || !_pendingMapLayoutTransition)
+                {
+                    _latestLogicalLandByUnit[rel.UnitId] = (rel.LandId, rel.Seq, curLayoutGen);
+                    if (!rel.IsExitPursuit)
+                    {
+                        if (!_confirmedHeroFields.TryGetValue(rel.UnitId, out var hc))
+                        {
+                            hc = new ConfirmedHeroCache();
+                            _confirmedHeroFields[rel.UnitId] = hc;
+                        }
+                        if (rel.Seq > hc.PendingLogicalEventSeq)
+                        {
+                            hc.PendingLogicalEventSeq = rel.Seq;
+                            hc.PendingLogicalLandId = rel.LandId;
+                        }
+                    }
+                }
+                if (rel.IsPursuit && !rel.IsExitPursuit && _memories.TryGetValue(rel.UnitId, out var mMem))
+                {
+                    mMem.ArrivedByNormalWalk = false;
+                    mMem.JustSpawnedOnFork = false;
+                    if (rel.FrontNodeIds != null && rel.FrontNodeIds.Length > 0)
+                    {
+                        mMem.ExplicitFrontNodeIds = rel.FrontNodeIds;
+                        mMem.ExplicitFrontLandId = rel.LandId;
+                        mMem.ExplicitFrontFromLandId = rel.BackLandId;
+                    }
+                    else
+                    {
+                        mMem.ExplicitFrontNodeIds = null;
+                        mMem.ExplicitFrontLandId = -1;
+                        mMem.ExplicitFrontFromLandId = -1;
+                    }
+                }
+            }
+        }
+
         public MatchSyncResult ObserveTurnBoundary(BattleLogic battle)
         {
             return ObserveTurnBoundary(battle, out _, out _);
@@ -1188,17 +1855,25 @@ namespace MonsterPathPredictor.Runtime
         {
             sampleRejected = false;
             sampledRound = -1;
+            _rpcHooks.EnsureHooked();
             var matchSync = EnsureSameMatch();
-            // Drain exact target-bound 1040.Place records even while rendering is paused so they
-            // remain latched until board validation, tile confirmation, superseding Place, death, or reset.
+            // Drain exact target-bound 1040.Place records, typed protocol events, and dice rolls even while paused.
             DrainPlaceQueue();
+            DrainLiveAttrAndRelocationQueues();
             DrainDiceQueue();
+            bool explicitActionReset = DrainProtocolTurnQueue();
             if (battle == null) return matchSync;
 
-            var currentActor = SafeGetCurrentPlayer(battle);
-            bool hasCurrentActor = currentActor != null && currentActor.player != null && currentActor.player.Id != 0;
-            long curActorId = hasCurrentActor ? currentActor.player.Id : 0;
+            long rawCurActorId = TryReadRawCurPlayerId(battle);
+            var currentActor = rawCurActorId > 0 ? Players.Get(rawCurActorId) : null;
+            bool hasCurrentActor = rawCurActorId > 0 && currentActor != null && currentActor.player != null;
+            long curActorId = hasCurrentActor ? rawCurActorId : 0;
             int curRound = TryReadCurrentRound();
+            if (curRound >= 0 && _roundTracker.LastObservedRound > curRound)
+            {
+                // Explicit 1015/1117 RPC already advanced ahead of RoomInfo.Round's async presentation await!
+                curRound = _roundTracker.LastObservedRound;
+            }
             sampledRound = curRound;
             long prevRawActorId = _roundTracker.ActiveActorId;
 
@@ -1222,13 +1897,10 @@ namespace MonsterPathPredictor.Runtime
 
             if (boundary.SampleRejected)
             {
-                // Regressing round sample: preserve independently stamped dice rolls for the next current observation
-                // and signal caller to defer turn-scoped reconciliation!
                 sampleRejected = true;
                 return matchSync;
             }
 
-            // Consume owner roll sequences only after the observation is accepted.
             int latestConsumedOwnerRollSeq = 0;
             if (ownedRollSeqs != null)
             {
@@ -1237,37 +1909,44 @@ namespace MonsterPathPredictor.Runtime
                 _pendingDiceByOwner.Remove(curActorId);
             }
 
-            // Expire any stale unconsumed rolls from a superseded outgoing actor occurrence so they
-            // cannot fabricate an extra turn the next time that actor becomes active.
             if (prevRawActorId > 0 && prevRawActorId != _roundTracker.ActiveActorId)
             {
                 _pendingDiceByOwner.Remove(prevRawActorId);
             }
 
-            if (boundary.BoundaryAdvanced)
+            if (boundary.BoundaryAdvanced || explicitActionReset)
             {
-                // Record the exact owner-specific roll sequence starting the newest active turn occurrence
-                // (never polluted by another actor's later roll before the poll).
                 _currentTurnOwnerStartDiceSeq = latestConsumedOwnerRollSeq;
             }
             else if (latestConsumedOwnerRollSeq > 0 && _currentTurnOwnerStartDiceSeq == 0)
             {
-                // First roll coalesced into the current turn: record its exact owner sequence.
                 _currentTurnOwnerStartDiceSeq = latestConsumedOwnerRollSeq;
             }
 
             PublishTurnStampIfChanged();
 
-            if (boundary.ShouldResetMovementState)
+            if (boundary.ShouldResetMovementState || explicitActionReset)
             {
                 _turnStartLayoutInvalidated = false;
                 if (hasCurrentActor)
                 {
                     int initLand = ReadUnitLandIdVerified(currentActor, out bool initVisual);
-                    _activeActorStartLandId = initLand;
-                    _activeActorStartFromVisual = initLand >= 0 && initVisual;
-                    _activeActorLastSeenLandId = initLand;
-                    _activeActorLastSeenFromVisual = initLand >= 0 && initVisual;
+                    // Only seed turn-start anchor from verified visual standLand (or confirmed logical relocation);
+                    // never from unverified stale RoomPlayer.NodeId!
+                    if (initVisual && initLand >= 0)
+                    {
+                        _activeActorStartLandId = initLand;
+                        _activeActorStartFromVisual = true;
+                        _activeActorLastSeenLandId = initLand;
+                        _activeActorLastSeenFromVisual = true;
+                    }
+                    else
+                    {
+                        _activeActorStartLandId = -1;
+                        _activeActorStartFromVisual = false;
+                        _activeActorLastSeenLandId = -1;
+                        _activeActorLastSeenFromVisual = false;
+                    }
                 }
                 else
                 {
@@ -1281,28 +1960,21 @@ namespace MonsterPathPredictor.Runtime
             else if (hasCurrentActor && curActorId == _roundTracker.EffectiveActiveActorId)
             {
                 int nowLand = ReadUnitLandIdVerified(currentActor, out bool nowFromVisual);
-                if (nowLand >= 0)
+                if (nowLand >= 0 && nowFromVisual)
                 {
                     if (!_turnStartLayoutInvalidated && _activeActorStartLandId < 0)
                     {
                         _activeActorStartLandId = nowLand;
-                        _activeActorStartFromVisual = nowFromVisual;
+                        _activeActorStartFromVisual = true;
                     }
                     if (_activeActorLastSeenLandId < 0)
                     {
                         _activeActorLastSeenLandId = nowLand;
-                        _activeActorLastSeenFromVisual = nowFromVisual;
+                        _activeActorLastSeenFromVisual = true;
                     }
-                    else if (_activeActorLastSeenFromVisual && !nowFromVisual)
+                    else if (!_activeActorLastSeenFromVisual)
                     {
-                        // Visual model transiently disappeared while protocol NodeId may have jumped ahead:
-                        // do NOT set _activeActorSteppedThisTurn from a protocol-only fallback!
-                    }
-                    else if (!_activeActorLastSeenFromVisual && nowFromVisual)
-                    {
-                        // First verified visual confirmation after a protocol-only observation:
-                        // anchor cleanly to the confirmed visual tile without fabricating a B->A move!
-                        if (!_activeActorSteppedThisTurn && !_activeActorStartFromVisual)
+                        if (!_turnStartLayoutInvalidated && !_activeActorSteppedThisTurn && !_activeActorStartFromVisual)
                         {
                             _activeActorStartLandId = nowLand;
                             _activeActorStartFromVisual = true;
@@ -1324,6 +1996,14 @@ namespace MonsterPathPredictor.Runtime
                     {
                         _activeActorSteppedThisTurn = true;
                         _activeActorLastSeenLandId = nowLand;
+                        if (_skillMoveEffects.TryConsumeOnArrival(curActorId, nowLand, out var triggered))
+                        {
+                            for (int ti = 0; ti < triggered.Count; ti++)
+                            {
+                                IngestHeroAttrEffects(triggered[ti], allowThiefSteal: false);
+                            }
+                            DrainLiveAttrAndRelocationQueues();
+                        }
                     }
                 }
             }
@@ -1504,6 +2184,52 @@ namespace MonsterPathPredictor.Runtime
             int acceptedRound = _roundTracker.LastObservedRound;
             int curLayoutGen = Volatile.Read(ref _layoutGeneration);
 
+            // Detect fresh full roster / reconnect snapshots (RoomPlayer.UpdateFromServer assigns a new Hero reference)
+            // independently of RoomId/StartTime so same-match reconnects cleanly reseed ActionEnd, BossTargetId, and IsLaunchFight!
+            if (acceptedRound <= 1 && !_hasSeenFreshFullSnapshot)
+            {
+                _hasSeenFreshFullSnapshot = true;
+            }
+            bool detectedNewHeroRefSnapshot = false;
+            for (int i = 0; i < allUnits.Count; i++)
+            {
+                var pd = allUnits[i];
+                if (pd == null || pd.player == null || pd.player.Id <= 0) continue;
+                object hRef = null;
+                try { hRef = pd.player.Hero; } catch { }
+                if (hRef == null) continue;
+                long uid = pd.player.Id;
+                if (_confirmedHeroFields.TryGetValue(uid, out var hc) && hc.LastHeroRef != null && !ReferenceEquals(hc.LastHeroRef, hRef))
+                {
+                    detectedNewHeroRefSnapshot = true;
+                    break;
+                }
+                if (_memories.TryGetValue(uid, out var mm) && mm.LastHeroRef != null && !ReferenceEquals(mm.LastHeroRef, hRef))
+                {
+                    detectedNewHeroRefSnapshot = true;
+                    break;
+                }
+            }
+            if (detectedNewHeroRefSnapshot)
+            {
+                _rosterSnapshotGeneration++;
+                _hasSeenFreshFullSnapshot = true;
+                _presenceLedger.Reset();
+                var reseedEntries = new List<(long MonsterId, bool ActionEnd)>(8);
+                for (int i = 0; i < allUnits.Count; i++)
+                {
+                    var pd = allUnits[i];
+                    if (pd == null || pd.player == null || pd.player.Id <= 0) continue;
+                    CharacterType ct = CharacterType.None;
+                    try { ct = pd.characterType; } catch { continue; }
+                    if (ct != CharacterType.Monster) continue;
+                    var ae = SafeActionEnd(pd);
+                    if (ae.HasValue) reseedEntries.Add((pd.player.Id, ae.Value));
+                }
+                _roundTracker.ReseedFromFullSnapshot(acceptedRound, reseedEntries);
+            }
+            int curSnapshotGen = _rosterSnapshotGeneration;
+
             var playerPositions = new Dictionary<long, int>();
             var heroIdToPlayerId = new Dictionary<int, long>();
             var seenPlayerIds = new HashSet<long>();
@@ -1677,7 +2403,7 @@ namespace MonsterPathPredictor.Runtime
                 _lastAcceptedHeroIdToPlayerId.Clear();
                 foreach (var kv in heroIdToPlayerId) _lastAcceptedHeroIdToPlayerId[kv.Key] = kv.Value;
 
-                playerPositionsReady = allLivingHeroPositionsConfirmed;
+                playerPositionsReady = allLivingHeroPositionsConfirmed && (players.Count > 0 || _knownPlayerCount > 0);
                 if (playerPositionsReady && _awaitingPostLayoutHeroConfirmation)
                 {
                     _awaitingPostLayoutHeroConfirmation = false;
@@ -1714,6 +2440,7 @@ namespace MonsterPathPredictor.Runtime
                 if (cType != CharacterType.Monster) continue;
                 long mid = pd.player.Id;
                 if (mid <= 0 || conflictingUnitIds.Contains(mid) || snapshotNameLookup.ContainsKey(mid)) continue;
+                if (IsUnitAbsentFromBoard(mid, pd)) continue;
                 if (!TryCheckRosterMonsterAlive(pd, out bool alive) || !alive) continue;
 
                 string resolvedName = ResolveMonsterName(pd, SafeHeroId(pd), out bool isProv);
@@ -1780,6 +2507,11 @@ namespace MonsterPathPredictor.Runtime
                     rosterAuthoritative = false;
                     continue;
                 }
+                if (IsUnitAbsentFromBoard(mid, pd))
+                {
+                    explicitDeadMonsterIds.Add(mid);
+                    continue;
+                }
                 if (!TryCheckRosterMonsterAlive(pd, out bool isAlive))
                 {
                     rosterAuthoritative = false;
@@ -1807,6 +2539,8 @@ namespace MonsterPathPredictor.Runtime
                     resolvedName = ResolveMonsterName(pd, rawHeroId, out nameIsProvisional);
                 }
                 bool? serverActionEnd = SafeActionEnd(pd);
+                object curHeroRef = null;
+                try { curHeroRef = pd.player.Hero; } catch { }
 
                 bool isNew = !_memories.TryGetValue(mid, out var mem);
                 if (isNew)
@@ -1822,10 +2556,13 @@ namespace MonsterPathPredictor.Runtime
                         SpawnSequence = assignedSeq,
                         NameOrdinal = nextOrd,
                         NameBucket = resolvedName,
-                        NameBucketIsProvisional = nameIsProvisional
+                        NameBucketIsProvisional = nameIsProvisional,
+                        LastHeroRef = curHeroRef
                     };
                     _memories[mid] = mem;
-                    if (serverActionEnd.HasValue)
+                    // Only seed frozen Hero.ActionEnd on first observation when backed by a fresh snapshot or 1018 spawn!
+                    bool fromFreshSnapshotOrSpawn = _hasSeenFreshFullSnapshot || _freshSpawnedMonsterIds.Contains(mid);
+                    if (serverActionEnd.HasValue && fromFreshSnapshotOrSpawn)
                     {
                         _roundTracker.SeedInitialServerActionEnd(mid, serverActionEnd.Value, acceptedRound);
                     }
@@ -1833,10 +2570,23 @@ namespace MonsterPathPredictor.Runtime
                 else
                 {
                     mem.MissingAuthoritativeFrames = 0;
-
-                    if (serverActionEnd.HasValue)
+                    if (curHeroRef != null) mem.LastHeroRef = curHeroRef;
+                    // Only reconcile Hero.ActionEnd when a fresh snapshot generation arrived (frozen Hero.ActionEnd
+                    // is never mutated mid-match by BattleLogic!).
+                    if (serverActionEnd.HasValue && mem.LastObservedSnapshotGen < curSnapshotGen && _hasSeenFreshFullSnapshot)
                     {
                         _roundTracker.ReconcileServerActionEnd(mid, serverActionEnd.Value, acceptedRound);
+                    }
+                }
+
+                // Seed frozen Hero.IsLaunchFight strictly once per fresh snapshot generation for the active action!
+                if (mem.LastObservedSnapshotGen < curSnapshotGen)
+                {
+                    mem.LastObservedSnapshotGen = curSnapshotGen;
+                    bool isFresh = _hasSeenFreshFullSnapshot || _freshSpawnedMonsterIds.Contains(mid);
+                    if (isFresh)
+                    {
+                        mem.LaunchFightGuard.SeedFromFreshSnapshot(curSnapshotGen, turnSeq, SafeIsLaunchFight(pd), curActorId == mid);
                     }
                 }
 
@@ -1850,7 +2600,18 @@ namespace MonsterPathPredictor.Runtime
                 var chForFacing = pd.CharacterInst;
                 bool hasLiveChar = UnityObject.IsAlive(chForFacing);
                 bool visualConfirmed = landFromVisual && hasLiveChar;
-                int fromLandId = onBoard ? SafeFromLandId(pd) : -1;
+                int rawFromLandId = onBoard ? SafeFromLandId(pd) : -1;
+                int nextStandLandId = (onBoard && hasLiveChar) ? TryReadNextStandLandId(chForFacing) : -1;
+                LiveFacingResolver.SanitizeInFlightMovement(
+                    board,
+                    landId,
+                    rawFromLandId,
+                    nextStandLandId,
+                    mem.LastLandId,
+                    mem.LastFromLandId,
+                    out int fromLandId,
+                    out int[] inFlightFrontOverride,
+                    out bool isInFlightSelfLoop);
                 bool? knownThiefOpt = TryReadMonsterIsThief(pd);
                 bool? knownAggOpt = TryReadIsNormalAggressive(pd);
                 int? knownWeightOpt = TryReadActionWeight(pd);
@@ -1886,11 +2647,12 @@ namespace MonsterPathPredictor.Runtime
                                 board, mid, mem, fromLandId, landId, fromLandId, serverNodeId,
                                 leftPreviousTile: false, isInitialBoardObservation: true, playerPositions, allUnits, out _);
                         }
-                        frontIds = ResolveMonsterFrontNodeIds(board, chForFacing, hasLiveChar, landId, fromLandId, mem);
+                        frontIds = ResolveMonsterFrontNodeIds(board, chForFacing, hasLiveChar, landId, fromLandId, mem, inFlightFrontOverride);
                         if (firstOnBoard && initPlace == ExactPlaceLookup.NotFound)
                         {
+                            bool confirmedFreshSpawn = _freshSpawnedMonsterIds.Remove(mid);
                             bool noIncomingEdge = !board.IsValidNeighbor(fromLandId, landId) && !board.IsValidNeighbor(landId, fromLandId);
-                            mem.JustSpawnedOnFork = board.IsFork(landId) && serverNodeId == landId && noIncomingEdge;
+                            mem.JustSpawnedOnFork = board.IsFork(landId) && serverNodeId == landId && (confirmedFreshSpawn || noIncomingEdge);
                         }
                     }
                     else
@@ -1909,15 +2671,11 @@ namespace MonsterPathPredictor.Runtime
                             mem.LaunchedFightTurnSequence = -1;
                         }
 
-                        // Keep protocol and verified visual baselines strictly separated:
-                        // - If no prior verified visual tile exists yet, establishing the first visual sample
-                        //   anchors LastVisualLandId cleanly without emitting a fabricated B->A move.
-                        // - Only verified visual samples advance MoveSequence, consume Places, or run heuristics.
                         if (visualConfirmed && mem.LastVisualLandId < 0)
                         {
                             mem.LastVisualLandId = landId;
                             mem.LastLandId = landId;
-                            mem.LastFromLandId = fromLandId;
+                            if (!isInFlightSelfLoop) mem.LastFromLandId = fromLandId;
                             if (_pendingPlaceByMonster.ContainsKey(mid))
                             {
                                 TryConsumeExactPlaceDisplacement(
@@ -1931,6 +2689,18 @@ namespace MonsterPathPredictor.Runtime
                             int prevLandId = mem.LastVisualLandId;
                             bool confirmedOffTurn = curActorId > 0 && curActorId != mid;
                             bool movedNonAdjacently = prevLandId >= 0 && !board.IsValidNeighbor(prevLandId, landId);
+                            bool recentActiveWalk = curActorId == mid &&
+                                                    _lastWalkEventSecByUnit.TryGetValue(mid, out double walkSec) &&
+                                                    (snapNowSec - walkSec) <= 2.0;
+
+                            if (_skillMoveEffects.TryConsumeOnArrival(mid, landId, out var arrivedEffects))
+                            {
+                                for (int ae = 0; ae < arrivedEffects.Count; ae++)
+                                {
+                                    IngestHeroAttrEffects(arrivedEffects[ae], allowThiefSteal: false);
+                                }
+                                DrainLiveAttrAndRelocationQueues();
+                            }
 
                             mem.JustSpawnedOnFork = false;
                             mem.JustFoughtOnFork = false;
@@ -1951,17 +2721,15 @@ namespace MonsterPathPredictor.Runtime
                             var exactLookup = TryConsumeExactPlaceDisplacement(
                                 board, mid, mem, prevLandId, landId, fromLandId, serverNodeId,
                                 leftPreviousTile: true, isInitialBoardObservation: false, playerPositions, allUnits, out int consumedTileHops);
-                            // Count each actual tile-changing hop once: if no exact Place hop incremented MoveSequence,
-                            // advance once for this observed visual tile change.
+                            mem.ArrivedByNormalWalk = (exactLookup == ExactPlaceLookup.NotFound);
                             if (consumedTileHops == 0)
                             {
                                 mem.MoveSequence++;
                             }
-                            if (exactLookup == ExactPlaceLookup.NotFound && (confirmedOffTurn || movedNonAdjacently))
+                            if (exactLookup == ExactPlaceLookup.NotFound && (confirmedOffTurn || (movedNonAdjacently && !recentActiveWalk)))
                             {
                                 if (!TryTagSkillDisplacementFromWindow(board, mid, mem, prevLandId, landId, playerPositions, allUnits))
                                 {
-                                    // Retain short-lived unmatched off-turn move so a late SkillUsed arrival can still correlate.
                                     mem.UnmatchedOffTurnMoveSeq = mem.MoveSequence;
                                     mem.UnmatchedOffTurnFromLandId = prevLandId;
                                     mem.UnmatchedOffTurnToLandId = landId;
@@ -1971,7 +2739,7 @@ namespace MonsterPathPredictor.Runtime
 
                             mem.LastVisualLandId = landId;
                             mem.LastLandId = landId;
-                            mem.LastFromLandId = fromLandId;
+                            if (!isInFlightSelfLoop) mem.LastFromLandId = fromLandId;
                         }
                         else if (visualConfirmed)
                         {
@@ -1983,16 +2751,17 @@ namespace MonsterPathPredictor.Runtime
                                 if (sameTileLookup != ExactPlaceLookup.NotFound)
                                 {
                                     mem.UnmatchedOffTurnMoveSeq = -1;
+                                    mem.ArrivedByNormalWalk = false;
                                 }
-                                if (sameTileLookup == ExactPlaceLookup.NotFound && mem.LastFromLandId != fromLandId)
+                                if (sameTileLookup == ExactPlaceLookup.NotFound && !isInFlightSelfLoop && mem.LastFromLandId != fromLandId)
                                 {
                                     mem.ExplicitFrontNodeIds = null;
                                     mem.ExplicitFrontLandId = -1;
                                     mem.ExplicitFrontFromLandId = -1;
                                 }
-                                mem.LastFromLandId = fromLandId;
+                                if (!isInFlightSelfLoop) mem.LastFromLandId = fromLandId;
                             }
-                            else if (mem.LastFromLandId != fromLandId)
+                            else if (!isInFlightSelfLoop && mem.LastFromLandId != fromLandId)
                             {
                                 mem.ExplicitFrontNodeIds = null;
                                 mem.ExplicitFrontLandId = -1;
@@ -2000,7 +2769,6 @@ namespace MonsterPathPredictor.Runtime
                                 mem.LastFromLandId = fromLandId;
                             }
 
-                            // Re-evaluate a short-lived unmatched off-turn move when a late SkillUsed cast arrives.
                             if (mem.UnmatchedOffTurnMoveSeq == mem.MoveSequence &&
                                 mem.UnmatchedOffTurnToLandId == landId &&
                                 mem.SkillMoveKind == SkillMoveKind.None)
@@ -2017,68 +2785,27 @@ namespace MonsterPathPredictor.Runtime
                             }
                         }
 
-                        frontIds = ResolveMonsterFrontNodeIds(board, chForFacing, hasLiveChar, landId, fromLandId, mem);
+                        frontIds = ResolveMonsterFrontNodeIds(board, chForFacing, hasLiveChar, landId, fromLandId, mem, inFlightFrontOverride);
                     }
                 }
 
                 bool usesBossTarget = (heroId == 1018 || heroId == 1047);
-                long preUpdateEffectiveBossTargetId = mem.EffectiveBossTargetId;
-                long? serverBossTargetOpt = usesBossTarget ? TryReadBossTargetId(pd) : null;
-
-                if (usesBossTarget)
+                if (usesBossTarget && mem.BossLock.SeededSnapshotGeneration < curSnapshotGen)
                 {
-                    // Promote the latest authoritative server BossTargetId transition (including explicit 0!)
-                    // captured while the previous turn was locally suppressed.
-                    if (mem.HasPendingServerBossTarget && mem.BossTargetClearedTurnSequence != turnSeq)
-                    {
-                        mem.EffectiveServerBossTargetId = mem.PendingServerBossTargetId;
-                        mem.BossTargetAssignedTurnSeq = turnSeq;
-                        mem.BossTargetAssignedOrderSeq = mem.PendingServerBossTargetOrderSeq > 0
-                            ? mem.PendingServerBossTargetOrderSeq
-                            : Interlocked.Increment(ref _bossOrderSeq);
-                        mem.BossTargetAssignmentVersion++;
-                        if (mem.EffectiveServerBossTargetId != 0) mem.InferredBossTargetId = 0;
-                        mem.PendingServerBossTargetId = 0;
-                        mem.PendingServerBossTargetOrderSeq = 0;
-                        mem.HasPendingServerBossTarget = false;
-                    }
-
+                    long? serverBossTargetOpt = TryReadBossTargetId(pd);
                     if (serverBossTargetOpt.HasValue)
                     {
-                        long sv = serverBossTargetOpt.Value;
-                        // Compare against the raw server observation (NEVER the locally zeroed effective target)
-                        // so an unchanged server value cannot restore a cleared target, while any real transition
-                        // (including P2 -> 0) replaces a pending replacement cleanly!
-                        bool hadLastRaw = mem.HasLastRawServerBossTarget;
-                        bool serverTransitioned = !hadLastRaw || sv != mem.LastRawServerBossTargetId;
-                        mem.HasLastRawServerBossTarget = true;
-                        mem.LastRawServerBossTargetId = sv;
-
-                        if (serverTransitioned)
-                        {
-                            if (mem.BossTargetClearedTurnSequence != turnSeq)
-                            {
-                                mem.EffectiveServerBossTargetId = sv;
-                                mem.BossTargetAssignedTurnSeq = turnSeq;
-                                mem.BossTargetAssignedOrderSeq = hadLastRaw ? Interlocked.Increment(ref _bossOrderSeq) : 0L;
-                                mem.BossTargetAssignmentVersion++;
-                                if (sv != 0) mem.InferredBossTargetId = 0;
-                                mem.PendingServerBossTargetId = 0;
-                                mem.PendingServerBossTargetOrderSeq = 0;
-                                mem.HasPendingServerBossTarget = false;
-                            }
-                            else
-                            {
-                                mem.PendingServerBossTargetId = sv;
-                                mem.PendingServerBossTargetOrderSeq = Interlocked.Increment(ref _bossOrderSeq);
-                                mem.HasPendingServerBossTarget = true;
-                            }
-                        }
+                        // Seed fresh roster/reconnect snapshot ONCE per snapshot generation (including authoritative 0!).
+                        mem.BossLock.SeedFromFreshSnapshot(
+                            serverBossTargetOpt.Value,
+                            curSnapshotGen,
+                            turnSeq,
+                            Interlocked.Increment(ref _bossOrderSeq));
                     }
                 }
 
                 // Evaluate retained per-monster combat records using tri-state turn matching (Pending/Matched/Superseded),
-                // idempotent assignment-versioned boss-lock clearance, layout checks, and movement-occurrence validation.
+                // strict mark-verified boss-lock clearance (expired-mark fights preserve the lock!), and movement checks.
                 if (_pendingCombatByMonster.TryGetValue(mid, out var combatList))
                 {
                     for (int ci = 0; ci < combatList.Count; )
@@ -2121,76 +2848,17 @@ namespace MonsterPathPredictor.Runtime
                             bool? oppMarkAtFight = heroId == 1018
                                 ? combatEvt.OpponentHadProblemStudent
                                 : combatEvt.OpponentHadMandarinDuck;
-                            bool matchesLockedId =
-                                (preUpdateEffectiveBossTargetId != 0 && combatEvt.OpponentId == preUpdateEffectiveBossTargetId) ||
-                                (mem.EffectiveBossTargetId != 0 && combatEvt.OpponentId == mem.EffectiveBossTargetId);
 
-                            // Defer unresolved clearance when fight-time mark evidence was unavailable and opponent
-                            // does not match the current locked ID (never substituting a later-applied current-frame mark).
-                            if (matchesLockedId || oppMarkAtFight.HasValue || turnMatch != EventTurnMatch.Matched)
+                            if (oppMarkAtFight.HasValue || turnMatch != EventTurnMatch.Matched)
                             {
                                 combatEvt.BossLockEvaluated = true;
                                 combatList[ci] = combatEvt;
-
-                                // Deduplicate interleaved/repeated FightResolved + BattleUpdate deliveries by fight + assignment version.
-                                bool isDuplicateClear = false;
-                                for (int ri = 0; ri < mem.RecentClearedBossFights.Count; ri++)
-                                {
-                                    var rc = mem.RecentClearedBossFights[ri];
-                                    if (rc.OpponentId == combatEvt.OpponentId &&
-                                        rc.TurnSeq == fightTurnSeq &&
-                                        rc.Version == mem.BossTargetAssignmentVersion)
-                                    {
-                                        isDuplicateClear = true;
-                                        break;
-                                    }
-                                }
-
-                                bool matchedBossTarget = !isDuplicateClear && (matchesLockedId || oppMarkAtFight == true);
-                                if (matchedBossTarget)
-                                {
-                                    if (mem.RecentClearedBossFights.Count >= 8) mem.RecentClearedBossFights.RemoveAt(0);
-                                    mem.RecentClearedBossFights.Add((combatEvt.OpponentId, fightTurnSeq, mem.BossTargetAssignmentVersion));
-
-                                    // Protect ANY newer server, pending, or inferred assignment (including same-turn, same-ID reacquisition!).
-                                    bool assignmentIsNewerThanFight =
-                                        mem.EffectiveBossTargetId != 0 &&
-                                        (mem.BossTargetAssignedTurnSeq > fightTurnSeq ||
-                                         (combatEvt.CombatOrderSeq > 0 && mem.BossTargetAssignedOrderSeq > combatEvt.CombatOrderSeq));
-                                    bool pendingIsNewerThanFight =
-                                        combatEvt.CombatOrderSeq > 0 &&
-                                        mem.PendingServerBossTargetOrderSeq > combatEvt.CombatOrderSeq;
-
-                                    if (mem.HasPendingServerBossTarget &&
-                                        !pendingIsNewerThanFight &&
-                                        mem.PendingServerBossTargetId == combatEvt.OpponentId &&
-                                        turnMatch == EventTurnMatch.Matched)
-                                    {
-                                        mem.PendingServerBossTargetId = 0;
-                                        mem.PendingServerBossTargetOrderSeq = 0;
-                                        mem.HasPendingServerBossTarget = false;
-                                    }
-
-                                    if (mem.InferredBossTargetId == combatEvt.OpponentId && !assignmentIsNewerThanFight)
-                                    {
-                                        mem.InferredBossTargetId = 0;
-                                    }
-
-                                    if (!assignmentIsNewerThanFight)
-                                    {
-                                        if (mem.EffectiveServerBossTargetId == combatEvt.OpponentId ||
-                                            !mem.HasLastRawServerBossTarget ||
-                                            mem.EffectiveServerBossTargetId == preUpdateEffectiveBossTargetId)
-                                        {
-                                            mem.EffectiveServerBossTargetId = 0;
-                                        }
-                                        mem.InferredBossTargetId = 0;
-                                        if (turnMatch == EventTurnMatch.Matched)
-                                        {
-                                            mem.BossTargetClearedTurnSequence = turnSeq;
-                                        }
-                                    }
-                                }
+                                mem.BossLock.TryClearOnMarkedCombat(
+                                    oppMarkAtFight,
+                                    fightTurnSeq,
+                                    combatEvt.CombatOrderSeq,
+                                    turnSeq,
+                                    isCurrentTurn: turnMatch == EventTurnMatch.Matched);
                             }
                         }
 
@@ -2246,29 +2914,20 @@ namespace MonsterPathPredictor.Runtime
                     if (combatList.Count == 0) _pendingCombatByMonster.Remove(mid);
                 }
 
-                // Infer nearest marked target ONLY after combat clearance, ONLY when no authoritative server target
-                // exists, and ONLY commit the per-turn attempt flag once playerPositionsReady AND a valid turn-start
-                // anchor on the current board exist (retrying incomplete attempts).
+                // Evaluate nearest marked target UNCONDITIONALLY at each actual turn start (even if an older
+                // BossTargetId was retained!) so a closer marked target replaces the old lock (1795616950353775).
                 if (usesBossTarget &&
                     onBoard &&
                     curActorId == mid &&
-                    mem.EffectiveBossTargetId == 0 &&
-                    mem.BossTargetLockTurnSequence != turnSeq &&
-                    mem.BossTargetClearedTurnSequence != turnSeq &&
+                    mem.BossLock.LastEvaluatedTurnSequence != turnSeq &&
+                    mem.BossLock.ClearedTurnSequence != turnSeq &&
                     playersAuthoritative &&
                     playerPositionsReady &&
                     _activeActorStartLandId >= 0 &&
                     board.Contains(_activeActorStartLandId))
                 {
-                    mem.BossTargetLockTurnSequence = turnSeq;
                     long lockedMarkedId = FindNearestMarkedPlayerId(board, heroId, _activeActorStartLandId, players);
-                    if (lockedMarkedId != 0)
-                    {
-                        mem.InferredBossTargetId = lockedMarkedId;
-                        mem.BossTargetAssignedTurnSeq = turnSeq;
-                        mem.BossTargetAssignedOrderSeq = Interlocked.Increment(ref _bossOrderSeq);
-                        mem.BossTargetAssignmentVersion++;
-                    }
+                    mem.BossLock.EvaluateTurnStart(lockedMarkedId, turnSeq, Interlocked.Increment(ref _bossOrderSeq));
                 }
 
                 // Process retained per-monster thief steals independently of combat with deferred classification.
@@ -2383,7 +3042,7 @@ namespace MonsterPathPredictor.Runtime
                                   board.IsForkForContext(landId, fromLandId, arrivedFromIncomingEdge: true);
                 bool isMovingMidTurn = onBoard && (curActorId == mid) && _activeActorSteppedThisTurn && !justFought;
                 bool launchedFightThisTurn = (curActorId == mid) &&
-                                             (SafeIsLaunchFight(pd) ||
+                                             (mem.LaunchFightGuard.IsSeededLaunchFightActive(turnSeq) ||
                                               mem.LaunchedFightTurnSequence == turnSeq ||
                                               (isThief && mem.StolenTurnSequence == turnSeq));
                 bool hasStartedMovingThisTurn = (curActorId == mid) &&
@@ -2394,10 +3053,10 @@ namespace MonsterPathPredictor.Runtime
                                                _activeActorStartLandId >= 0 &&
                                                board.Contains(_activeActorStartLandId));
 
-                bool isTaunted = TryReadTauntTarget(pd, heroIdToPlayerId, out long tauntTargetId);
-                bool requiresCrimeTarget = IsCrimeRestrictedMonster(pd, heroId, anyPlayerHasTrueCulprit);
+                bool isTaunted = TryReadTauntTarget(pd, mid, heroIdToPlayerId, out long tauntTargetId);
+                bool requiresCrimeTarget = IsCrimeRestrictedMonster(pd, mid, mem, heroId, anyPlayerHasTrueCulprit);
                 SafeHp(pd, out int hp, out int maxHp, out bool hasHp, out _);
-                bool bossTargetClearedThisTurn = (curActorId == mid) && (mem.BossTargetClearedTurnSequence == turnSeq);
+                bool bossTargetClearedThisTurn = (curActorId == mid) && (mem.BossLock.ClearedTurnSequence == turnSeq);
 
                 if (knownWeightOpt.HasValue && knownWeightOpt.Value > 0)
                 {
@@ -2593,6 +3252,16 @@ namespace MonsterPathPredictor.Runtime
             _pendingPlaceByMonster.Remove(monsterId);
             _pendingCombatByMonster.Remove(monsterId);
             _pendingStealByMonster.Remove(monsterId);
+            _unitBuffLedgers.Remove(monsterId);
+            _eventHpByUnit.Remove(monsterId);
+            _eventMaxHpByUnit.Remove(monsterId);
+            _eventGoldByUnit.Remove(monsterId);
+            _eventCrimeByUnit.Remove(monsterId);
+            _eventNotSelectByUnit.Remove(monsterId);
+            _latestLogicalLandByUnit.Remove(monsterId);
+            _lastWalkEventSecByUnit.Remove(monsterId);
+            _freshSpawnedMonsterIds.Remove(monsterId);
+            _skillMoveEffects.ClearForMover(monsterId);
             _roundTracker.RemoveDeadMonster(monsterId);
             _retiredMonsterSec[monsterId] = nowSec;
         }
@@ -2652,6 +3321,29 @@ namespace MonsterPathPredictor.Runtime
             _currentLayoutLandById.Clear();
             _awaitingPostLayoutHeroConfirmation = false;
             _retiredMonsterSec.Clear();
+            _presenceLedger.Reset();
+            _battleRegistry.Reset();
+            _unitBuffLedgers.Clear();
+            _skillMoveEffects.Clear();
+            _eventHpByUnit.Clear();
+            _eventMaxHpByUnit.Clear();
+            _eventGoldByUnit.Clear();
+            _eventCrimeByUnit.Clear();
+            _eventNotSelectByUnit.Clear();
+            _latestLogicalLandByUnit.Clear();
+            _lastWalkEventSecByUnit.Clear();
+            _freshSpawnedMonsterIds.Clear();
+            while (_protocolTurnQueue.TryDequeue(out _)) { }
+            while (_relocationQueue.TryDequeue(out _)) { }
+            while (_liveAttrQueue.TryDequeue(out _)) { }
+            while (_moveWalkQueue.TryDequeue(out _)) { }
+            while (_skillMoveQueue.TryDequeue(out _)) { }
+            _hasSeenFreshFullSnapshot = false;
+            _pendingMapLayoutTransition = false;
+            _ackedMapIndexTransitionVersion = _mapIndexTransitionVersion;
+            _lastCapturedLandManager = null;
+            _lastCapturedNodeDict = null;
+            _rosterSnapshotGeneration++;
             _recentExactDisplacements.Clear();
             _lastAcceptedHeroIdToPlayerId.Clear();
             _lastAcceptedAnyPlayerHasTrueCulprit = false;
@@ -3603,6 +4295,13 @@ namespace MonsterPathPredictor.Runtime
                     mem.ExplicitFrontLandId = nextLand;
                     mem.ExplicitFrontFromLandId = boundFrom;
                 }
+                else
+                {
+                    // Same-tile Place with empty FrontNodeIds explicitly clears any prior explicit front set!
+                    mem.ExplicitFrontNodeIds = null;
+                    mem.ExplicitFrontLandId = -1;
+                    mem.ExplicitFrontFromLandId = -1;
+                }
 
                 // Exact 1040.Place records MUST specify an explicit active displacement SkillId;
                 // never infer Shirley/Trashcan/Lingling from caster HeroId when Cause is absent (SkillId == 0).
@@ -4106,7 +4805,8 @@ namespace MonsterPathPredictor.Runtime
                 var p = pd.player;
                 if (p == null) return null;
 
-                bool? aliveVerdict = TryEvaluateUnitLiveness(pd);
+                bool absentFromBoard = IsUnitAbsentFromBoard(p.Id, pd);
+                bool? aliveVerdict = absentFromBoard ? (bool?)false : TryEvaluateUnitLiveness(pd);
                 bool dead;
                 if (aliveVerdict.HasValue)
                 {
@@ -4114,16 +4814,19 @@ namespace MonsterPathPredictor.Runtime
                     _lastKnownPlayerAlive[p.Id] = aliveVerdict.Value;
                     livenessConfirmed = true;
                 }
+                else if (_eventHpByUnit.TryGetValue(p.Id, out int evHp))
+                {
+                    dead = evHp <= 0;
+                    _lastKnownPlayerAlive[p.Id] = !dead;
+                    livenessConfirmed = true;
+                }
                 else if (_lastKnownPlayerAlive.TryGetValue(p.Id, out bool prevAlive))
                 {
-                    // Unknown/inconclusive liveness on an already-known hero: retain last-known liveness
-                    // for display continuity while withholding authoritative readiness (livenessConfirmed=false).
                     dead = !prevAlive;
                     livenessConfirmed = false;
                 }
                 else
                 {
-                    // First observation with unknown liveness: never invent alive & targetable!
                     livenessConfirmed = false;
                     return null;
                 }
@@ -4134,22 +4837,32 @@ namespace MonsterPathPredictor.Runtime
                     cache = new ConfirmedHeroCache();
                     _confirmedHeroFields[p.Id] = cache;
                 }
+                try { if (p.Hero != null) cache.LastHeroRef = p.Hero; } catch { }
+                cache.SnapshotGen = _rosterSnapshotGeneration;
                 cache.IsAlive = !dead;
 
-                bool notSelect = false;
-                bool notSelectReadOk = false;
-                try
-                {
-                    var prop = pd.Property;
-                    if (prop != null && prop.NotSelect != null)
-                    {
-                        notSelect = prop.NotSelect.Value;
-                        notSelectReadOk = true;
-                    }
-                }
-                catch { }
-                // Only fall back to spawn/reconnect snapshot Hero.NotSelect when live Property.NotSelect was unavailable.
+                bool notSelect = absentFromBoard;
+                bool notSelectReadOk = absentFromBoard;
                 if (!notSelectReadOk)
+                {
+                    try
+                    {
+                        var prop = pd.Property;
+                        if (prop != null && prop.NotSelect != null)
+                        {
+                            notSelect = prop.NotSelect.Value;
+                            notSelectReadOk = true;
+                        }
+                    }
+                    catch { }
+                }
+                if (!notSelectReadOk && _eventNotSelectByUnit.TryGetValue(p.Id, out bool evNs))
+                {
+                    notSelect = evNs;
+                    notSelectReadOk = true;
+                }
+                // Only fall back to frozen Hero.NotSelect when we have NO prior cached confirmation AND a fresh snapshot!
+                if (!notSelectReadOk && !cache.HasTargetable && _hasSeenFreshFullSnapshot)
                 {
                     try
                     {
@@ -4168,91 +4881,72 @@ namespace MonsterPathPredictor.Runtime
                 int crimeFromBuff = 0;
                 bool anyBuffSourceRead = false;
 
-                try
+                // Read live BuffContainer._buffDict directly into a temporary list (atomic full traversal!),
+                // distinguishing confirmed-empty dictionary from unavailable and NEVER relying on Players.BuffsOf
+                // (which silently falls back to frozen Hero.Buffs via PreferLiveBuffs).
+                if (TryReadDirectLiveBuffEntries(pd, out var directEntries))
                 {
-                    var buffs = Players.BuffsOf(p.Id);
-                    if (buffs != null)
+                    if (!_unitBuffLedgers.TryGetValue(p.Id, out var ledger))
                     {
-                        anyBuffSourceRead = true;
-                        for (int i = 0; i < buffs.Count; i++)
-                        {
-                            int bid = buffs[i].BuffId;
-                            if (bid == 2101001) hasProblemStudent = true;
-                            else if (bid == 10470101) hasMandarinDuck = true;
-                            else if (bid == 10671302) isTrueCulprit = true;
-                            else if (bid == 1270202) hasUnchallengeableStealth = true;
-
-                            if (!notSelect && settings != null && settings.ExcludedPlayerBuffIds != null &&
-                                settings.ExcludedPlayerBuffIds.Contains(bid))
-                            {
-                                notSelect = true;
-                                notSelectReadOk = true;
-                            }
-                        }
+                        ledger = new LiveBuffMap();
+                        _unitBuffLedgers[p.Id] = ledger;
+                    }
+                    ledger.ApplyFullReplace(directEntries);
+                    var summary = ledger.BuildSummary();
+                    anyBuffSourceRead = summary.HasConfirmedData;
+                    hasProblemStudent = summary.HasProblemStudent;
+                    hasMandarinDuck = summary.HasMandarinDuck;
+                    isTrueCulprit = summary.IsTrueCulprit;
+                    hasUnchallengeableStealth = summary.HasUnchallengeableStealth;
+                    crimeFromBuff = summary.CrimeBuffProgress;
+                    if (!notSelect && ledger.HasAnyExcludedBuff(settings != null ? settings.ExcludedPlayerBuffIds : null))
+                    {
+                        notSelect = true;
+                        notSelectReadOk = true;
                     }
                 }
-                catch { }
-
-                // Read live crime buff progress (10013) directly from live BuffContainer (Hero.Buffs is frozen at spawn/reconnect).
-                try
+                else if (_unitBuffLedgers.TryGetValue(p.Id, out var evLedger) && evLedger.HasConfirmedState)
                 {
-                    var bc = pd.buffContainer;
-                    if (bc != null)
+                    var summary = evLedger.BuildSummary();
+                    anyBuffSourceRead = summary.HasConfirmedData;
+                    hasProblemStudent = summary.HasProblemStudent;
+                    hasMandarinDuck = summary.HasMandarinDuck;
+                    isTrueCulprit = summary.IsTrueCulprit;
+                    hasUnchallengeableStealth = summary.HasUnchallengeableStealth;
+                    crimeFromBuff = summary.CrimeBuffProgress;
+                    if (!notSelect && evLedger.HasAnyExcludedBuff(settings != null ? settings.ExcludedPlayerBuffIds : null))
                     {
-                        if (!anyBuffSourceRead)
-                        {
-                            anyBuffSourceRead = true;
-                            hasProblemStudent = bc.Contain(2101001);
-                            hasMandarinDuck = bc.Contain(10470101);
-                            isTrueCulprit = bc.Contain(10671302);
-                            hasUnchallengeableStealth = bc.Contain(1270202);
-                            if (!notSelect && settings != null && settings.ExcludedPlayerBuffIds != null)
-                            {
-                                foreach (int exId in settings.ExcludedPlayerBuffIds)
-                                {
-                                    if (bc.Contain(exId))
-                                    {
-                                        notSelect = true;
-                                        notSelectReadOk = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        var crimeBuff = bc.GetBuff(10013);
-                        if (crimeBuff != null && crimeBuff.Progress > crimeFromBuff)
-                        {
-                            crimeFromBuff = crimeBuff.Progress;
-                        }
+                        notSelect = true;
+                        notSelectReadOk = true;
                     }
                 }
-                catch { }
-
-                // Only fall back to spawn/reconnect snapshot Hero.Buffs when BOTH live buff sources were unavailable!
-                if (!anyBuffSourceRead)
+                else if (!cache.HasBuffRead && _hasSeenFreshFullSnapshot)
                 {
                     try
                     {
                         if (p.Hero != null && p.Hero.Buffs != null)
                         {
-                            anyBuffSourceRead = true;
+                            var snapEntries = new List<LiveBuffEntry>(p.Hero.Buffs.Count);
                             foreach (var kv in p.Hero.Buffs)
                             {
                                 var b = kv.Value;
-                                if (b == null) continue;
-                                int bid = b.BuffId;
-                                if (bid == 2101001) hasProblemStudent = true;
-                                else if (bid == 10470101) hasMandarinDuck = true;
-                                else if (bid == 10671302) isTrueCulprit = true;
-                                else if (bid == 1270202) hasUnchallengeableStealth = true;
-                                else if (bid == 10013 && b.Progress > crimeFromBuff) crimeFromBuff = b.Progress;
-
-                                if (!notSelect && settings != null && settings.ExcludedPlayerBuffIds != null &&
-                                    settings.ExcludedPlayerBuffIds.Contains(bid))
-                                {
-                                    notSelect = true;
-                                    notSelectReadOk = true;
-                                }
+                                if (b == null || b.BuffId <= 0) continue;
+                                long uid = b.UniqueId != 0 ? b.UniqueId : kv.Key;
+                                snapEntries.Add(new LiveBuffEntry(uid, b.BuffId, b.Progress, b.Source != null ? b.Source.Id : 0));
+                            }
+                            var initMap = new LiveBuffMap();
+                            initMap.ApplyFullReplace(snapEntries);
+                            var summary = initMap.BuildSummary();
+                            anyBuffSourceRead = true;
+                            hasProblemStudent = summary.HasProblemStudent;
+                            hasMandarinDuck = summary.HasMandarinDuck;
+                            isTrueCulprit = summary.IsTrueCulprit;
+                            hasUnchallengeableStealth = summary.HasUnchallengeableStealth;
+                            crimeFromBuff = summary.CrimeBuffProgress;
+                            if (!notSelect && initMap.HasAnyExcludedBuff(settings != null ? settings.ExcludedPlayerBuffIds : null))
+                            {
+                                notSelect = true;
+                                notSelectReadOk = true;
                             }
                         }
                     }
@@ -4307,16 +5001,17 @@ namespace MonsterPathPredictor.Runtime
                     slot = cache.Slot;
                 }
 
-                int landId = SafeAuthoritativeHeroLandId(pd, board, out posConfirmedOnLayout);
+                int landId = SafeAuthoritativeHeroLandId(pd, board, out posConfirmedOnLayout, readOnly: false);
+                bool resolvedValidLand = posConfirmedOnLayout && landId >= 0 && (board == null || board.Contains(landId));
                 if (dead) posConfirmedOnLayout = true;
-                if (posConfirmedOnLayout && landId >= 0 && (board == null || board.Contains(landId)))
+                if (resolvedValidLand)
                 {
                     cache.LandId = landId;
                 }
-                else if (!dead && !_awaitingPostLayoutHeroConfirmation && cache.LandId >= 0 && (board == null || board.Contains(cache.LandId)))
+                else if (!_awaitingPostLayoutHeroConfirmation && cache.LandId >= 0 && (board == null || board.Contains(cache.LandId)))
                 {
-                    // Same-layout transient tile read miss: preserve last confirmed same-layout position
-                    // while leaving posConfirmedOnLayout=false so readiness reflects the transient gap.
+                    // Preserve last confirmed same-layout tile for BOTH living heroes (transient flicker) AND
+                    // dead locked Boss targets (1018/1047 chase a dead locked player's known tile!).
                     landId = cache.LandId;
                 }
 
@@ -4326,7 +5021,7 @@ namespace MonsterPathPredictor.Runtime
                     ? rawNick
                     : (!string.IsNullOrEmpty(cache.Name) ? cache.Name : ("P" + (slot + 1)));
 
-                int gold = SafeGold(pd);
+                int gold = SafeGoldLiveFirst(pd, p.Id, cache);
                 if (gold >= 0)
                 {
                     cache.HasGold = true;
@@ -4337,7 +5032,7 @@ namespace MonsterPathPredictor.Runtime
                     gold = cache.Gold;
                 }
 
-                int? crimeOpt = TryReadCrimeNum(pd);
+                int? crimeOpt = TryReadCrimeNumLiveFirst(pd, p.Id, cache);
                 int crimeNum;
                 if (crimeOpt.HasValue || anyBuffSourceRead)
                 {
@@ -4512,6 +5207,7 @@ namespace MonsterPathPredictor.Runtime
                 if (matchedIdCount == 1)
                 {
                     if (matchedNonMonster || matchedMonster == null) return false;
+                    if (IsUnitAbsentFromBoard(monsterId, matchedMonster)) return true;
                     return TryCheckRosterMonsterAlive(matchedMonster, out bool isAlive) && !isAlive;
                 }
 
@@ -4533,7 +5229,7 @@ namespace MonsterPathPredictor.Runtime
             {
                 var hero = pd != null && pd.player != null ? pd.player.Hero : null;
                 if (hero == null) return null;
-                return hero.MonsterType == Hero.Types.MonsterType.Thief;
+                return MonsterClassifier.TryClassifyThief((int)hero.MonsterType);
             }
             catch { return null; }
         }
@@ -4543,7 +5239,7 @@ namespace MonsterPathPredictor.Runtime
             return TryReadMonsterIsThief(pd) == true;
         }
 
-        private static int SafeGold(BattlePlayerData pd)
+        private int SafeGoldLiveFirst(BattlePlayerData pd, long unitId, ConfirmedHeroCache cache)
         {
             try
             {
@@ -4551,51 +5247,93 @@ namespace MonsterPathPredictor.Runtime
                 if (prop != null && prop.gold != null) return prop.gold.Value;
             }
             catch { }
-            try
+            if (_eventGoldByUnit.TryGetValue(unitId, out int evGold)) return evGold;
+            if (cache != null && cache.HasGold) return cache.Gold;
+            if (_hasSeenFreshFullSnapshot)
             {
-                if (pd.player != null && pd.player.Hero != null) return pd.player.Hero.Gold;
+                try
+                {
+                    if (pd.player != null && pd.player.Hero != null) return pd.player.Hero.Gold;
+                }
+                catch { }
             }
-            catch { }
             return -1;
         }
 
         private static bool _crimePropResolved;
         private static MemberInfo _crimePropMember;
+        private static FieldInfo _crimeInnerReactiveField;
+        private static PropertyInfo _crimeInnerValueProp;
 
-        private static int? TryReadCrimeNum(BattlePlayerData pd)
+        private static int? TryReadLiveCrimeProperty(BattlePlayerData pd)
         {
             try
             {
-                var prop = pd.Property;
+                var prop = pd != null ? pd.Property : null;
                 if (prop != null)
                 {
                     if (!_crimePropResolved)
                     {
                         _crimePropResolved = true;
                         var t = prop.GetType();
-                        _crimePropMember = (MemberInfo)t.GetProperty("CrimeNum", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-                            ?? (MemberInfo)t.GetProperty("crimeNum", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-                            ?? (MemberInfo)t.GetField("CrimeNum", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-                            ?? t.GetField("crimeNum", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                        _crimePropMember = (MemberInfo)t.GetField("CrimeNum", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                            ?? (MemberInfo)t.GetProperty("CrimeNum", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                            ?? (MemberInfo)t.GetField("crimeNum", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                            ?? t.GetProperty("crimeNum", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
                     }
                     if (_crimePropMember != null)
                     {
-                        object raw = _crimePropMember is PropertyInfo pi ? pi.GetValue(prop) : ((FieldInfo)_crimePropMember).GetValue(prop);
+                        object raw = _crimePropMember is FieldInfo fi ? fi.GetValue(prop) : ((PropertyInfo)_crimePropMember).GetValue(prop);
                         if (raw is int iv) return Math.Max(0, iv);
                         if (raw != null)
                         {
-                            var valProp = raw.GetType().GetProperty("Value");
-                            if (valProp != null && valProp.GetValue(raw) is int rv) return Math.Max(0, rv);
+                            // Core.PropertyData<int> stores the live ReactiveProperty<int> in field "property" -> property.Value!
+                            if (_crimeInnerReactiveField == null)
+                            {
+                                _crimeInnerReactiveField = raw.GetType().GetField("property", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                            }
+                            if (_crimeInnerReactiveField != null)
+                            {
+                                object reactive = _crimeInnerReactiveField.GetValue(raw);
+                                if (reactive != null)
+                                {
+                                    if (_crimeInnerValueProp == null)
+                                        _crimeInnerValueProp = reactive.GetType().GetProperty("Value", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                                    if (_crimeInnerValueProp != null && _crimeInnerValueProp.GetValue(reactive) is int rv)
+                                        return Math.Max(0, rv);
+                                }
+                            }
+                            var directVal = raw.GetType().GetProperty("Value");
+                            if (directVal != null && directVal.GetValue(raw) is int dv) return Math.Max(0, dv);
                         }
                     }
                 }
             }
             catch { }
-            try
+            return null;
+        }
+
+        private int? TryReadCrimeNumLiveFirst(BattlePlayerData pd, long unitId, ConfirmedHeroCache cache)
+        {
+            if (_eventCrimeByUnit.TryGetValue(unitId, out int evCrime))
             {
-                if (pd.player != null && pd.player.Hero != null) return Math.Max(0, pd.player.Hero.CrimeNum);
+                // If live BattleProperty.CrimeNum.property.Value already caught up, prefer live property;
+                // during OnCrimeNumChanged's async presentation await, honor the newer 1040 event value!
+                int? liveProp = TryReadLiveCrimeProperty(pd);
+                if (liveProp.HasValue && liveProp.Value == evCrime) return liveProp.Value;
+                return evCrime;
             }
-            catch { }
+            int? propVal = TryReadLiveCrimeProperty(pd);
+            if (propVal.HasValue) return propVal.Value;
+            if (cache != null && cache.HasCrimeNum) return cache.CrimeNum;
+            if (_hasSeenFreshFullSnapshot)
+            {
+                try
+                {
+                    if (pd.player != null && pd.player.Hero != null) return Math.Max(0, pd.player.Hero.CrimeNum);
+                }
+                catch { }
+            }
             return null;
         }
 
@@ -4697,54 +5435,39 @@ namespace MonsterPathPredictor.Runtime
             return false;
         }
 
-        private static bool IsCrimeRestrictedMonster(BattlePlayerData pd, int heroId, bool anyPlayerHasTrueCulprit)
+        private bool IsCrimeRestrictedMonster(BattlePlayerData pd, long monsterId, MonsterMemory mem, int heroId, bool anyPlayerHasTrueCulprit)
         {
             if (heroId == 1067) // 典狱长: restricted to CrimeNum > 0 until 真凶揭露
             {
-                if (anyPlayerHasTrueCulprit) return false;
-                return !IsWardenTrueCulpritRevealed(pd);
+                if (anyPlayerHasTrueCulprit || (mem != null && mem.WardenRevealedLatched)) return false;
+                bool revealed = IsWardenTrueCulpritRevealed(pd, monsterId);
+                if (revealed && mem != null) mem.WardenRevealedLatched = true;
+                return !revealed;
             }
             if (heroId == 1068) // 看守: restricted to CrimeNum > 0 until 5 cumulative damage (buff 10681202)
             {
-                return !HasMonsterBuff(pd, 10681202);
+                return !HasMonsterBuff(pd, monsterId, 10681202);
             }
             return false;
         }
 
-        private static bool IsWardenTrueCulpritRevealed(BattlePlayerData pd)
+        private bool IsWardenTrueCulpritRevealed(BattlePlayerData pd, long monsterId)
         {
-            bool readLive = false;
-            try
+            if (TryReadDirectLiveBuffEntries(pd, out var directEntries))
             {
-                var bc = pd != null ? pd.buffContainer : null;
-                if (bc != null)
+                if (!_unitBuffLedgers.TryGetValue(monsterId, out var ledger))
                 {
-                    readLive = true;
-                    if (bc.Contain(10671303)) return true;
-                    var b1301 = bc.GetBuff(10671301);
-                    if (b1301 != null && b1301.Progress > 0) return true;
-                    return false;
+                    ledger = new LiveBuffMap();
+                    _unitBuffLedgers[monsterId] = ledger;
                 }
+                ledger.ApplyFullReplace(directEntries);
+                return ledger.BuildSummary().HasWardenReveal;
             }
-            catch { }
-            try
+            if (_unitBuffLedgers.TryGetValue(monsterId, out var evLedger) && (evLedger.HasConfirmedState || evLedger.WardenRevealedLatched))
             {
-                long pid = pd != null && pd.player != null ? pd.player.Id : 0;
-                if (pid != 0)
-                {
-                    var buffs = Players.BuffsOf(pid);
-                    if (buffs != null)
-                    {
-                        readLive = true;
-                        for (int i = 0; i < buffs.Count; i++)
-                        {
-                            if (buffs[i].BuffId == 10671303) return true;
-                        }
-                    }
-                }
+                return evLedger.BuildSummary().HasWardenReveal;
             }
-            catch { }
-            if (!readLive)
+            if (_hasSeenFreshFullSnapshot)
             {
                 try
                 {
@@ -4764,38 +5487,23 @@ namespace MonsterPathPredictor.Runtime
             return false;
         }
 
-        private static bool HasMonsterBuff(BattlePlayerData pd, int buffId)
+        private bool HasMonsterBuff(BattlePlayerData pd, long monsterId, int buffId)
         {
-            bool readLive = false;
-            try
+            if (TryReadDirectLiveBuffEntries(pd, out var directEntries))
             {
-                var bc = pd != null ? pd.buffContainer : null;
-                if (bc != null)
+                if (!_unitBuffLedgers.TryGetValue(monsterId, out var ledger))
                 {
-                    readLive = true;
-                    return bc.Contain(buffId);
+                    ledger = new LiveBuffMap();
+                    _unitBuffLedgers[monsterId] = ledger;
                 }
+                ledger.ApplyFullReplace(directEntries);
+                return ledger.ContainsBuff(buffId);
             }
-            catch { }
-            try
+            if (_unitBuffLedgers.TryGetValue(monsterId, out var evLedger) && evLedger.HasConfirmedState)
             {
-                long pid = pd != null && pd.player != null ? pd.player.Id : 0;
-                if (pid != 0)
-                {
-                    var buffs = Players.BuffsOf(pid);
-                    if (buffs != null)
-                    {
-                        readLive = true;
-                        for (int i = 0; i < buffs.Count; i++)
-                        {
-                            if (buffs[i].BuffId == buffId) return true;
-                        }
-                        return false;
-                    }
-                }
+                return evLedger.ContainsBuff(buffId);
             }
-            catch { }
-            if (!readLive)
+            if (_hasSeenFreshFullSnapshot)
             {
                 try
                 {
@@ -4813,59 +5521,52 @@ namespace MonsterPathPredictor.Runtime
             return false;
         }
 
-        private static bool TryReadTauntTarget(BattlePlayerData pd, Dictionary<int, long> heroIdToPlayerId, out long targetPlayerId)
+        private bool TryReadTauntTarget(BattlePlayerData pd, long monsterId, Dictionary<int, long> heroIdToPlayerId, out long targetPlayerId)
         {
             targetPlayerId = 0;
-            bool readLive = false;
-            // Read live BuffContainer FIRST so mid-match Taunt (10011) is detected and expired Taunt clears immediately!
-            try
+            LiveBuffSummary summary = default;
+            if (TryReadDirectLiveBuffEntries(pd, out var directEntries))
             {
-                var bc = pd != null ? pd.buffContainer : null;
-                if (bc != null)
+                if (!_unitBuffLedgers.TryGetValue(monsterId, out var ledger))
                 {
-                    readLive = true;
-                    var buff = bc.GetBuff(10011);
-                    if (buff == null) return false;
-                    int skillId = buff.Source != null ? buff.Source.Id : 0;
-                    if (skillId >= 10000)
-                    {
-                        int casterHeroId = skillId / 100;
-                        if (heroIdToPlayerId.TryGetValue(casterHeroId, out long pid))
-                        {
-                            targetPlayerId = pid;
-                            return true;
-                        }
-                    }
-                    return true;
+                    ledger = new LiveBuffMap();
+                    _unitBuffLedgers[monsterId] = ledger;
                 }
+                ledger.ApplyFullReplace(directEntries);
+                summary = ledger.BuildSummary();
             }
-            catch { }
-            if (!readLive)
+            else if (_unitBuffLedgers.TryGetValue(monsterId, out var evLedger) && evLedger.HasConfirmedState)
+            {
+                summary = evLedger.BuildSummary();
+            }
+            else if (_hasSeenFreshFullSnapshot)
             {
                 try
                 {
                     var hero = pd != null && pd.player != null ? pd.player.Hero : null;
-                    if (hero == null || hero.Buffs == null) return false;
-                    foreach (var kv in hero.Buffs)
+                    if (hero != null && hero.Buffs != null)
                     {
-                        var buff = kv.Value;
-                        if (buff == null || buff.BuffId != 10011) continue;
-                        int skillId = buff.Source != null ? buff.Source.Id : 0;
-                        if (skillId >= 10000)
+                        foreach (var kv in hero.Buffs)
                         {
-                            int casterHeroId = skillId / 100;
-                            if (heroIdToPlayerId.TryGetValue(casterHeroId, out long pid))
-                            {
+                            var buff = kv.Value;
+                            if (buff == null || buff.BuffId != 10011) continue;
+                            int skillId = buff.Source != null ? buff.Source.Id : 0;
+                            if (skillId >= 10000 && heroIdToPlayerId.TryGetValue(skillId / 100, out long pid))
                                 targetPlayerId = pid;
-                                return true;
-                            }
+                            return true;
                         }
-                        return true;
                     }
                 }
                 catch { }
+                return false;
             }
-            return false;
+
+            if (!summary.HasConfirmedData || !summary.HasTaunt) return false;
+            if (summary.TauntSourceSkillId >= 10000 && heroIdToPlayerId.TryGetValue(summary.TauntSourceSkillId / 100, out long tpid))
+            {
+                targetPlayerId = tpid;
+            }
+            return true;
         }
 
         private static bool? TryReadIsNormalAggressive(BattlePlayerData pd)
@@ -4874,8 +5575,7 @@ namespace MonsterPathPredictor.Runtime
             {
                 var hero = pd != null && pd.player != null ? pd.player.Hero : null;
                 if (hero == null) return null;
-                var mt = hero.MonsterType;
-                return mt != Hero.Types.MonsterType.Thief && mt != Hero.Types.MonsterType.PveAllyMonster;
+                return MonsterClassifier.TryClassifyAggressive((int)hero.MonsterType);
             }
             catch { return null; }
         }
@@ -4959,7 +5659,7 @@ namespace MonsterPathPredictor.Runtime
         /// frozen at the hero's spawn or last <c>1040.Place</c> tile), falling back to <c>RoomPlayer.NodeId</c>
         /// only when <c>standLand</c> is unavailable and <c>RoomPlayer.NodeId</c> is proven fresh.
         /// </summary>
-        private int SafeAuthoritativeHeroLandId(BattlePlayerData pd, BoardGraph board, out bool confirmedOnCurrentLayout)
+        private int SafeAuthoritativeHeroLandId(BattlePlayerData pd, BoardGraph board, out bool confirmedOnCurrentLayout, bool readOnly = false)
         {
             confirmedOnCurrentLayout = false;
             if (pd == null) return -1;
@@ -5001,7 +5701,19 @@ namespace MonsterPathPredictor.Runtime
             int? lastSeenProto = (pid > 0 && _lastHeroProtoNodeId.TryGetValue(pid, out int prevProto)) ? (int?)prevProto : null;
             bool visualConfirmedBefore = pid > 0 && _heroVisualConfirmedOnCurrentLayout.Contains(pid);
 
-            var resolved = HeroPositionResolver.Resolve(
+            int pendingLand = -1;
+            long pendingSeq = 0;
+            long ackedSeq = 0;
+            bool walkedSinceSnap = false;
+            if (pid > 0 && _confirmedHeroFields.TryGetValue(pid, out var hc))
+            {
+                pendingLand = hc.PendingLogicalLandId;
+                pendingSeq = hc.PendingLogicalEventSeq;
+                ackedSeq = hc.AcknowledgedLogicalEventSeq;
+                walkedSinceSnap = hc.ObservedWalkSinceSnapshot;
+            }
+
+            var resolved = HeroPositionResolver.ResolveWithEvents(
                 board,
                 standLandId,
                 standLandVerifiedOnCurrentManager,
@@ -5011,21 +5723,33 @@ namespace MonsterPathPredictor.Runtime
                 prevBoardContainsProto: prevBoardContainsProto,
                 preLayoutProtoNodeId: preLayoutProto,
                 lastSeenProtoNodeId: lastSeenProto,
-                visualConfirmedOnCurrentLayout: visualConfirmedBefore);
+                visualConfirmedOnCurrentLayout: visualConfirmedBefore,
+                pendingLogicalLandId: pendingLand,
+                pendingLogicalEventSeq: pendingSeq,
+                acknowledgedLogicalEventSeq: ackedSeq,
+                hasFreshFullSnapshot: _hasSeenFreshFullSnapshot,
+                observedWalkSinceSnapshot: walkedSinceSnap);
 
-            if (resolved.ShouldBaselineUnconfirmedPostLayoutProto && pid > 0 && protoNode >= 0)
+            if (!readOnly)
             {
-                _preLayoutHeroProtoNodeId[pid] = protoNode;
+                if (resolved.ShouldBaselineUnconfirmedPostLayoutProto && pid > 0 && protoNode >= 0)
+                {
+                    _preLayoutHeroProtoNodeId[pid] = protoNode;
+                }
+                if (resolved.ConfirmedOnCurrentLayout && resolved.LandId >= 0 && pid > 0)
+                {
+                    _heroConfirmedOnCurrentLayout.Add(pid);
+                    if (resolved.UsedVerifiedVisual) _heroVisualConfirmedOnCurrentLayout.Add(pid);
+                    if (resolved.ShouldUpdateLastSeenProto && protoNode >= 0) _lastHeroProtoNodeId[pid] = protoNode;
+                    if (_confirmedHeroFields.TryGetValue(pid, out var hcMut) && resolved.AcknowledgedEventSeq > hcMut.AcknowledgedLogicalEventSeq)
+                    {
+                        hcMut.AcknowledgedLogicalEventSeq = resolved.AcknowledgedEventSeq;
+                    }
+                }
             }
 
             if (resolved.ConfirmedOnCurrentLayout && resolved.LandId >= 0)
             {
-                if (pid > 0)
-                {
-                    _heroConfirmedOnCurrentLayout.Add(pid);
-                    if (resolved.UsedVerifiedVisual) _heroVisualConfirmedOnCurrentLayout.Add(pid);
-                    if (protoNode >= 0) _lastHeroProtoNodeId[pid] = protoNode;
-                }
                 confirmedOnCurrentLayout = true;
                 return resolved.LandId;
             }
@@ -5056,14 +5780,9 @@ namespace MonsterPathPredictor.Runtime
             catch { }
             try
             {
-                if (pd.player != null && pd.player.BackNodeId >= 0)
+                // Trust live RoomPlayer.BackNodeId directly (including explicit -1!) without falling through to frozen Hero.BackNodeId!
+                if (pd.player != null)
                     return pd.player.BackNodeId;
-            }
-            catch { }
-            try
-            {
-                if (pd.player != null && pd.player.Hero != null && pd.player.Hero.BackNodeId >= 0)
-                    return pd.player.Hero.BackNodeId;
             }
             catch { }
             return -1;
@@ -5075,6 +5794,32 @@ namespace MonsterPathPredictor.Runtime
 
         private static FieldInfo _walkDirectionsField;
         private static bool _walkDirectionsFieldResolved;
+        private static FieldInfo _nextStandLandField;
+        private static bool _nextStandLandFieldResolved;
+
+        private static int TryReadNextStandLandId(Character ch)
+        {
+            if (!UnityObject.IsAlive(ch) || CharacterMoveField == null) return -1;
+            try
+            {
+                object moveComp = CharacterMoveField.GetValue(ch);
+                if (moveComp == null) return -1;
+                if (!_nextStandLandFieldResolved)
+                {
+                    _nextStandLandFieldResolved = true;
+                    _nextStandLandField = moveComp.GetType().GetField(
+                        "nextStandLand",
+                        BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                }
+                if (_nextStandLandField == null) return -1;
+                if (_nextStandLandField.GetValue(moveComp) is UnitLand nextLand && UnityObject.IsAlive(nextLand))
+                {
+                    return nextLand.Id;
+                }
+            }
+            catch { }
+            return -1;
+        }
 
         private static int[] TryReadLiveWalkDirectionArrows(BoardGraph board, Character ch, int landId)
         {
@@ -5118,8 +5863,13 @@ namespace MonsterPathPredictor.Runtime
             bool hasLiveChar,
             int landId,
             int fromLandId,
-            MonsterMemory mem)
+            MonsterMemory mem,
+            int[] inFlightFrontOverride = null)
         {
+            if (inFlightFrontOverride != null && inFlightFrontOverride.Length > 0)
+            {
+                return inFlightFrontOverride;
+            }
             int[] visualArrows = hasLiveChar ? TryReadLiveWalkDirectionArrows(board, ch, landId) : null;
             int[] explicitFront = (mem != null &&
                                    mem.ExplicitFrontNodeIds != null &&
@@ -5133,28 +5883,20 @@ namespace MonsterPathPredictor.Runtime
                 hasLiveChar,
                 fromLandId,
                 visualArrows,
-                explicitFront);
+                explicitFront,
+                arrivedByNormalWalk: mem != null && mem.ArrivedByNormalWalk);
         }
 
         private static int[] SafeRawProtocolFrontNodeIds(BattlePlayerData pd)
         {
             try
             {
-                if (pd.player != null && pd.player.FrontIds != null && pd.player.FrontIds.Count > 0)
+                // Honor live RoomPlayer.FrontIds directly (including an explicit empty list!) without
+                // falling through to frozen Hero.FrontNodeIds!
+                if (pd != null && pd.player != null && pd.player.FrontIds != null)
                 {
                     var list = pd.player.FrontIds;
-                    var arr = new int[list.Count];
-                    for (int i = 0; i < list.Count; i++) arr[i] = list[i];
-                    return arr;
-                }
-            }
-            catch { }
-
-            try
-            {
-                if (pd.player != null && pd.player.Hero != null && pd.player.Hero.FrontNodeIds != null && pd.player.Hero.FrontNodeIds.Count > 0)
-                {
-                    var list = pd.player.Hero.FrontNodeIds;
+                    if (list.Count == 0) return Array.Empty<int>();
                     var arr = new int[list.Count];
                     for (int i = 0; i < list.Count; i++) arr[i] = list[i];
                     return arr;

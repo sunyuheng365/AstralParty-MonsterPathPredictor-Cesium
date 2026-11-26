@@ -562,19 +562,19 @@ namespace MonsterPathPredictor.Runtime
 
         private void MergePartialPlayerUpdates(List<TrackedPlayer> partialPlayers)
         {
-            if (partialPlayers == null || partialPlayers.Count == 0 || _players.Count == 0) return;
+            if (partialPlayers == null || partialPlayers.Count == 0) return;
             bool changed = false;
             for (int i = 0; i < partialPlayers.Count; i++)
             {
                 var upd = partialPlayers[i];
                 if (upd == null || upd.PlayerId <= 0) continue;
+                bool found = false;
                 for (int j = 0; j < _players.Count; j++)
                 {
                     var existing = _players[j];
                     if (existing != null && existing.PlayerId == upd.PlayerId)
                     {
-                        // Merge per-field: apply confirmed death/status immediately while preserving the
-                        // last valid same-layout tile whenever a partial sample reads LandId < 0!
+                        found = true;
                         bool updLandValid = _board != null && upd.LandId >= 0 && _board.Contains(upd.LandId);
                         int mergedLand = updLandValid
                             ? upd.LandId
@@ -594,9 +594,21 @@ namespace MonsterPathPredictor.Runtime
                         break;
                     }
                 }
+                if (!found)
+                {
+                    // Finding #18: include independently confirmed new players (e.g. newly readable P4)
+                    // even on a partial roster frame so they are never omitted from forecasts or sandbox!
+                    _players.Add(upd);
+                    changed = true;
+                }
             }
             if (changed)
             {
+                _players.Sort((a, b) =>
+                {
+                    int cmp = a.Slot.CompareTo(b.Slot);
+                    return cmp != 0 ? cmp : a.PlayerId.CompareTo(b.PlayerId);
+                });
                 long prevSelPlayer = _virtualSandbox.SelectedPlayerId;
                 bool prevArmed = _virtualSandbox.BoardPickArmed;
                 _virtualSandbox.Reconcile(_players, _board, _tracker.LocalPlayerId);
@@ -693,9 +705,18 @@ namespace MonsterPathPredictor.Runtime
                     return;
                 }
 
+                if (_tracker.IsAwaitingMapLayoutReplacement(landManager))
+                {
+                    // 1086 MapIndexChangeS2C arrived and MapSceneChange() has not replaced LandManager yet:
+                    // suspend tile-dependent planning and input until the replacement board loads.
+                    SuspendForIncompleteBoard();
+                    return;
+                }
+
                 double nowSec = MonotonicSeconds();
                 long placeSeqSnapshot = _tracker.LatestPlaceSequence;
-                bool forceBoardScan = _board == null || _boardScanIncomplete || nowSec >= _nextBoardScanSec || _tracker.HasUnvalidatedPlace;
+                bool managerForceReplace = _tracker.ShouldForceTopologyReplaced(landManager);
+                bool forceBoardScan = _board == null || _boardScanIncomplete || managerForceReplace || nowSec >= _nextBoardScanSec || _tracker.HasUnvalidatedPlace;
 
                 if (forceBoardScan)
                 {
@@ -707,26 +728,25 @@ namespace MonsterPathPredictor.Runtime
                         if (_board == null)
                         {
                             _board = nextBoard;
+                            _tracker.MarkMapLayoutCaptured(landManager);
                             _awaitingPostLayoutUnitSync = true;
                             _needsUnitSync = true;
                             MarkPlanInputsChanged(forceReplan: true);
                             _tracker.AcknowledgeBoardValidatedUpTo(_board, placeSeqSnapshot);
                         }
-                        else if (!_board.SameTopology(nextBoard))
+                        else if (!_board.SameTopology(nextBoard) || managerForceReplace)
                         {
+                            _tracker.MarkMapLayoutCaptured(landManager);
                             HandleBoardTopologyReplaced(nextBoard, placeSeqSnapshot);
                         }
                         else
                         {
-                            // Acknowledge ONLY up to the Place sequence captured BEFORE CaptureBoard succeeded,
-                            // validating per-record board compatibility so future-layout Places stay pending.
+                            _tracker.MarkMapLayoutCaptured(landManager);
                             _tracker.AcknowledgeBoardValidatedUpTo(_board, placeSeqSnapshot);
                         }
                     }
                     else
                     {
-                        // Incomplete replacement/rebuilding board: suspend tile-dependent reconciliation,
-                        // gestures, and rendering until a complete board scan confirms the topology!
                         SuspendForIncompleteBoard();
                         return;
                     }

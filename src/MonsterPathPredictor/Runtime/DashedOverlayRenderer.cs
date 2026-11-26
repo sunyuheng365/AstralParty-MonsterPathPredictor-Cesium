@@ -504,8 +504,7 @@ namespace MonsterPathPredictor.Runtime
 
                 Color badgeColor = combat.IsSteal ? palette.MajorBranch : CombatBadgeColor;
                 DrawDot(cPt, 7.5f, badgeColor);
-                string prefix = combat.IsSteal ? "偷" : "⚔遇";
-                string cLabel = prefix + combat.TargetLabel + "(第" + combat.StepIndex + "格)";
+                string cLabel = CombatBadgeFormatter.FormatEncounterLabel(combat);
                 DrawPillLabel(new Point2(cPt.X, cPt.Y + 20f), cLabel, Math.Max(12, settings.FontSize - 3), badgeColor, layer.width, layer.height);
             }
 

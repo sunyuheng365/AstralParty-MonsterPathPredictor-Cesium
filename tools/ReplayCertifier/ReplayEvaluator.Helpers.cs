@@ -11,7 +11,7 @@ namespace MonsterPathPredictor.ReplayCertifier
     {
         private static bool IsStateFrame(int cmd)
         {
-            return cmd == 1003 || cmd == 1016 || cmd == 1113 || cmd == 1018 || cmd == 5022 ||
+            return cmd == 1003 || cmd == 1016 || cmd == 1113 || cmd == 1018 || cmd == 1042 || cmd == 5022 ||
                    cmd == 1040 || cmd == 1086 || cmd == 1096 || cmd == 5214 || cmd == 1007 || cmd == 1115 || cmd == 5028;
         }
 
@@ -139,6 +139,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                     return true;
                 }
                 case 1018: return decoder.TryDecode("party.protocol.MonsterRefreshS2C", payload) != null;
+                case 1042: return decoder.TryDecode("party.protocol.ChangePlayerSlotS2C", payload) != null;
                 case 5022: return decoder.TryDecode("party.protocol.ThrowDiceS2C", payload) != null;
                 case 1040: return decoder.TryDecode("party.protocol.UpdateHeroAttrS2C", payload) != null;
                 case 1086: return decoder.TryDecode("party.protocol.MapIndexChangeS2C", payload) != null;
@@ -185,18 +186,27 @@ namespace MonsterPathPredictor.ReplayCertifier
             if (isMonster)
             {
                 try { u.BossTargetId = (long)h.BossTargetId; } catch { }
+                try { u.IsLaunchFight = (bool)h.IsLaunchFight; } catch { }
             }
             if (h.Buffs != null)
             {
+                var initBuffs = new List<LiveBuffEntry>();
                 foreach (dynamic kv in (IEnumerable)h.Buffs)
-                    if (kv?.Value != null)
-                    {
-                        int bid = (int)kv.Value.BuffId;
-                        u.BuffIds.Add(bid);
-                        if (bid == 10011 && kv.Value.Source != null) u.TauntSkillId = (int)kv.Value.Source.Id;
-                        if (bid == 10013) u.CrimeBuffProgress = Math.Max(u.CrimeBuffProgress, (int)kv.Value.Progress);
-                        if (bid == 10671303 || (bid == 10671301 && (int)kv.Value.Progress > 0)) u.WardenRevealed = true;
-                    }
+                {
+                    if (kv?.Value == null) continue;
+                    dynamic bv = kv.Value;
+                    long uid = 0;
+                    try { uid = (long)bv.UniqueId; } catch { }
+                    if (uid == 0) { try { uid = Convert.ToInt64(kv.Key); } catch { } }
+                    int bid = (int)bv.BuffId;
+                    int prog = 0;
+                    try { prog = (int)bv.Progress; } catch { }
+                    int srcSkill = 0;
+                    try { if (bv.Source != null) srcSkill = (int)bv.Source.Id; } catch { }
+                    initBuffs.Add(new LiveBuffEntry(uid, bid, prog, srcSkill));
+                }
+                u.BuffMap.ApplyFullReplace(initBuffs);
+                u.SyncBuffSummary();
             }
             return u;
         }
@@ -309,9 +319,10 @@ namespace MonsterPathPredictor.ReplayCertifier
             {
                 if (eff == null) continue;
                 long pid = (long)eff.PlayerId;
-                if (!players.TryGetValue(pid, out var target) && !monsters.TryGetValue(pid, out target)) continue;
+                UnitSim target = null;
+                if (!players.TryGetValue(pid, out target)) monsters.TryGetValue(pid, out target);
 
-                if (eff.Hp != null)
+                if (target != null && eff.Hp != null)
                 {
                     int currHp = (int)eff.Hp.CurrHp;
                     int maxHp = (int)eff.Hp.MaxHp;
@@ -320,60 +331,64 @@ namespace MonsterPathPredictor.ReplayCertifier
                     if (maxHp > 0 || oriHp > 0 || changeHp != 0 || currHp > 0)
                         target.Hp = Math.Max(0, currHp);
                 }
-                if (eff.Gold != null)
+                if (target != null && eff.Gold != null)
                 {
                     int chg = (int)eff.Gold.ChangeGold;
                     target.Gold = (int)eff.Gold.CurrGold;
                     if (actorIsThief && !target.IsMonster && chg < 0) thiefStole = true;
                 }
-                if (eff.CrimeNum != null) target.CrimeNum = Math.Max(0, (int)eff.CrimeNum.CurrNum);
-                if (eff.NotSelect != null) target.NotSelect = (bool)eff.NotSelect.NotSelect;
-                if (eff.Disappear != null && target.IsMonster) target.Hp = 0;
+                if (target != null && eff.CrimeNum != null) target.CrimeNum = Math.Max(0, (int)eff.CrimeNum.CurrNum);
+                if (target != null && eff.NotSelect != null) target.NotSelect = (bool)eff.NotSelect.NotSelect;
+                if (eff.Disappear != null)
+                {
+                    long disPid = pid;
+                    try { long nested = (long)eff.Disappear.PlayerId; if (nested > 0) disPid = nested; } catch { }
+                    if (monsters.TryGetValue(disPid, out var disMonster)) disMonster.Hp = 0;
+                    else if (players.TryGetValue(disPid, out var disPlayer)) disPlayer.Hp = 0;
+                }
 
                 if (eff.Buff != null)
                 {
-                    int op = Convert.ToInt32(eff.Buff.Op);
-                    if (eff.Buff.Buff != null)
+                    long buffPid = pid;
+                    try { long nested = (long)eff.Buff.PlayerId; if (nested > 0) buffPid = nested; } catch { }
+                    if (players.TryGetValue(buffPid, out var buffTarget) || monsters.TryGetValue(buffPid, out buffTarget))
                     {
-                        int bid = (int)eff.Buff.Buff.BuffId;
-                        if (op == 2)
+                        int op = Convert.ToInt32(eff.Buff.Op);
+                        var entries = new List<LiveBuffEntry>();
+                        if (eff.Buff.Buff != null)
                         {
-                            target.BuffIds.Remove(bid);
-                            if (bid == 10011) target.TauntSkillId = 0;
-                            if (bid == 10013) target.CrimeBuffProgress = 0;
+                            dynamic bv = eff.Buff.Buff;
+                            long uid = 0;
+                            try { uid = (long)bv.UniqueId; } catch { }
+                            int prog = 0;
+                            try { prog = (int)bv.Progress; } catch { }
+                            int srcSkill = 0;
+                            try { if (bv.Source != null) srcSkill = (int)bv.Source.Id; } catch { }
+                            entries.Add(new LiveBuffEntry(uid, (int)bv.BuffId, prog, srcSkill));
                         }
-                        else if (op == 1 || op == 3)
+                        else if (eff.Buff.Buffs != null)
                         {
-                            target.BuffIds.Add(bid);
-                            if (bid == 10011 && eff.Buff.Buff.Source != null) target.TauntSkillId = (int)eff.Buff.Buff.Source.Id;
-                            if (bid == 10013) target.CrimeBuffProgress = Math.Max(0, (int)eff.Buff.Buff.Progress);
-                            if (bid == 10671303 || (bid == 10671301 && (int)eff.Buff.Buff.Progress > 0)) target.WardenRevealed = true;
-                        }
-                    }
-                    else if (eff.Buff.Buffs != null)
-                    {
-                        foreach (dynamic kv in (IEnumerable)eff.Buff.Buffs)
-                        {
-                            if (kv?.Value == null) continue;
-                            int bid = (int)kv.Value.BuffId;
-                            if (op == 2)
+                            foreach (dynamic kv in (IEnumerable)eff.Buff.Buffs)
                             {
-                                target.BuffIds.Remove(bid);
-                                if (bid == 10011) target.TauntSkillId = 0;
-                                if (bid == 10013) target.CrimeBuffProgress = 0;
-                            }
-                            else if (op == 1 || op == 3)
-                            {
-                                target.BuffIds.Add(bid);
-                                if (bid == 10011 && kv.Value.Source != null) target.TauntSkillId = (int)kv.Value.Source.Id;
-                                if (bid == 10013) target.CrimeBuffProgress = Math.Max(0, (int)kv.Value.Progress);
-                                if (bid == 10671303 || (bid == 10671301 && (int)kv.Value.Progress > 0)) target.WardenRevealed = true;
+                                if (kv?.Value == null) continue;
+                                dynamic bv = kv.Value;
+                                long uid = 0;
+                                try { uid = (long)bv.UniqueId; } catch { }
+                                if (uid == 0) { try { uid = Convert.ToInt64(kv.Key); } catch { } }
+                                int prog = 0;
+                                try { prog = (int)bv.Progress; } catch { }
+                                int srcSkill = 0;
+                                try { if (bv.Source != null) srcSkill = (int)bv.Source.Id; } catch { }
+                                entries.Add(new LiveBuffEntry(uid, (int)bv.BuffId, prog, srcSkill));
                             }
                         }
+                        // Handles op 0 (full replace), op 1 (insert), op 2 (delete by UniqueId), op 3 (change).
+                        buffTarget.BuffMap.ApplyOperation(op, entries);
+                        buffTarget.SyncBuffSummary();
                     }
                 }
 
-                if (eff.Place != null && eff.Place.Place != null)
+                if (target != null && eff.Place != null && eff.Place.Place != null)
                 {
                     dynamic pl = eff.Place.Place;
                     int oldNode = target.NodeId;

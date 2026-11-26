@@ -41,8 +41,26 @@ namespace MonsterPathPredictor.ReplayCertifier
             public int PreTeleportLandingNodeId = -1;
             public int TauntSkillId;
             public long BossTargetId;
+            public bool IsLaunchFight;
             public bool WardenRevealed;
             public HashSet<int> BuffIds = new();
+            public LiveBuffMap BuffMap = new();
+
+            public void SyncBuffSummary()
+            {
+                var summary = BuffMap.BuildSummary();
+                TauntSkillId = summary.HasTaunt ? summary.TauntSourceSkillId : 0;
+                CrimeBuffProgress = summary.CrimeBuffProgress;
+                if (summary.HasWardenReveal) WardenRevealed = true;
+                BuffIds.Clear();
+                if (summary.HasTaunt) BuffIds.Add(10011);
+                if (summary.HasProblemStudent) BuffIds.Add(2101001);
+                if (summary.HasMandarinDuck) BuffIds.Add(10470101);
+                if (summary.IsTrueCulprit) BuffIds.Add(10671302);
+                if (summary.HasUnchallengeableStealth) BuffIds.Add(1270202);
+                if (BuffMap.ContainsBuff(10681202)) BuffIds.Add(10681202);
+                if (BuffMap.ContainsBuff(10671303)) BuffIds.Add(10671303);
+            }
         }
 
         public static CertificationSummary EvaluateBytes(string replayId, byte[] bytes, IProtocolDecoder decoder, BoardCatalog catalog)
@@ -399,6 +417,7 @@ namespace MonsterPathPredictor.ReplayCertifier
                         foughtTile = foughtLayoutIdx = thiefStoleTile = thiefStoleLayoutIdx = -1;
                         turnStartLandId = monsters.TryGetValue(curTurnActor, out var am) ? am.NodeId : -1;
                         startedOnFork = am != null && board.IsFork(am.NodeId);
+                        if (am != null && am.IsLaunchFight) foughtTurn = true;
                     }
                     else
                     {
@@ -444,6 +463,23 @@ namespace MonsterPathPredictor.ReplayCertifier
                             }
                         }
                         SyncTileScopedTurnFlags();
+                    }
+                }
+                else if (cmd == 1042)
+                {
+                    dynamic cps = decoder.TryDecode("party.protocol.ChangePlayerSlotS2C", payload);
+                    if (cps == null) { decodeFailed = true; break; }
+                    if (cps.PlayerSlot != null)
+                    {
+                        foreach (dynamic ps in (IEnumerable)cps.PlayerSlot)
+                        {
+                            if (ps == null) continue;
+                            long spid = (long)ps.PlayerId;
+                            if (!players.TryGetValue(spid, out var sp)) continue;
+                            int nextSlot = (int)ps.Slot;
+                            try { int cs = (int)ps.ChangeSlot; if (cs >= 0 && cs < 4) nextSlot = cs; } catch { }
+                            if (nextSlot >= 0 && nextSlot < 4) sp.Slot = nextSlot;
+                        }
                     }
                 }
                 else if (cmd == 1018)

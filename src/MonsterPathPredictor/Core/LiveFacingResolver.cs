@@ -114,10 +114,80 @@ namespace MonsterPathPredictor.Core
         }
 
         /// <summary>
-        /// Resolves live <c>FrontNodeIds</c> in strict authority order:
-        /// 1. Rendered visual arrows (<paramref name="visualArrowFrontIds"/>) from <c>CharacterMove._walkDirections</c>.
-        /// 2. Fresh explicit server arrows (<paramref name="explicitFrontNodeIds"/>) from spawn or <c>1040.Place</c>.
-        /// 3. Exact client-equivalent <c>UnitLand.CanSelectedLandId(liveFromLandId)</c> from live <c>Character</c> state.
+        /// Sanitizes the in-flight <c>5028 MoveS2C</c> tween self-loop in <c>Core.Unit.CharacterMove</c>:
+        /// <c>GetNextLandId</c> calls <c>ResetFromLandId(departure)</c> BEFORE the movement tween, while
+        /// <c>MoveToPositionAsync</c> calls <c>ResetStandLand(nextStandLand)</c> AFTER the tween completes.
+        /// During that interval, <c>(standLand, fromLandId) == (departure, departure)</c>.
+        /// Retaining the last committed predecessor (or deriving the unique forward edge from
+        /// <paramref name="nextStandLandId"/>) prevents manufacturing a 50% U-turn on a straight road.
+        /// </summary>
+        public static void SanitizeInFlightMovement(
+            BoardGraph board,
+            int currentLandId,
+            int rawFromLandId,
+            int nextStandLandId,
+            int lastCommittedLandId,
+            int lastCommittedFromLandId,
+            out int effectiveFromLandId,
+            out int[] inFlightFrontOverride,
+            out bool isInFlightSelfLoop)
+        {
+            effectiveFromLandId = rawFromLandId;
+            inFlightFrontOverride = null;
+            isInFlightSelfLoop = false;
+
+            if (board == null || currentLandId < 0 || !board.Contains(currentLandId))
+                return;
+
+            bool validNext = nextStandLandId >= 0 &&
+                             nextStandLandId != currentLandId &&
+                             board.IsValidNeighbor(currentLandId, nextStandLandId);
+
+            if (rawFromLandId == currentLandId)
+            {
+                isInFlightSelfLoop = true;
+
+                // Prefer the known in-flight destination edge if CharacterMove.nextStandLand is valid.
+                if (validNext)
+                {
+                    inFlightFrontOverride = new[] { nextStandLandId };
+                }
+
+                // Retain the committed incoming edge while still standing on departure.
+                if (lastCommittedLandId == currentLandId &&
+                    lastCommittedFromLandId >= 0 &&
+                    lastCommittedFromLandId != currentLandId &&
+                    (board.IsValidNeighbor(currentLandId, lastCommittedFromLandId) ||
+                     board.IsValidNeighbor(lastCommittedFromLandId, currentLandId)))
+                {
+                    effectiveFromLandId = lastCommittedFromLandId;
+                    return;
+                }
+
+                // On a 2-exit straight road [prev, next], if we know the in-flight destination next,
+                // the incoming predecessor is uniquely the other neighbor.
+                if (validNext)
+                {
+                    var all = board.GetValidNeighbors(currentLandId);
+                    if (all.Count == 2)
+                    {
+                        int other = all[0] == nextStandLandId ? all[1] : all[0];
+                        if (other != currentLandId)
+                        {
+                            effectiveFromLandId = other;
+                            return;
+                        }
+                    }
+                }
+
+                effectiveFromLandId = -1;
+            }
+        }
+
+        /// <summary>
+        /// Resolves live <c>FrontNodeIds</c> in strict authority order while guarding against partial async
+        /// <c>CharacterMove.ShowWalkDirections</c> loads (which await each effect before appending to
+        /// <c>_walkDirections</c>) and matching <c>UnitLand.CanSelectedLandId</c> on directed one-way arrivals.
         /// </summary>
         public static int[] ResolveLiveFrontNodeIds(
             BoardGraph board,
@@ -125,41 +195,79 @@ namespace MonsterPathPredictor.Core
             bool hasLiveCharacter,
             int liveFromLandId,
             int[] visualArrowFrontIds,
-            int[] explicitFrontNodeIds)
+            int[] explicitFrontNodeIds,
+            bool arrivedByNormalWalk = false)
         {
             if (board == null || !board.Contains(currentLandId)) return Array.Empty<int>();
 
-            if (visualArrowFrontIds != null && visualArrowFrontIds.Length > 0)
-            {
-                var vis = FilterValidDistinct(board, currentLandId, visualArrowFrontIds);
-                if (vis.Count > 0) return vis.ToArray();
-            }
+            List<int> vis = (visualArrowFrontIds != null && visualArrowFrontIds.Length > 0)
+                ? FilterValidDistinct(board, currentLandId, visualArrowFrontIds)
+                : null;
+            List<int> exp = (explicitFrontNodeIds != null && explicitFrontNodeIds.Length > 0)
+                ? FilterValidDistinct(board, currentLandId, explicitFrontNodeIds)
+                : null;
 
-            if (explicitFrontNodeIds != null && explicitFrontNodeIds.Length > 0)
-            {
-                var exp = FilterValidDistinct(board, currentLandId, explicitFrontNodeIds);
-                if (exp.Count > 0) return exp.ToArray();
-            }
-
-            if (hasLiveCharacter)
+            List<int> expectedTopological = null;
+            if (hasLiveCharacter && liveFromLandId != currentLandId)
             {
                 if (liveFromLandId >= 0 && board.IsValidNeighbor(currentLandId, liveFromLandId))
                 {
                     var fwd = board.GetForwardNeighbors(currentLandId, liveFromLandId);
-                    var arr = new int[fwd.Count];
-                    for (int i = 0; i < fwd.Count; i++) arr[i] = fwd[i];
-                    return arr;
+                    expectedTopological = new List<int>(fwd.Count);
+                    for (int i = 0; i < fwd.Count; i++) expectedTopological.Add(fwd[i]);
                 }
-                if (liveFromLandId == -1)
+                else if (liveFromLandId == -1 ||
+                         (liveFromLandId >= 0 && board.IsValidNeighbor(liveFromLandId, currentLandId)))
                 {
+                    // Exact match to UnitLand.CanSelectedLandId(from): when from == -1 OR from arrived along a
+                    // directed one-way edge (absent from currentLand's outgoing adjacency), all outgoing exits remain valid.
                     var all = board.GetValidNeighbors(currentLandId);
-                    var arr = new int[all.Count];
-                    for (int i = 0; i < all.Count; i++) arr[i] = all[i];
-                    return arr;
+                    expectedTopological = new List<int>(all.Count);
+                    for (int i = 0; i < all.Count; i++) expectedTopological.Add(all[i]);
                 }
             }
 
+            if (vis != null && vis.Count > 0)
+            {
+                // Guard against ShowWalkDirections mid-async-load:
+                // - When explicit fronts are known for this occurrence (spawn/Place/Pursuit), a strict subset is mid-load.
+                // - When the unit arrived via normal walking (ShowWalkDirections(null)), all CanSelectedLandId(from)
+                //   arrows are spawned, so a strict subset of expectedTopological is also mid-load.
+                if (exp != null && exp.Count > vis.Count && IsSubset(vis, exp))
+                {
+                    return exp.ToArray();
+                }
+                if (arrivedByNormalWalk &&
+                    (exp == null || exp.Count == 0) &&
+                    expectedTopological != null &&
+                    expectedTopological.Count > vis.Count &&
+                    IsSubset(vis, expectedTopological))
+                {
+                    return expectedTopological.ToArray();
+                }
+                return vis.ToArray();
+            }
+
+            if (exp != null && exp.Count > 0)
+            {
+                return exp.ToArray();
+            }
+
+            if (expectedTopological != null && expectedTopological.Count > 0)
+            {
+                return expectedTopological.ToArray();
+            }
+
             return Array.Empty<int>();
+        }
+
+        private static bool IsSubset(List<int> sub, List<int> super)
+        {
+            for (int i = 0; i < sub.Count; i++)
+            {
+                if (!super.Contains(sub[i])) return false;
+            }
+            return true;
         }
 
         private static List<int> FilterValidDistinct(BoardGraph board, int currentLandId, int[] candidates)

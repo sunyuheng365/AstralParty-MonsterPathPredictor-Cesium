@@ -204,6 +204,196 @@ namespace MonsterPathPredictor.Core
             }
         }
 
+        public void ReseedFromFullSnapshot(int snapshotRound, IReadOnlyList<(long MonsterId, bool ActionEnd)> entries)
+        {
+            if (snapshotRound >= 0)
+            {
+                if (_lastObservedRound >= 0 && snapshotRound < _lastObservedRound)
+                {
+                    return;
+                }
+                if (_hasProvisionalNextRound && snapshotRound >= _provisionalNextRoundNumber)
+                {
+                    PromoteProvisionalRound(snapshotRound);
+                    _lastObservedRound = snapshotRound;
+                }
+                else if (_lastObservedRound >= 0 && snapshotRound > _lastObservedRound)
+                {
+                    ClearActedSetsForNewRound();
+                    _lastObservedRound = snapshotRound;
+                }
+                else if (_lastObservedRound < 0)
+                {
+                    _lastObservedRound = snapshotRound;
+                }
+            }
+
+            if (entries == null || entries.Count == 0) return;
+            int roundKey = snapshotRound >= 0 ? snapshotRound : EffectiveRoundNumber;
+            for (int i = 0; i < entries.Count; i++)
+            {
+                long mid = entries[i].MonsterId;
+                bool actionEnd = entries[i].ActionEnd;
+                if (mid == 0) continue;
+
+                // A fresh full roster / reconnect snapshot is authoritative for its round even when
+                // the numeric ActionEnd value equals a prior round's cached true!
+                _serverActionEndHistory[mid] = (actionEnd, roundKey, false);
+                if (mid == EffectiveActiveActorId)
+                {
+                    _activeActorSawServerActionEndTrue = actionEnd;
+                    ClearActedThisRound(mid);
+                }
+                else if (actionEnd)
+                {
+                    MarkActedThisRound(mid);
+                }
+                else
+                {
+                    ClearActedThisRound(mid);
+                }
+            }
+        }
+
+        public TurnBoundaryResult ObserveExplicitRoundChange(int newRound)
+        {
+            if (newRound < 0)
+            {
+                return new TurnBoundaryResult(false, false, false);
+            }
+            if (_lastObservedRound >= 0 && newRound < _lastObservedRound)
+            {
+                return new TurnBoundaryResult(false, false, false, sampleRejected: true);
+            }
+            if (_lastObservedRound >= 0 && newRound == _lastObservedRound)
+            {
+                return new TurnBoundaryResult(false, false, false);
+            }
+
+            bool roundChanged = _lastObservedRound >= 0 && newRound > _lastObservedRound;
+            _lastObservedRound = newRound;
+
+            if (_hasProvisionalNextRound && newRound >= _provisionalNextRoundNumber)
+            {
+                PromoteProvisionalRound(newRound);
+                if (_activeActorId != 0 && _activeActorStartedRound >= 0 && _activeActorStartedRound < newRound)
+                {
+                    _staleActorRoundPending = true;
+                }
+                return new TurnBoundaryResult(false, roundChanged, false);
+            }
+
+            if (roundChanged)
+            {
+                ClearActedSetsForNewRound();
+                if (_activeActorId != 0 && _activeActorStartedRound >= 0 && _activeActorStartedRound < newRound)
+                {
+                    _staleActorRoundPending = true;
+                }
+                else if (_activeActorId == 0)
+                {
+                    _pendingNullRoundReset = true;
+                }
+            }
+            return new TurnBoundaryResult(false, roundChanged, false);
+        }
+
+        public TurnBoundaryResult ObserveExplicitActionStart(
+            long actorId,
+            int roundHint,
+            Func<long, bool> isAliveMonster,
+            Func<long, bool> isHeroUnit,
+            bool isEarlierRoundPriorityThanPrevious = false)
+        {
+            if (actorId <= 0)
+            {
+                return new TurnBoundaryResult(false, false, false);
+            }
+
+            bool roundChanged = false;
+            bool promotedProvisional = false;
+            if (roundHint >= 0)
+            {
+                bool wasProvisional = _hasProvisionalNextRound && roundHint >= _provisionalNextRoundNumber;
+                var rRes = ObserveExplicitRoundChange(roundHint);
+                if (rRes.SampleRejected) return rRes;
+                roundChanged = rRes.RoundChanged;
+                promotedProvisional = wasProvisional && !_hasProvisionalNextRound;
+            }
+
+            int effectiveRound = EffectiveRoundNumber;
+            bool outgoingWasAliveMonster = _activeActorId != 0 && isAliveMonster != null && isAliveMonster(_activeActorId);
+            bool incomingIsHero = isHeroUnit != null && isHeroUnit(actorId);
+            bool actorChanged = actorId != _activeActorId;
+            bool incomingAlreadyActedInActiveRound = _hasProvisionalNextRound
+                ? _provisionalInferredActedSawServerTrue.ContainsKey(actorId)
+                : (_inferredActedSawServerTrue.ContainsKey(actorId) || _serverActedMonsterIdsThisRound.Contains(actorId));
+
+            bool looksLikeEarlyNextRound =
+                !roundChanged && actorChanged && _activeActorId != 0 &&
+                !_hasProvisionalNextRound && !_staleActorRoundPending && !_pendingNullRoundReset &&
+                (incomingAlreadyActedInActiveRound ||
+                 (outgoingWasAliveMonster && incomingIsHero) ||
+                 (outgoingWasAliveMonster && isEarlierRoundPriorityThanPrevious));
+
+            if ((!roundChanged || promotedProvisional) && actorChanged && outgoingWasAliveMonster)
+            {
+                bool startedInActiveRound = !_staleActorRoundPending &&
+                                            !_pendingNullRoundReset &&
+                                            (_activeActorStartedRound < 0 || effectiveRound < 0 || _activeActorStartedRound == effectiveRound);
+                if (startedInActiveRound)
+                {
+                    if (_hasProvisionalNextRound)
+                        _provisionalInferredActedSawServerTrue[_activeActorId] = _activeActorSawServerActionEndTrue;
+                    else
+                        _inferredActedSawServerTrue[_activeActorId] = _activeActorSawServerActionEndTrue;
+                }
+            }
+
+            if (looksLikeEarlyNextRound)
+            {
+                if (_lastObservedRound < 0)
+                {
+                    ClearActedSetsForNewRound();
+                }
+                else
+                {
+                    _hasProvisionalNextRound = true;
+                    _provisionalNextRoundNumber = _lastObservedRound + 1;
+                    _provisionalInferredActedSawServerTrue.Clear();
+                    _activeActorProvisionalNextRound = true;
+                }
+            }
+            else if (_hasProvisionalNextRound)
+            {
+                _activeActorProvisionalNextRound = true;
+            }
+            else
+            {
+                _activeActorProvisionalNextRound = false;
+            }
+
+            if (_lastObservedRound < 0 && (_inferredActedSawServerTrue.Count > 0 || _serverActedMonsterIdsThisRound.Count > 0) && incomingIsHero)
+            {
+                ClearActedSetsForNewRound();
+            }
+
+            _turnSequence++;
+            _activeActorId = actorId;
+            int nextActorRound = _hasProvisionalNextRound ? _provisionalNextRoundNumber : EffectiveRoundNumber;
+            _activeActorStartedRound = nextActorRound;
+            _pendingNullRoundReset = false;
+            _staleActorRoundPending = false;
+            _activeActorSawServerActionEndTrue = false;
+            _actorAwaitingFirstDice = true;
+
+            _inferredActedSawServerTrue.Remove(actorId);
+            _serverActedMonsterIdsThisRound.Remove(actorId);
+            _provisionalInferredActedSawServerTrue.Remove(actorId);
+
+            return new TurnBoundaryResult(boundaryAdvanced: true, roundChanged: roundChanged, shouldResetMovementState: true);
+        }
+
         public void SeedInitialServerActionEnd(long monsterId, bool serverActionEnd, int currentRound)
         {
             if (monsterId == 0) return;

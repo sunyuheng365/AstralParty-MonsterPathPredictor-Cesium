@@ -269,10 +269,18 @@ namespace MonsterPathPredictor.Core
             bool initialBossTargetCleared = monster.BossTargetClearedThisTurn;
             RecordTileStep(tileStepMap, tileStepHasPreCombat, monster.CurrentLandId, step: 0, probability: 1.0, isAfterCombat: initialCombatState);
 
-            var currentLayer = new Dictionary<WalkStateKey, (double Prob, double LogProb)>
+            var currentLayer = new Dictionary<WalkStateKey, (double Prob, double LogProb)>();
+            if (options.PostCombatMode == PostCombatMode.StopAtFirstCombat && monster.JustFoughtOnCurrentFork)
             {
-                [new WalkStateKey(monster.CurrentLandId, monster.FromLandId, initialCombatState, -1, initialBossTargetCleared)] = (1.0, 0.0)
-            };
+                // Finding #22: when refreshing a plan on the confirmed encounter tile in StopAtFirstCombat mode,
+                // emit a zero-step stopped endpoint instead of resuming movement past the encounter.
+                hasEarlyTerminationOrPruning = true;
+                AccumulateEndpoint(endpointMap, monster.CurrentLandId, 0, false, true, true, 1.0);
+            }
+            else
+            {
+                currentLayer[new WalkStateKey(monster.CurrentLandId, monster.FromLandId, initialCombatState, -1, initialBossTargetCleared)] = (1.0, 0.0);
+            }
 
             for (int step = 0; step < maxSteps && currentLayer.Count > 0; step++)
             {
@@ -302,6 +310,9 @@ namespace MonsterPathPredictor.Core
                     bool postCombatNow = state.HasEncounteredPlayer;
                     int clearedMarkLandId = state.ClearedMarkLandId;
                     bool bossTargetClearedNow = state.BossTargetCleared;
+                    bool splitMixedMarkedCombat = false;
+                    double markedCombatShare = 0.0;
+                    int clearedMarkLandIfMarked = clearedMarkLandId;
                     bool encounteredOnThisTile = false;
 
                     // When stepping onto a tile occupied by living player(s) during the walk (step > 0):
@@ -314,17 +325,25 @@ namespace MonsterPathPredictor.Core
                         {
                             encounteredOnThisTile = true;
                             postCombatNow = true;
-                            if (monster.ChasesProblemStudent && AnyHasProblemStudentMark(targetsHere))
-                            {
-                                clearedMarkLandId = state.LandId;
-                            }
                             // Replay-verified on 82015 (1795593160172877 R10 F4138): fighting a player whose mark
                             // ALREADY expired does NOT clear BossTargetId in multi-step lookahead; only fighting
                             // a target currently carrying the priority mark clears bossTargetClearedNow.
-                            if ((monster.ChasesProblemStudent || monster.ChasesMandarinDuckMark) &&
-                                AnyHasPriorityMark(monster, targetsHere))
+                            // When a marked player and an unmarked player are stacked on the same tile, retain BOTH
+                            // clear/keep outcomes proportionally instead of letting a marked bystander always clear it.
+                            if (monster.ChasesProblemStudent || monster.ChasesMandarinDuckMark)
                             {
-                                bossTargetClearedNow = true;
+                                int markedCount = CountPriorityMarked(monster, targetsHere);
+                                if (markedCount == targetsHere.Count && markedCount > 0)
+                                {
+                                    bossTargetClearedNow = true;
+                                    if (monster.ChasesProblemStudent) clearedMarkLandId = state.LandId;
+                                }
+                                else if (markedCount > 0 && markedCount < targetsHere.Count && !bossTargetClearedNow)
+                                {
+                                    splitMixedMarkedCombat = true;
+                                    markedCombatShare = (double)markedCount / targetsHere.Count;
+                                    if (monster.ChasesProblemStudent) clearedMarkLandIfMarked = state.LandId;
+                                }
                             }
                             RecordCombat(combatMap, state.LandId, step, arrivalProb, targetsHere, isSteal: false);
 
@@ -441,11 +460,33 @@ namespace MonsterPathPredictor.Core
                         stepPositiveTiles.Add(nextId);
                         RecordTileStep(tileStepMap, tileStepHasPreCombat, nextId, step + 1, branchProb, postCombatNow);
 
-                        var nextKey = new WalkStateKey(nextId, state.LandId, postCombatNow, clearedMarkLandId, bossTargetClearedNow);
-                        if (nextLayer.TryGetValue(nextKey, out var existing))
-                            nextLayer[nextKey] = (existing.Prob + branchProb, BoardGraph.LogAddExp(existing.LogProb, branchLogProb));
+                        if (splitMixedMarkedCombat)
+                        {
+                            double pCleared = branchProb * markedCombatShare;
+                            double logPCleared = branchLogProb + Math.Log(markedCombatShare);
+                            var clearedKey = new WalkStateKey(nextId, state.LandId, postCombatNow, clearedMarkLandIfMarked, true);
+                            if (nextLayer.TryGetValue(clearedKey, out var exCleared))
+                                nextLayer[clearedKey] = (exCleared.Prob + pCleared, BoardGraph.LogAddExp(exCleared.LogProb, logPCleared));
+                            else
+                                nextLayer[clearedKey] = (pCleared, logPCleared);
+
+                            double unmarkedShare = 1.0 - markedCombatShare;
+                            double pKept = branchProb * unmarkedShare;
+                            double logPKept = branchLogProb + Math.Log(unmarkedShare);
+                            var keptKey = new WalkStateKey(nextId, state.LandId, postCombatNow, clearedMarkLandId, bossTargetClearedNow);
+                            if (nextLayer.TryGetValue(keptKey, out var exKept))
+                                nextLayer[keptKey] = (exKept.Prob + pKept, BoardGraph.LogAddExp(exKept.LogProb, logPKept));
+                            else
+                                nextLayer[keptKey] = (pKept, logPKept);
+                        }
                         else
-                            nextLayer[nextKey] = (branchProb, branchLogProb);
+                        {
+                            var nextKey = new WalkStateKey(nextId, state.LandId, postCombatNow, clearedMarkLandId, bossTargetClearedNow);
+                            if (nextLayer.TryGetValue(nextKey, out var existing))
+                                nextLayer[nextKey] = (existing.Prob + branchProb, BoardGraph.LogAddExp(existing.LogProb, branchLogProb));
+                            else
+                                nextLayer[nextKey] = (branchProb, branchLogProb);
+                        }
                     }
                 }
 
@@ -1830,34 +1871,19 @@ namespace MonsterPathPredictor.Core
             return true;
         }
 
-        private static bool AnyHasPlayerId(List<TrackedPlayer> targets, long playerId)
+        private static int CountPriorityMarked(MonsterState monster, List<TrackedPlayer> targets)
         {
-            if (playerId == 0 || targets == null) return false;
-            for (int i = 0; i < targets.Count; i++)
-            {
-                if (targets[i].PlayerId == playerId) return true;
-            }
-            return false;
-        }
-
-        private static bool AnyHasPriorityMark(MonsterState monster, List<TrackedPlayer> targets)
-        {
+            int count = 0;
             for (int i = 0; i < targets.Count; i++)
             {
                 var p = targets[i];
-                if (monster.ChasesProblemStudent && p.HasProblemStudentMark) return true;
-                if (monster.ChasesMandarinDuckMark && p.HasMandarinDuckMark) return true;
+                if ((monster.ChasesProblemStudent && p.HasProblemStudentMark) ||
+                    (monster.ChasesMandarinDuckMark && p.HasMandarinDuckMark))
+                {
+                    count++;
+                }
             }
-            return false;
-        }
-
-        private static bool AnyHasProblemStudentMark(List<TrackedPlayer> targets)
-        {
-            for (int i = 0; i < targets.Count; i++)
-            {
-                if (targets[i].HasProblemStudentMark) return true;
-            }
-            return false;
+            return count;
         }
 
         private static List<TrackedPlayer> FilterTrackablePlayers(BoardGraph board, IReadOnlyList<TrackedPlayer> players)

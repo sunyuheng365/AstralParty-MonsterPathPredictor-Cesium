@@ -416,17 +416,6 @@ namespace MonsterPathPredictor.Runtime
                 if (m == null || m.State == null) continue;
                 if (!settings.AllowNonAggressiveMonsters && !m.State.IsNormalAggressive) continue;
 
-                if (requireLiveEligible)
-                {
-                    var chk = MonsterStateTracker.CheckMonsterLiveAndEligible(m.State.MonsterId, settings.AllowNonAggressiveMonsters);
-                    if (chk == LiveMonsterCheckResult.Indeterminate)
-                    {
-                        liveLookupIndeterminate = true;
-                        return 0;
-                    }
-                    if (chk != LiveMonsterCheckResult.Eligible) continue;
-                }
-
                 // Refresh live visual bounds right on click so moving/stacked sprites are pixel-accurate
                 var bounds = m.CharacterRef != null
                     ? SpriteBoundsReader.Capture(m.CharacterRef, m.FeetWorldPos, camera)
@@ -438,7 +427,24 @@ namespace MonsterPathPredictor.Runtime
                 boxes.Add(hitBox);
             }
 
-            return MonsterHitTester.PickMonster(new Point2(clickLocal.x, clickLocal.y), boxes, settings.ClickRadius);
+            if (!requireLiveEligible)
+            {
+                return MonsterHitTester.PickMonster(new Point2(clickLocal.x, clickLocal.y), boxes, settings.ClickRadius);
+            }
+
+            bool allowNonAgg = settings.AllowNonAggressiveMonsters;
+            return MonsterHitTester.PickMonsterWithEligibility(
+                new Point2(clickLocal.x, clickLocal.y),
+                boxes,
+                settings.ClickRadius,
+                monsterId =>
+                {
+                    var chk = MonsterStateTracker.CheckMonsterLiveAndEligible(monsterId, allowNonAgg);
+                    if (chk == LiveMonsterCheckResult.Eligible) return 1;
+                    if (chk == LiveMonsterCheckResult.Indeterminate) return -1;
+                    return 0;
+                },
+                out liveLookupIndeterminate);
         }
 
         private static bool TryProjectHitBox(

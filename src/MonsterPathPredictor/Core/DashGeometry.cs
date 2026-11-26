@@ -204,6 +204,62 @@ namespace MonsterPathPredictor.Core
 
             return nearest != null ? nearest.MonsterId : 0;
         }
+
+        /// <summary>
+        /// Projects and ranks geometric candidates FIRST, checking live eligibility strictly in winning
+        /// order so an unrelated offscreen/non-hitting indeterminate monster never cancels a valid click
+        /// or empty-board deselect, while a foreground indeterminate monster still safely defers.
+        /// <paramref name="checkEligibility"/> returns &gt; 0 for Eligible, 0 for Dead/Ineligible, &lt; 0 for Indeterminate.
+        /// </summary>
+        public static long PickMonsterWithEligibility(
+            Point2 click,
+            IReadOnlyList<MonsterHitBox> boxes,
+            float nearMissRadius,
+            Func<long, int> checkEligibility,
+            out bool deferredIndeterminate)
+        {
+            deferredIndeterminate = false;
+            if (boxes == null || boxes.Count == 0) return 0;
+            if (checkEligibility == null) return PickMonster(click, boxes, nearMissRadius);
+
+            List<MonsterHitBox> remaining = null;
+            IReadOnlyList<MonsterHitBox> current = boxes;
+
+            while (current.Count > 0)
+            {
+                long winnerId = PickMonster(click, current, nearMissRadius);
+                if (winnerId == 0) return 0;
+
+                int verdict = checkEligibility(winnerId);
+                if (verdict > 0) return winnerId;
+                if (verdict < 0)
+                {
+                    deferredIndeterminate = true;
+                    return 0;
+                }
+
+                // Confirmed dead/ineligible foreground sprite: remove it and re-test sprites underneath.
+                if (remaining == null)
+                {
+                    remaining = new List<MonsterHitBox>(current.Count);
+                    for (int i = 0; i < current.Count; i++)
+                    {
+                        var b = current[i];
+                        if (b != null && b.MonsterId != winnerId) remaining.Add(b);
+                    }
+                    current = remaining;
+                }
+                else
+                {
+                    for (int i = remaining.Count - 1; i >= 0; i--)
+                    {
+                        if (remaining[i].MonsterId == winnerId) remaining.RemoveAt(i);
+                    }
+                }
+            }
+
+            return 0;
+        }
     }
 
     public readonly struct DashQuad

@@ -52,6 +52,32 @@ namespace MonsterPathPredictor.Runtime
             var activeUnityCol = new Color(activeRgba.Rf, activeRgba.Gf, activeRgba.Bf, 1f);
             int alphaPct = (int)Math.Round(activeRgba.A * 100.0 / 255.0);
 
+            void AddSectionHeader(string title, float h)
+            {
+                var secTf = new GTextField
+                {
+                    touchable = false,
+                    autoSize = AutoSizeType.Both,
+                    singleLine = true,
+                    textFormat = new TextFormat { size = 11, bold = true, letterSpacing = 1, color = TextSecondary },
+                    text = title
+                };
+                float secY = y + Math.Max(0f, (h - secTf.height) * 0.5f);
+                secTf.SetXY(2f, secY);
+                _contentHost.AddChild(secTf);
+
+                float lineX = 2f + Math.Max(secTf.textWidth, secTf.width) + 8f;
+                float lineW = contentW - lineX;
+                if (lineW >= 12f)
+                {
+                    var line = new GGraph { touchable = false };
+                    line.SetXY(lineX, (float)Math.Round(y + h * 0.5f));
+                    line.SetSize(lineW, 1f);
+                    line.DrawRect(lineW, 1f, 0, Color.clear, Hairline);
+                    _contentHost.AddChild(line);
+                }
+            }
+
             void AddStepper(string label, string shortLabel, string valueText, string shortValueText, float h, Action onMinus, Action onPlus)
             {
                 var row = BuildStyleStepperRow(label, shortLabel, valueText, shortValueText, contentW, h, onMinus, onPlus);
@@ -64,7 +90,7 @@ namespace MonsterPathPredictor.Runtime
                 int safeCount = Math.Max(1, Math.Min(count, 6 - startRoleIndex));
                 float cGap = contentW < 100f ? 2f : 3f;
                 float cW = (contentW - cGap * (safeCount - 1)) / safeCount;
-                float dotSize = Math.Max(3f, Math.Min(10f, chipH - 2f));
+                float dotSize = Math.Max(3f, Math.Min(8f, chipH - 4f));
                 bool showDot = cW >= 28f && chipH >= 8f;
                 int chipFont = (cW < 54f || chipH < 14f) ? Math.Max(8, Math.Min(10, (int)Math.Max(8f, chipH - 2f))) : 11;
                 for (int c = 0; c < safeCount; c++)
@@ -80,19 +106,22 @@ namespace MonsterPathPredictor.Runtime
                         roleTxt,
                         cW,
                         chipH,
-                        sel ? BtnActiveBg : BtnBg,
-                        sel ? AccentGold : new Color(0.32f, 0.40f, 0.52f, 0.8f),
-                        sel ? AccentGold : TextPrimary,
+                        sel ? new Color(1f, 1f, 1f, 0.08f) : new Color(1f, 1f, 1f, 0.03f),
+                        sel ? WithAlpha(Accent, 0.80f) : Hairline,
+                        sel ? TextPrimary : TextSecondary,
                         () => { _selectedColorRole = role; _popupLocalRevision++; _lastSignature = string.Empty; },
-                        fontSize: chipFont);
+                        fontSize: chipFont,
+                        radius: RadiusButton,
+                        hoverFill: sel ? new Color(1f, 1f, 1f, 0.11f) : new Color(1f, 1f, 1f, 0.06f),
+                        hoverBorder: sel ? Accent : HairlineStrong,
+                        hoverText: TextPrimary);
 
                     if (showDot)
                     {
                         PopupPagination.ClampChildVertical(chipH, (chipH - dotSize) * 0.5f, dotSize, out float dotY, out float dotH);
                         var dot = new GGraph { touchable = false };
-                        dot.SetXY(3f, dotY);
-                        dot.SetSize(dotH, dotH);
-                        dot.DrawRect(dotH, dotH, 1, Color.black, new Color(roleCol.Rf, roleCol.Gf, roleCol.Bf, 1f));
+                        dot.SetXY(cW < 64f ? 4f : 8f, dotY);
+                        DrawCircle(dot, dotH, new Color(roleCol.Rf, roleCol.Gf, roleCol.Bf, 1f));
                         chip.AddChild(dot);
                     }
 
@@ -116,7 +145,7 @@ namespace MonsterPathPredictor.Runtime
                             touchable = false,
                             autoSize = AutoSizeType.None,
                             singleLine = true,
-                            textFormat = new TextFormat { size = 11, bold = true, color = new Color(1f, 0.42f, 0.36f, 1f) },
+                            textFormat = new TextFormat { size = 11, bold = true, color = Danger },
                             text = "⚠ 样式写入 config.json 失败（仅本局临时生效）"
                         };
                         warn.SetXY(2f, y);
@@ -124,6 +153,12 @@ namespace MonsterPathPredictor.Runtime
                         _contentHost.AddChild(warn);
                         break;
                     }
+                    case PopupPagination.StyleRowKind.SectionLine:
+                        AddSectionHeader("路线线条", item.Height);
+                        break;
+                    case PopupPagination.StyleRowKind.SectionDisplay:
+                        AddSectionHeader("标签与显示", item.Height);
+                        break;
                     case PopupPagination.StyleRowKind.LineWidth:
                         AddStepper(
                             "线条宽度", "线宽",
@@ -193,14 +228,26 @@ namespace MonsterPathPredictor.Runtime
                             {
                                 string pcLabel = tW < 52f
                                     ? (settings.PostCombatMode == PostCombatMode.StopAtFirstCombat ? "截断" : (settings.PostCombatMode == PostCombatMode.RedBlueAfterCombat ? "红蓝" : "续行"))
-                                    : (settings.PostCombatMode == PostCombatMode.StopAtFirstCombat ? "战后:截断" : (settings.PostCombatMode == PostCombatMode.RedBlueAfterCombat ? "战后:红蓝" : "战后:续行"));
-                                var pcBtn = CreateStyledButton(pcLabel, tW, item.Height, BtnBg, AccentCyan, AccentCyan, () =>
-                                {
-                                    StyleMutationRequested?.Invoke(s =>
+                                    : (settings.PostCombatMode == PostCombatMode.StopAtFirstCombat ? "战后 · 截断" : (settings.PostCombatMode == PostCombatMode.RedBlueAfterCombat ? "战后 · 红蓝" : "战后 · 续行"));
+                                var pcBtn = CreateStyledButton(
+                                    pcLabel,
+                                    tW,
+                                    item.Height,
+                                    new Color(1f, 1f, 1f, 0.04f),
+                                    WithAlpha(Accent, 0.40f),
+                                    Accent,
+                                    () =>
                                     {
-                                        s.PostCombatMode = (PostCombatMode)(((int)s.PostCombatMode + 1) % 3);
-                                    });
-                                }, fontSize: tFont);
+                                        StyleMutationRequested?.Invoke(s =>
+                                        {
+                                            s.PostCombatMode = (PostCombatMode)(((int)s.PostCombatMode + 1) % 3);
+                                        });
+                                    },
+                                    fontSize: tFont,
+                                    radius: RadiusButton,
+                                    hoverFill: AccentSoft,
+                                    hoverBorder: WithAlpha(Accent, 0.70f),
+                                    hoverText: Accent);
                                 pcBtn.SetXY(tx, y);
                                 _contentHost.AddChild(pcBtn);
                             }
@@ -223,8 +270,8 @@ namespace MonsterPathPredictor.Runtime
                             autoSize = AutoSizeType.None,
                             singleLine = true,
                             verticalAlign = VertAlignType.Middle,
-                            textFormat = new TextFormat { size = 12, bold = true, color = AccentCyan },
-                            text = "配色：" + StyleColor.GetRoleLabel(activeRole) + " " + activeRgba.ToHex()
+                            textFormat = new TextFormat { size = 12, bold = true, color = TextSecondary },
+                            text = "配色 · " + StyleColor.GetRoleLabel(activeRole) + "  " + activeRgba.ToHex()
                         };
                         colTitle.SetXY(2f, y);
                         colTitle.SetSize(titleW, item.Height);
@@ -236,20 +283,17 @@ namespace MonsterPathPredictor.Runtime
                             float swY = y + Math.Max(0f, (item.Height - swH) * 0.5f);
                             var swBackDark = new GGraph { touchable = false };
                             swBackDark.SetXY(contentW - 38f, swY);
-                            swBackDark.SetSize(18f, swH);
-                            swBackDark.DrawRect(18f, swH, 0, Color.clear, new Color(0.10f, 0.12f, 0.16f, 1f));
+                            DrawRound(swBackDark, 18f, swH, 3f, 0f, 3f, 0f, new Color(0.10f, 0.12f, 0.16f, 1f), Color.clear);
                             _contentHost.AddChild(swBackDark);
 
                             var swBackLight = new GGraph { touchable = false };
                             swBackLight.SetXY(contentW - 20f, swY);
-                            swBackLight.SetSize(18f, swH);
-                            swBackLight.DrawRect(18f, swH, 0, Color.clear, new Color(0.75f, 0.78f, 0.84f, 1f));
+                            DrawRound(swBackLight, 18f, swH, 0f, 3f, 0f, 3f, new Color(0.75f, 0.78f, 0.84f, 1f), Color.clear);
                             _contentHost.AddChild(swBackLight);
 
                             var previewSwatch = new GGraph { touchable = false };
                             previewSwatch.SetXY(contentW - 38f, swY);
-                            previewSwatch.SetSize(36f, swH);
-                            previewSwatch.DrawRect(36f, swH, 1, TextPrimary, new Color(activeRgba.Rf, activeRgba.Gf, activeRgba.Bf, activeRgba.Af));
+                            DrawRound(previewSwatch, 36f, swH, 3f, new Color(activeRgba.Rf, activeRgba.Gf, activeRgba.Bf, activeRgba.Af), HairlineStrong);
                             _contentHost.AddChild(previewSwatch);
                         }
                         break;
@@ -299,15 +343,7 @@ namespace MonsterPathPredictor.Runtime
                         break;
                     case PopupPagination.StyleRowKind.ResetDefaults:
                     {
-                        var resetBtn = CreateStyledButton(
-                            "恢复默认路线样式",
-                            contentW,
-                            item.Height,
-                            BtnBg,
-                            new Color(0.55f, 0.42f, 0.30f, 0.9f),
-                            AccentGold,
-                            () => StyleResetRequested?.Invoke(),
-                            fontSize: 12);
+                        var resetBtn = CreateDangerButton("恢复默认样式", contentW, item.Height, () => StyleResetRequested?.Invoke(), fontSize: 12);
                         resetBtn.SetXY(0f, y);
                         _contentHost.AddChild(resetBtn);
                         break;
@@ -330,12 +366,13 @@ namespace MonsterPathPredictor.Runtime
                 var preset = StyleColor.Presets[startIdx + i];
                 var pc = preset.Color;
                 bool matches = pc == activeRgba;
+                Color baseFill = new Color(pc.Rf, pc.Gf, pc.Bf, 0.95f);
                 var sw = CreateStyledButton(
-                    sW < 18f ? string.Empty : preset.Name,
+                    sW < 26f ? string.Empty : preset.Name,
                     sW,
                     swatchH,
-                    new Color(pc.Rf * 0.72f, pc.Gf * 0.72f, pc.Bf * 0.72f, 0.95f),
-                    matches ? Color.white : new Color(pc.Rf, pc.Gf, pc.Bf, 0.95f),
+                    baseFill,
+                    matches ? Color.white : new Color(0f, 0f, 0f, 0.25f),
                     (pc.R + pc.G + pc.B > 500) ? Color.black : Color.white,
                     () =>
                     {
@@ -343,7 +380,10 @@ namespace MonsterPathPredictor.Runtime
                         var capturedRole = activeRole;
                         StyleMutationRequested?.Invoke(s => StyleColor.SetRoleHex(s, capturedRole, capturedHex));
                     },
-                    fontSize: sW < 26f ? 10 : 11);
+                    fontSize: 10,
+                    radius: RadiusChip,
+                    hoverFill: new Color(Math.Min(1f, pc.Rf + 0.08f), Math.Min(1f, pc.Gf + 0.08f), Math.Min(1f, pc.Bf + 0.08f), 1f),
+                    hoverBorder: Color.white);
                 sw.SetXY(i * (sW + sGap), y);
                 _contentHost.AddChild(sw);
             }
@@ -351,16 +391,22 @@ namespace MonsterPathPredictor.Runtime
 
         private void AddToggleChip(string label, bool isOn, float x, float y, float w, float h, int fontSize, Action onClick)
         {
-            string suffix = w < 44f ? (isOn ? "✓" : "×") : (isOn ? ":开" : ":关");
+            string display = w < 44f
+                ? (label + (isOn ? "✓" : "×"))
+                : ((isOn ? "● " : "○ ") + label);
             var btn = CreateStyledButton(
-                label + suffix,
+                display,
                 w,
                 h,
-                isOn ? BtnActiveBg : BtnBg,
-                isOn ? AccentGreen : new Color(0.32f, 0.38f, 0.48f, 0.75f),
-                isOn ? AccentGreen : TextMuted,
+                isOn ? AccentSoft : new Color(1f, 1f, 1f, 0.03f),
+                isOn ? WithAlpha(Accent, 0.60f) : Hairline,
+                isOn ? Accent : TextSecondary,
                 onClick,
-                fontSize: fontSize);
+                fontSize: fontSize,
+                radius: RadiusButton,
+                hoverFill: isOn ? Lighten(AccentSoft, 0.05f) : new Color(1f, 1f, 1f, 0.06f),
+                hoverBorder: isOn ? Accent : HairlineStrong,
+                hoverText: isOn ? Accent : TextPrimary);
             btn.SetXY(x, y);
             _contentHost.AddChild(btn);
         }
@@ -383,8 +429,7 @@ namespace MonsterPathPredictor.Runtime
             host.SetSize(w, h);
 
             var bg = new GGraph { touchable = false };
-            bg.SetSize(w, h);
-            bg.DrawRect(w, h, 1, new Color(0.24f, 0.30f, 0.40f, 0.65f), RowNormalBg);
+            DrawRound(bg, w, h, RadiusButton, Surface2, Color.clear);
             host.AddChild(bg);
 
             PopupPagination.ComputeChannelGeometry(
@@ -409,7 +454,7 @@ namespace MonsterPathPredictor.Runtime
             tagTf.SetSize(tagW, h);
             host.AddChild(tagTf);
 
-            var minus = CreateMiniButton("-", btnW, btnH, () =>
+            var minus = CreateGhostButton("－", btnW, btnH, () =>
             {
                 StyleMutationRequested?.Invoke(s =>
                 {
@@ -421,7 +466,7 @@ namespace MonsterPathPredictor.Runtime
             minus.SetXY(minusX, btnY);
             host.AddChild(minus);
 
-            var plus = CreateMiniButton("+", btnW, btnH, () =>
+            var plus = CreateGhostButton("＋", btnW, btnH, () =>
             {
                 StyleMutationRequested?.Invoke(s =>
                 {
@@ -467,8 +512,7 @@ namespace MonsterPathPredictor.Runtime
             row.SetSize(w, h);
 
             var bg = new GGraph { touchable = false };
-            bg.SetSize(w, h);
-            bg.DrawRect(w, h, 1, new Color(0.24f, 0.30f, 0.40f, 0.65f), RowNormalBg);
+            DrawRound(bg, w, h, RadiusCard, Surface2, Color.clear);
             row.AddChild(bg);
 
             var geo = PopupPagination.ComputeStepperGeometry(w, h);
@@ -480,7 +524,7 @@ namespace MonsterPathPredictor.Runtime
                 : 12;
             int btnFont = (geo.BtnW < 16f || geo.BtnH < 14f)
                 ? Math.Max(8, Math.Min(11, (int)Math.Max(8f, geo.BtnH - 1f)))
-                : 13;
+                : 12;
 
             if (geo.ShowLabel && geo.LabelW >= 8f && geo.LabelH >= 6f)
             {
@@ -491,7 +535,7 @@ namespace MonsterPathPredictor.Runtime
                     singleLine = true,
                     align = geo.Stacked ? AlignType.Center : AlignType.Left,
                     verticalAlign = VertAlignType.Middle,
-                    textFormat = new TextFormat { size = lblFont, color = TextPrimary },
+                    textFormat = new TextFormat { size = lblFont, color = TextSecondary },
                     text = geo.LabelW < 56f ? shortLabel : label
                 };
                 lbl.SetXY(geo.LabelX, geo.LabelY);
@@ -499,9 +543,18 @@ namespace MonsterPathPredictor.Runtime
                 row.AddChild(lbl);
             }
 
-            var minus = CreateMiniButton("-", geo.BtnW, geo.BtnH, onMinus, fontSize: btnFont);
+            float btnRadius = Math.Min(5f, geo.BtnH * 0.5f);
+            var minus = CreateGhostButton("－", geo.BtnW, geo.BtnH, onMinus, fontSize: btnFont, radius: btnRadius);
             minus.SetXY(geo.MinusX, geo.MinusY);
             row.AddChild(minus);
+
+            if (geo.ValW >= 16f && geo.ValH >= 12f)
+            {
+                var valWell = new GGraph { touchable = false };
+                valWell.SetXY(geo.ValX, geo.ValY);
+                DrawRound(valWell, geo.ValW, geo.ValH, RadiusChip, Track, Hairline);
+                row.AddChild(valWell);
+            }
 
             string displayVal;
             if (!geo.ShowLabel)
@@ -521,14 +574,14 @@ namespace MonsterPathPredictor.Runtime
                 singleLine = true,
                 align = AlignType.Center,
                 verticalAlign = VertAlignType.Middle,
-                textFormat = new TextFormat { size = valFont, bold = true, color = AccentGold },
+                textFormat = new TextFormat { size = valFont, bold = true, color = Accent },
                 text = displayVal
             };
             val.SetXY(geo.ValX, geo.ValY);
             val.SetSize(geo.ValW, geo.ValH);
             row.AddChild(val);
 
-            var plus = CreateMiniButton("+", geo.BtnW, geo.BtnH, onPlus, fontSize: btnFont);
+            var plus = CreateGhostButton("＋", geo.BtnW, geo.BtnH, onPlus, fontSize: btnFont, radius: btnRadius);
             plus.SetXY(geo.PlusX, geo.MinusY);
             row.AddChild(plus);
 

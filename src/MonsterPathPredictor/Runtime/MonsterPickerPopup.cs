@@ -23,46 +23,34 @@ namespace MonsterPathPredictor.Runtime
     /// </summary>
     internal sealed partial class MonsterPickerPopup : IDisposable
     {
-        private const float PanelWidth = 344f;
-        private const float HeaderHeight = 34f;
-        private const float TabBarHeight = 28f;
-        private const float FooterHeight = 36f;
-        private const float RowHeight = 34f;
-        private const float Padding = 8f;
+        private const float PanelWidth = 360f;
+        private const float HeaderHeight = 38f;
+        private const float TabBarHeight = 34f;
+        private const float FooterHeight = 42f;
+        private const float RowHeight = 44f;
+        private const float Padding = 10f;
         private const int MaxVisibleRows = 12;
 
-        private static readonly Color PanelBg = new Color(0.07f, 0.10f, 0.15f, 0.93f);
-        private static readonly Color PanelBorder = new Color(0.28f, 0.72f, 0.92f, 0.78f);
-        private static readonly Color HeaderBg = new Color(0.11f, 0.16f, 0.24f, 0.96f);
-        private static readonly Color RowNormalBg = new Color(0.12f, 0.16f, 0.22f, 0.86f);
-        private static readonly Color RowHoverBg = new Color(0.18f, 0.26f, 0.36f, 0.95f);
-        private static readonly Color RowSelectedBg = new Color(0.24f, 0.36f, 0.20f, 0.95f);
-        private static readonly Color RowSelectedBorder = new Color(1.00f, 0.84f, 0.24f, 0.95f);
-        private static readonly Color RowActedBg = new Color(0.10f, 0.13f, 0.18f, 0.72f);
-        private static readonly Color BtnBg = new Color(0.18f, 0.24f, 0.34f, 0.95f);
-        private static readonly Color BtnHoverBg = new Color(0.26f, 0.36f, 0.50f, 1.00f);
-        private static readonly Color BtnActiveBg = new Color(0.24f, 0.42f, 0.54f, 0.98f);
-        private static readonly Color BtnVioletBg = new Color(0.38f, 0.20f, 0.54f, 0.96f);
-        private static readonly Color BtnVioletBorder = new Color(0.84f, 0.46f, 1.00f, 0.96f);
-        private static readonly Color AccentGold = new Color(1.00f, 0.86f, 0.30f, 1f);
-        private static readonly Color AccentCyan = new Color(0.42f, 0.90f, 1.00f, 1f);
-        private static readonly Color AccentViolet = new Color(0.86f, 0.52f, 1f, 1f);
-        private static readonly Color AccentGreen = new Color(0.36f, 0.92f, 0.58f, 1f);
-        private static readonly Color TextPrimary = new Color(0.95f, 0.97f, 1.00f, 1f);
-        private static readonly Color TextMuted = new Color(0.68f, 0.76f, 0.86f, 1f);
+        // Palette constants and aliases live in MonsterPickerPopup.Theme.cs.
 
         private GComponent _root;
         private GGraph _panelBg;
         private GGraph _headerBg;
+        private GGraph _headerLine;
+        private GGraph _accentLine;
         private GTextField _titleText;
+        private GComponent _hotkeyChip;
         private GComponent _closeBtn;
         private GComponent _tabHost;
+        private GGraph _tabTrack;
         private GComponent _tabMonstersBtn;
         private GComponent _tabVirtualBtn;
         private GComponent _tabStyleBtn;
         private GComponent _contentHost;
         private GComponent _footerHost;
         private GGraph _footerBg;
+        private GGraph _footerLine;
+        private GGraph _stepsGroupBg;
         private GComponent _minusBtn;
         private GComponent _plusBtn;
         private GComponent _clearBtn;
@@ -338,9 +326,8 @@ namespace MonsterPathPredictor.Runtime
 
             bool showPager = totalPages > 1;
 
-            _titleText.text = panelW < 100f ? settings.PickerHotkey : ("怪物寻路 [" + settings.PickerHotkey + "]");
             _stepsLabel.text = panelW < 100f ? settings.PreviewSteps.ToString() : (panelW < 180f ? (settings.PreviewSteps + "格") : ("延伸 " + settings.PreviewSteps + " 格"));
-            ApplyChromeLayout(layout, panelW, padX, sandbox != null ? sandbox.OverrideCount : 0);
+            ApplyChromeLayout(layout, panelW, padX, sandbox != null ? sandbox.OverrideCount : 0, settings.PickerHotkey);
 
             _contentHost.RemoveChildren(0, -1, true);
             _contentHost.visible = true;
@@ -384,8 +371,7 @@ namespace MonsterPathPredictor.Runtime
                 totalHeight = stageHeight;
             }
             _root.SetSize(panelW, totalHeight);
-            _panelBg.SetSize(panelW, totalHeight);
-            _panelBg.DrawRect(panelW, totalHeight, 2, PanelBorder, PanelBg);
+            DrawRound(_panelBg, panelW, totalHeight, RadiusPanel, Surface0, HairlineStrong);
 
             _contentHost.SetXY(padX, contentY);
             _contentHost.SetSize(contentW, Math.Max(0f, contentHeight));

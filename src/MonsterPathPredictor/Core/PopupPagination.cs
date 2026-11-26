@@ -348,7 +348,9 @@ namespace MonsterPathPredictor.Core
             RgbaSingleG,
             RgbaSingleB,
             RgbaSingleA,
-            ResetDefaults
+            ResetDefaults,
+            SectionLine,
+            SectionDisplay
         }
 
         public readonly struct StyleRowItem
@@ -375,10 +377,13 @@ namespace MonsterPathPredictor.Core
             float swatchH = Math.Min(capH, Math.Min(rowH, 22f));
             float headerH = Math.Min(capH, 20f);
             float warnH = Math.Min(capH, 18f);
+            bool sections = maxContentH >= 260f;
+            float sectionH = Math.Min(capH, 18f);
             rowGap = capH < 24f ? 1f : 3f;
 
-            var items = new List<StyleRowItem>(24);
+            var items = new List<StyleRowItem>(26);
             if (hasSaveWarn) items.Add(new StyleRowItem(StyleRowKind.SaveWarning, warnH));
+            if (sections) items.Add(new StyleRowItem(StyleRowKind.SectionLine, sectionH));
             items.Add(new StyleRowItem(StyleRowKind.LineWidth, stepperH));
             items.Add(new StyleRowItem(StyleRowKind.DashSpeed, stepperH));
             items.Add(new StyleRowItem(StyleRowKind.DashLength, stepperH));
@@ -386,6 +391,7 @@ namespace MonsterPathPredictor.Core
             items.Add(new StyleRowItem(StyleRowKind.FontSize, stepperH));
             items.Add(new StyleRowItem(StyleRowKind.HeightOffset, stepperH));
 
+            if (sections) items.Add(new StyleRowItem(StyleRowKind.SectionDisplay, sectionH));
             int toggleCols = contentW < 96f ? 1 : (contentW < 190f ? 2 : 4);
             for (int start = 0; start < 4; start += toggleCols)
             {
@@ -471,7 +477,7 @@ namespace MonsterPathPredictor.Core
             out int neighborCols)
         {
             float capH = Math.Max(1f, maxContentH);
-            float pRowH = Math.Min(capH, maxContentH < 160f ? 22f : 28f);
+            float pRowH = Math.Min(capH, maxContentH < 160f ? 22f : 32f);
             float btnH = Math.Min(capH, maxContentH < 180f ? 21f : (maxContentH < 240f ? 23f : 26f));
             float hdrH = Math.Min(capH, 18f);
             rowGap = capH < 24f ? 1f : 3f;

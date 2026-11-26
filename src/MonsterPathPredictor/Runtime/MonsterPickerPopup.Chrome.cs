@@ -49,30 +49,60 @@ namespace MonsterPathPredictor.Runtime
             _root.AddChild(_panelBg);
 
             _headerBg = new GGraph { touchable = false };
-            _headerBg.SetSize(PanelWidth, HeaderHeight);
-            _headerBg.DrawRect(PanelWidth, HeaderHeight, 0, Color.clear, HeaderBg);
             _root.AddChild(_headerBg);
+
+            _accentLine = new GGraph { touchable = false };
+            _root.AddChild(_accentLine);
+
+            _headerLine = new GGraph { touchable = false };
+            _root.AddChild(_headerLine);
 
             _titleText = new GTextField
             {
                 touchable = false,
                 autoSize = AutoSizeType.None,
                 singleLine = true,
-                textFormat = new TextFormat { size = 15, bold = true, color = AccentCyan }
+                verticalAlign = VertAlignType.Middle,
+                textFormat = new TextFormat { size = 15, bold = true, color = TextPrimary }
             };
-            _titleText.SetXY(10f, 7f);
-            _titleText.SetSize(PanelWidth - 52f, 20f);
+            _titleText.SetXY(12f, 8f);
+            _titleText.SetSize(PanelWidth - 52f, 22f);
             _root.AddChild(_titleText);
 
-            _closeBtn = CreateMiniButton("×", 28f, 24f, () => Hide());
-            _closeBtn.SetXY(PanelWidth - 36f, 5f);
+            _hotkeyChip = new GComponent { touchable = false };
+            var chipBg = new GGraph { touchable = false };
+            _hotkeyChip.AddChild(chipBg);
+            var chipTf = new GTextField
+            {
+                touchable = false,
+                autoSize = AutoSizeType.None,
+                singleLine = true,
+                align = AlignType.Center,
+                verticalAlign = VertAlignType.Middle,
+                textFormat = new TextFormat { size = 11, bold = true, color = TextSecondary }
+            };
+            _hotkeyChip.AddChild(chipTf);
+            _root.AddChild(_hotkeyChip);
+
+            _closeBtn = CreateStyledButton(
+                "×", 28f, 24f,
+                Color.clear, Color.clear, TextSecondary,
+                () => Hide(),
+                fontSize: 16,
+                radius: RadiusCard,
+                hoverFill: DangerSoft,
+                hoverBorder: Color.clear,
+                hoverText: Danger);
+            _closeBtn.SetXY(PanelWidth - 36f, 6f);
             _root.AddChild(_closeBtn);
 
             _tabHost = new GComponent { touchable = true };
             _tabHost.SetSize(PanelWidth, TabBarHeight);
-            _tabMonstersBtn = CreateMiniButton("怪物列表", 96f, 24f, () => SwitchTab(PickerPopupTab.Monsters));
-            _tabVirtualBtn = CreateMiniButton("虚拟走位", 96f, 24f, () => SwitchTab(PickerPopupTab.VirtualMove));
-            _tabStyleBtn = CreateMiniButton("路线样式", 96f, 24f, () => SwitchTab(PickerPopupTab.RouteStyle));
+            _tabTrack = new GGraph { touchable = false };
+            _tabHost.AddChild(_tabTrack);
+            _tabMonstersBtn = CreateStyledButton("怪物列表", 96f, 24f, Color.clear, Color.clear, TextSecondary, () => SwitchTab(PickerPopupTab.Monsters), fontSize: 12, radius: RadiusButton);
+            _tabVirtualBtn = CreateStyledButton("虚拟走位", 96f, 24f, Color.clear, Color.clear, TextSecondary, () => SwitchTab(PickerPopupTab.VirtualMove), fontSize: 12, radius: RadiusButton);
+            _tabStyleBtn = CreateStyledButton("路线样式", 96f, 24f, Color.clear, Color.clear, TextSecondary, () => SwitchTab(PickerPopupTab.RouteStyle), fontSize: 12, radius: RadiusButton);
             _tabHost.AddChild(_tabMonstersBtn);
             _tabHost.AddChild(_tabVirtualBtn);
             _tabHost.AddChild(_tabStyleBtn);
@@ -83,7 +113,7 @@ namespace MonsterPathPredictor.Runtime
 
             _pagerHost = new GComponent { touchable = true, visible = false };
             _pagerHost.SetSize(PanelWidth, 28f);
-            _prevBtn = CreateMiniButton("◀", 28f, 22f, () => StepActivePage(-1));
+            _prevBtn = CreateGhostButton("◀", 28f, 22f, () => StepActivePage(-1), fontSize: 11);
             _prevBtn.SetXY(Padding, 3f);
             _pagerHost.AddChild(_prevBtn);
             _pageLabel = new GTextField
@@ -91,12 +121,13 @@ namespace MonsterPathPredictor.Runtime
                 touchable = false,
                 autoSize = AutoSizeType.None,
                 align = AlignType.Center,
-                textFormat = new TextFormat { size = 13, color = TextMuted }
+                verticalAlign = VertAlignType.Middle,
+                textFormat = new TextFormat { size = 12, color = TextSecondary }
             };
-            _pageLabel.SetXY(44f, 5f);
-            _pageLabel.SetSize(PanelWidth - 88f, 18f);
+            _pageLabel.SetXY(44f, 4f);
+            _pageLabel.SetSize(PanelWidth - 88f, 20f);
             _pagerHost.AddChild(_pageLabel);
-            _nextBtn = CreateMiniButton("▶", 28f, 22f, () => StepActivePage(1));
+            _nextBtn = CreateGhostButton("▶", 28f, 22f, () => StepActivePage(1), fontSize: 11);
             _nextBtn.SetXY(PanelWidth - Padding - 28f, 3f);
             _pagerHost.AddChild(_nextBtn);
             _root.AddChild(_pagerHost);
@@ -106,7 +137,8 @@ namespace MonsterPathPredictor.Runtime
                 touchable = false,
                 autoSize = AutoSizeType.None,
                 singleLine = true,
-                textFormat = new TextFormat { size = 14, color = TextMuted },
+                verticalAlign = VertAlignType.Middle,
+                textFormat = new TextFormat { size = 13, color = TextSecondary },
                 text = "当前棋盘上没有存活怪物"
             };
             _root.AddChild(_emptyText);
@@ -114,11 +146,21 @@ namespace MonsterPathPredictor.Runtime
             _footerHost = new GComponent { touchable = true, opaque = true };
             _footerHost.SetSize(PanelWidth, FooterHeight);
             _footerBg = new GGraph { touchable = false };
-            _footerBg.SetSize(PanelWidth, FooterHeight);
-            _footerBg.DrawRect(PanelWidth, FooterHeight, 0, Color.clear, HeaderBg);
             _footerHost.AddChild(_footerBg);
+            _footerLine = new GGraph { touchable = false };
+            _footerHost.AddChild(_footerLine);
+            _stepsGroupBg = new GGraph { touchable = false };
+            _footerHost.AddChild(_stepsGroupBg);
 
-            _minusBtn = CreateMiniButton("-", 26f, 24f, () => StepsDeltaRequested?.Invoke(-1));
+            _minusBtn = CreateStyledButton(
+                "－", 26f, 24f,
+                Color.clear, Color.clear, TextPrimary,
+                () => StepsDeltaRequested?.Invoke(-1),
+                fontSize: 13,
+                radius: RadiusButton,
+                hoverFill: new Color(1f, 1f, 1f, 0.06f),
+                hoverBorder: Color.clear,
+                hoverText: Accent);
             _footerHost.AddChild(_minusBtn);
 
             _stepsLabel = new GTextField
@@ -126,14 +168,23 @@ namespace MonsterPathPredictor.Runtime
                 touchable = false,
                 autoSize = AutoSizeType.None,
                 align = AlignType.Center,
-                textFormat = new TextFormat { size = 14, bold = true, color = TextPrimary }
+                verticalAlign = VertAlignType.Middle,
+                textFormat = new TextFormat { size = 13, bold = true, color = TextPrimary }
             };
             _footerHost.AddChild(_stepsLabel);
 
-            _plusBtn = CreateMiniButton("+", 26f, 24f, () => StepsDeltaRequested?.Invoke(1));
+            _plusBtn = CreateStyledButton(
+                "＋", 26f, 24f,
+                Color.clear, Color.clear, TextPrimary,
+                () => StepsDeltaRequested?.Invoke(1),
+                fontSize: 13,
+                radius: RadiusButton,
+                hoverFill: new Color(1f, 1f, 1f, 0.06f),
+                hoverBorder: Color.clear,
+                hoverText: Accent);
             _footerHost.AddChild(_plusBtn);
 
-            _clearBtn = CreateMiniButton("清除预览", 76f, 24f, () =>
+            _clearBtn = CreateDangerButton("清除预览", 76f, 24f, () =>
             {
                 if (_clearPressCaptured)
                 {
@@ -144,7 +195,7 @@ namespace MonsterPathPredictor.Runtime
                 {
                     ClearRequested?.Invoke(_currentSelectedMonsterId, _currentHadVirtualState, _currentMatchGen, _currentLayoutGen);
                 }
-            });
+            }, fontSize: 12);
             _clearBtn.onTouchBegin.Add(_ =>
             {
                 _clearPressSelectedMonsterId = _currentSelectedMonsterId;
@@ -164,90 +215,7 @@ namespace MonsterPathPredictor.Runtime
             }
         }
 
-        private static GComponent CreateMiniButton(string text, float w, float h, Action onClick, int fontSize = 13)
-        {
-            return CreateStyledButton(text, w, h, BtnBg, new Color(0.35f, 0.45f, 0.60f, 0.8f), TextPrimary, onClick, fontSize);
-        }
-
-        private static GComponent CreateStyledButton(
-            string text,
-            float w,
-            float h,
-            Color fill,
-            Color border,
-            Color textColor,
-            Action onClick,
-            int fontSize = 13)
-        {
-            var btn = new GComponent { touchable = true, opaque = true };
-            btn.SetSize(w, h);
-
-            var bg = new GGraph { touchable = false };
-            bg.SetSize(w, h);
-            bg.DrawRect(w, h, 1, border, fill);
-            btn.AddChild(bg);
-
-            var tf = new GTextField
-            {
-                touchable = false,
-                autoSize = AutoSizeType.None,
-                singleLine = true,
-                align = AlignType.Center,
-                verticalAlign = VertAlignType.Middle,
-                textFormat = new TextFormat { size = fontSize, bold = true, color = textColor },
-                text = text ?? string.Empty
-            };
-            tf.SetSize(w, h);
-            btn.AddChild(tf);
-
-            btn.onRollOver.Add(() => bg.DrawRect(btn.width, btn.height, 1, PanelBorder, BtnHoverBg));
-            btn.onRollOut.Add(() => bg.DrawRect(btn.width, btn.height, 1, border, fill));
-            btn.onClick.Add(() => onClick?.Invoke());
-            return btn;
-        }
-
-        private static void ResizeMiniButton(GComponent btn, float w, float h)
-        {
-            if (btn == null || btn.isDisposed) return;
-            btn.SetSize(w, h);
-            if (btn.numChildren >= 1 && btn.GetChildAt(0) is GGraph bg)
-            {
-                bg.SetSize(w, h);
-                bg.DrawRect(w, h, 1, new Color(0.35f, 0.45f, 0.60f, 0.8f), BtnBg);
-            }
-            if (btn.numChildren >= 2 && btn.GetChildAt(1) is GTextField tf)
-            {
-                tf.SetSize(w, h);
-            }
-        }
-
-        private static void StyleTabButton(GComponent btn, string label, float w, float h, bool active, bool accentViolet)
-        {
-            if (btn == null || btn.isDisposed) return;
-            btn.SetSize(w, h);
-            Color fill = active ? (accentViolet ? BtnVioletBg : BtnActiveBg) : BtnBg;
-            Color border = active ? (accentViolet ? BtnVioletBorder : AccentCyan) : (accentViolet ? BtnVioletBorder : new Color(0.35f, 0.45f, 0.60f, 0.8f));
-            Color txtCol = active ? AccentGold : (accentViolet ? AccentViolet : TextPrimary);
-
-            if (btn.numChildren >= 1 && btn.GetChildAt(0) is GGraph bg)
-            {
-                bg.SetSize(w, h);
-                bg.DrawRect(w, h, active ? 2 : 1, border, fill);
-                btn.onRollOver.Clear();
-                btn.onRollOut.Clear();
-                btn.onRollOver.Add(() => bg.DrawRect(btn.width, btn.height, active ? 2 : 1, PanelBorder, BtnHoverBg));
-                btn.onRollOut.Add(() => bg.DrawRect(btn.width, btn.height, active ? 2 : 1, border, fill));
-            }
-            if (btn.numChildren >= 2 && btn.GetChildAt(1) is GTextField tf)
-            {
-                tf.SetSize(w, h);
-                var fmt = tf.textFormat;
-                fmt.size = w < 64f ? 11 : 12;
-                fmt.color = txtCol;
-                tf.textFormat = fmt;
-                tf.text = label;
-            }
-        }
+        // Styled button factories and tab styler live in MonsterPickerPopup.Theme.cs.
 
         private void ClampToStage()
         {
@@ -323,27 +291,112 @@ namespace MonsterPathPredictor.Runtime
             return new CompactLayout(headerH, tabH, footerH, pagerH, pad, finalRowH, rowGap, maxContentH);
         }
 
-        private void ApplyChromeLayout(CompactLayout layout, float panelW, float padX, int virtualOverrideCount)
+        private void ApplyChromeLayout(CompactLayout layout, float panelW, float padX, int virtualOverrideCount, string hotkey)
         {
-            _headerBg.SetSize(panelW, layout.HeaderH);
-            _headerBg.DrawRect(panelW, layout.HeaderH, 0, Color.clear, HeaderBg);
+            float innerW = Math.Max(1f, panelW - 2f);
+            float headerBandH = Math.Max(1f, layout.HeaderH + layout.TabH - 1f);
+            _headerBg.SetXY(1f, 1f);
+            DrawRound(_headerBg, innerW, headerBandH, 9f, 9f, 0f, 0f, Surface1, Color.clear);
+
+            if (panelW >= 120f && headerBandH >= 4f)
+            {
+                _accentLine.visible = true;
+                _accentLine.SetXY(14f, 1f);
+                DrawRound(_accentLine, Math.Max(1f, panelW - 28f), 2f, 1f, WithAlpha(Accent, 0.9f), Color.clear);
+            }
+            else
+            {
+                _accentLine.visible = false;
+            }
+
+            _headerLine.SetXY(1f, layout.HeaderH + layout.TabH);
+            _headerLine.SetSize(innerW, 1f);
+            _headerLine.DrawRect(innerW, 1f, 0, Color.clear, Hairline);
+
             float closeW = panelW < 100f ? 14f : (panelW < 200f ? 22f : 28f);
-            PopupPagination.ClampChildVertical(layout.HeaderH, 2f, Math.Min(24f, Math.Max(1f, layout.HeaderH - 4f)), out float closeY, out float closeH);
+            PopupPagination.ClampChildVertical(layout.HeaderH, (layout.HeaderH - 24f) * 0.5f, Math.Min(24f, Math.Max(1f, layout.HeaderH - 4f)), out float closeY, out float closeH);
             float closeX = Math.Max(padX, panelW - padX - closeW);
+            var closeSkin = GetSkin(_closeBtn);
+            if (closeSkin != null && closeSkin.Label != null)
+            {
+                var cf = closeSkin.Label.textFormat;
+                cf.size = closeH < 18f ? Math.Max(9, (int)Math.Max(9f, closeH - 2f)) : 16;
+                closeSkin.Label.textFormat = cf;
+            }
             ResizeMiniButton(_closeBtn, closeW, closeH);
             _closeBtn.SetXY(closeX, closeY);
+
             float titleW = Math.Max(0f, closeX - padX - 4f);
-            PopupPagination.ClampChildVertical(layout.HeaderH, (layout.HeaderH - 20f) * 0.5f, Math.Min(20f, layout.HeaderH), out float titleY, out float titleH);
+            PopupPagination.ClampChildVertical(layout.HeaderH, (layout.HeaderH - 22f) * 0.5f, Math.Min(22f, layout.HeaderH), out float titleY, out float titleH);
+            var titleFmt = _titleText.textFormat;
+            titleFmt.size = layout.HeaderH < 26f ? Math.Max(9, (int)Math.Max(9f, titleH - 2f)) : 15;
+            _titleText.textFormat = titleFmt;
             _titleText.SetXY(padX, titleY);
             _titleText.SetSize(titleW, titleH);
             _titleText.visible = titleW >= 12f && titleH >= 6f;
 
-            // 3-tab bar directly under header — guaranteed strictly inside [padX, panelW - padX] and [0, layout.TabH].
+            string safeHotkey = string.IsNullOrEmpty(hotkey) ? "F10" : hotkey;
+            bool showChip = panelW >= 220f && layout.HeaderH >= 28f;
+            _titleText.text = showChip ? "怪物寻路" : (panelW < 100f ? safeHotkey : ("怪物寻路 [" + safeHotkey + "]"));
+            if (_hotkeyChip != null && !_hotkeyChip.isDisposed)
+            {
+                if (showChip && _titleText.visible)
+                {
+                    float chipX = padX + _titleText.textWidth + 8f;
+                    var chipBg = _hotkeyChip.numChildren >= 1 ? _hotkeyChip.GetChildAt(0) as GGraph : null;
+                    var chipTf = _hotkeyChip.numChildren >= 2 ? _hotkeyChip.GetChildAt(1) as GTextField : null;
+                    if (chipTf != null) chipTf.text = safeHotkey;
+                    float chipW = chipTf != null ? Math.Max(26f, chipTf.textWidth + 12f) : 34f;
+                    if (chipX + chipW <= closeX - 4f)
+                    {
+                        float chipH = 18f;
+                        float chipY = (layout.HeaderH - chipH) * 0.5f;
+                        _hotkeyChip.visible = true;
+                        _hotkeyChip.SetXY(chipX, chipY);
+                        _hotkeyChip.SetSize(chipW, chipH);
+                        if (chipBg != null) DrawRound(chipBg, chipW, chipH, RadiusChip, Track, HairlineStrong);
+                        if (chipTf != null) chipTf.SetSize(chipW, chipH);
+                    }
+                    else
+                    {
+                        _hotkeyChip.visible = false;
+                    }
+                }
+                else
+                {
+                    _hotkeyChip.visible = false;
+                }
+            }
+
+            // 3-tab segmented bar directly under header — strictly inside [padX, panelW - padX] and [0, layout.TabH].
             _tabHost.SetXY(0f, layout.HeaderH);
             _tabHost.SetSize(panelW, layout.TabH);
-            PopupPagination.ComputeThreeTabGeometry(panelW, padX, out float tabW, out float tabGap);
-            float desiredTabH = Math.Min(24f, PopupPagination.ComputeTabStripButtonHeight(layout.TabH));
-            PopupPagination.ClampChildVertical(layout.TabH, (layout.TabH - desiredTabH) * 0.5f, desiredTabH, out float tabBtnY, out float tabBtnH);
+            float tabW;
+            float tabGap;
+            float tabBtnY;
+            float tabBtnH;
+            float tabStartX;
+            if (layout.TabH >= 24f && panelW >= padX * 2f + 16f)
+            {
+                float trackW = Math.Max(12f, panelW - padX * 2f);
+                float trackH = Math.Min(28f, layout.TabH - 6f);
+                float trackY = (layout.TabH - trackH) * 0.5f;
+                _tabTrack.visible = true;
+                _tabTrack.SetXY(padX, trackY);
+                DrawRound(_tabTrack, trackW, trackH, 7f, Track, Hairline);
+                PopupPagination.ComputeThreeTabGeometry(panelW, padX + 2f, out tabW, out tabGap);
+                tabStartX = padX + 2f;
+                tabBtnH = Math.Max(1f, trackH - 4f);
+                tabBtnY = trackY + 2f;
+            }
+            else
+            {
+                _tabTrack.visible = false;
+                PopupPagination.ComputeThreeTabGeometry(panelW, padX, out tabW, out tabGap);
+                float desiredTabH = Math.Min(24f, PopupPagination.ComputeTabStripButtonHeight(layout.TabH));
+                PopupPagination.ClampChildVertical(layout.TabH, (layout.TabH - desiredTabH) * 0.5f, desiredTabH, out tabBtnY, out tabBtnH);
+                tabStartX = padX;
+            }
 
             string monstersLabel = tabW < 42f ? "怪" : (panelW < 210f ? "怪物" : "怪物列表");
             string virtualLabel = tabW < 42f
@@ -357,9 +410,9 @@ namespace MonsterPathPredictor.Runtime
             StyleTabButton(_tabVirtualBtn, virtualLabel, tabW, tabBtnH, _activeTab == PickerPopupTab.VirtualMove, accentViolet: virtualOverrideCount > 0);
             StyleTabButton(_tabStyleBtn, styleLabel, tabW, tabBtnH, _activeTab == PickerPopupTab.RouteStyle, accentViolet: false);
 
-            _tabMonstersBtn.SetXY(padX, tabBtnY);
-            _tabVirtualBtn.SetXY(padX + tabW + tabGap, tabBtnY);
-            _tabStyleBtn.SetXY(padX + (tabW + tabGap) * 2f, tabBtnY);
+            _tabMonstersBtn.SetXY(tabStartX, tabBtnY);
+            _tabVirtualBtn.SetXY(tabStartX + tabW + tabGap, tabBtnY);
+            _tabStyleBtn.SetXY(tabStartX + (tabW + tabGap) * 2f, tabBtnY);
 
             if (layout.PagerH > 0f)
             {
@@ -379,9 +432,16 @@ namespace MonsterPathPredictor.Runtime
             }
 
             _footerHost.SetSize(panelW, layout.FooterH);
-            _footerBg.SetSize(panelW, layout.FooterH);
-            _footerBg.DrawRect(panelW, layout.FooterH, 0, Color.clear, HeaderBg);
-            PopupPagination.ClampChildVertical(layout.FooterH, 1f, Math.Min(24f, Math.Max(1f, layout.FooterH - 2f)), out float fBtnY, out float fBtnH);
+            _footerBg.SetXY(1f, 0f);
+            DrawRound(_footerBg, innerW, Math.Max(1f, layout.FooterH - 1f), 0f, 0f, 9f, 9f, Surface1, Color.clear);
+            _footerLine.SetXY(1f, 0f);
+            _footerLine.SetSize(innerW, 1f);
+            _footerLine.DrawRect(innerW, 1f, 0, Color.clear, Hairline);
+
+            float desiredFBtnH = layout.FooterH >= 32f
+                ? Math.Min(28f, layout.FooterH - 10f)
+                : Math.Min(24f, Math.Max(1f, layout.FooterH - 2f));
+            PopupPagination.ClampChildVertical(layout.FooterH, (layout.FooterH - desiredFBtnH) * 0.5f, desiredFBtnH, out float fBtnY, out float fBtnH);
             PopupPagination.ComputeFooterGeometry(
                 panelW, padX,
                 out float minusX, out float stepBtnW,
@@ -389,24 +449,54 @@ namespace MonsterPathPredictor.Runtime
                 out float plusX,
                 out float clearX, out float clearW);
 
+            float stepsPillW = Math.Max(1f, (plusX + stepBtnW) - minusX);
+            if (stepsPillW >= 8f && fBtnH >= 8f)
+            {
+                _stepsGroupBg.visible = true;
+                _stepsGroupBg.SetXY(minusX, fBtnY);
+                DrawRound(_stepsGroupBg, stepsPillW, fBtnH, RadiusCard, Track, Hairline);
+            }
+            else
+            {
+                _stepsGroupBg.visible = false;
+            }
+
+            int stepSignFont = (stepBtnW < 16f || fBtnH < 14f) ? Math.Max(8, Math.Min(11, (int)Math.Max(8f, fBtnH - 1f))) : 13;
+            var minusSkin = GetSkin(_minusBtn);
+            if (minusSkin != null && minusSkin.Label != null)
+            {
+                var mf = minusSkin.Label.textFormat;
+                mf.size = stepSignFont;
+                minusSkin.Label.textFormat = mf;
+            }
             ResizeMiniButton(_minusBtn, stepBtnW, fBtnH);
             _minusBtn.SetXY(minusX, fBtnY);
+
             PopupPagination.ClampChildVertical(layout.FooterH, (layout.FooterH - 20f) * 0.5f, Math.Min(22f, layout.FooterH), out float sLblY, out float sLblH);
             _stepsLabel.SetXY(stepsX, sLblY);
             _stepsLabel.SetSize(stepsW, sLblH);
             var stepsFmt = _stepsLabel.textFormat;
-            stepsFmt.size = (stepsW < 24f || sLblH < 14f) ? Math.Max(8, Math.Min(10, (int)Math.Max(8f, sLblH - 1f))) : 14;
+            stepsFmt.size = (stepsW < 24f || sLblH < 14f) ? Math.Max(8, Math.Min(10, (int)Math.Max(8f, sLblH - 1f))) : 13;
             _stepsLabel.textFormat = stepsFmt;
+
+            var plusSkin = GetSkin(_plusBtn);
+            if (plusSkin != null && plusSkin.Label != null)
+            {
+                var pf = plusSkin.Label.textFormat;
+                pf.size = stepSignFont;
+                plusSkin.Label.textFormat = pf;
+            }
             ResizeMiniButton(_plusBtn, stepBtnW, fBtnH);
             _plusBtn.SetXY(plusX, fBtnY);
-            ResizeMiniButton(_clearBtn, clearW, fBtnH);
+
             if (_clearBtn != null && !_clearBtn.isDisposed && _clearBtn.numChildren >= 2 && _clearBtn.GetChildAt(1) is GTextField clearTf)
             {
                 clearTf.text = clearW < 26f ? "×" : (clearW < 52f ? "清除" : "清除预览");
                 var cf = clearTf.textFormat;
-                cf.size = (clearW < 26f || fBtnH < 14f) ? Math.Max(8, Math.Min(10, (int)Math.Max(8f, fBtnH - 1f))) : 13;
+                cf.size = (clearW < 26f || fBtnH < 14f) ? Math.Max(8, Math.Min(10, (int)Math.Max(8f, fBtnH - 1f))) : 12;
                 clearTf.textFormat = cf;
             }
+            ResizeMiniButton(_clearBtn, clearW, fBtnH);
             _clearBtn.SetXY(clearX, fBtnY);
         }
 
@@ -550,9 +640,13 @@ namespace MonsterPathPredictor.Runtime
             }
             _panelBg = null;
             _headerBg = null;
+            _headerLine = null;
+            _accentLine = null;
             _titleText = null;
+            _hotkeyChip = null;
             _closeBtn = null;
             _tabHost = null;
+            _tabTrack = null;
             _tabMonstersBtn = null;
             _tabVirtualBtn = null;
             _tabStyleBtn = null;
@@ -563,6 +657,8 @@ namespace MonsterPathPredictor.Runtime
             _pageLabel = null;
             _footerHost = null;
             _footerBg = null;
+            _footerLine = null;
+            _stepsGroupBg = null;
             _minusBtn = null;
             _plusBtn = null;
             _clearBtn = null;

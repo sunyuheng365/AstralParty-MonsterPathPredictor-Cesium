@@ -271,5 +271,24 @@ namespace MonsterPathPredictor.Tests
                 Assert.True(cy >= 0f && cy + ch <= tabH + 0.001f);
             }
         }
+
+        [Fact]
+        public void StyleRowsAddSectionHeadersOnlyWhenTall()
+        {
+            var tallRows = PopupPagination.BuildStyleRows(maxContentH: 400f, contentW: 328f, hasSaveWarn: false, out _);
+            int secLineIdx = tallRows.FindIndex(r => r.Kind == PopupPagination.StyleRowKind.SectionLine);
+            int lineWidthIdx = tallRows.FindIndex(r => r.Kind == PopupPagination.StyleRowKind.LineWidth);
+            int secDispIdx = tallRows.FindIndex(r => r.Kind == PopupPagination.StyleRowKind.SectionDisplay);
+            int firstToggleIdx = tallRows.FindIndex(r => r.Kind == PopupPagination.StyleRowKind.Toggles);
+
+            Assert.True(secLineIdx >= 0);
+            Assert.True(secDispIdx >= 0);
+            Assert.True(secLineIdx < lineWidthIdx);
+            Assert.True(secDispIdx < firstToggleIdx);
+
+            var shortRows = PopupPagination.BuildStyleRows(maxContentH: 200f, contentW: 328f, hasSaveWarn: false, out _);
+            Assert.DoesNotContain(shortRows, r => r.Kind == PopupPagination.StyleRowKind.SectionLine);
+            Assert.DoesNotContain(shortRows, r => r.Kind == PopupPagination.StyleRowKind.SectionDisplay);
+        }
     }
 }

@@ -140,7 +140,8 @@ namespace MonsterPathPredictor.Runtime
                             touchable = false,
                             autoSize = AutoSizeType.None,
                             singleLine = true,
-                            textFormat = new TextFormat { size = 12, color = TextMuted },
+                            verticalAlign = VertAlignType.Middle,
+                            textFormat = new TextFormat { size = 11, color = TextSecondary },
                             text = "虚拟移位不影响实战，点怪物即可看转向变化"
                         };
                         hint.SetXY(2f, y);
@@ -166,24 +167,43 @@ namespace MonsterPathPredictor.Runtime
                     {
                         bool armed = hasLivingSelected && sandbox.BoardPickArmed;
                         long capturedOwnerId = selectedPlayer != null ? selectedPlayer.PlayerId : 0L;
-                        string toggleLabel = contentW < 100f
-                            ? (!hasLivingSelected ? "无活人" : (armed ? "●右选" : "○右选"))
-                            : (!hasLivingSelected
-                                ? "○ 暂无存活角色可右键移位"
-                                : (armed ? "● 右键点击棋盘任意格移位：已开启" : "○ 开启「右键点击棋盘格」快速移位"));
-                        int btnFont = (contentW < 100f || item.Height < 15f) ? Math.Max(8, Math.Min(10, (int)Math.Max(8f, item.Height - 2f))) : 12;
-                        var pickBtn = CreateStyledButton(
-                            toggleLabel,
-                            contentW,
-                            item.Height,
-                            armed ? BtnVioletBg : BtnBg,
-                            armed ? BtnVioletBorder : (hasLivingSelected ? new Color(0.35f, 0.45f, 0.60f, 0.8f) : new Color(0.26f, 0.30f, 0.36f, 0.55f)),
-                            armed ? AccentGold : (hasLivingSelected ? TextPrimary : TextMuted),
-                            () => VirtualBoardPickToggled?.Invoke(capturedOwnerId, !armed, matchGen, layoutGen),
-                            fontSize: btnFont);
-                        pickBtn.touchable = hasLivingSelected;
-                        pickBtn.SetXY(0f, y);
-                        _contentHost.AddChild(pickBtn);
+                        if (contentW >= 180f && item.Height >= 18f)
+                        {
+                            string swLabel = !hasLivingSelected
+                                ? "暂无存活角色可移位"
+                                : (armed ? "右键棋盘任意格移位 · 已开启" : "右键点棋盘格快速移位");
+                            var swRow = BuildSwitchRow(
+                                swLabel,
+                                armed,
+                                hasLivingSelected,
+                                contentW,
+                                item.Height,
+                                () => VirtualBoardPickToggled?.Invoke(capturedOwnerId, !armed, matchGen, layoutGen));
+                            swRow.SetXY(0f, y);
+                            _contentHost.AddChild(swRow);
+                        }
+                        else
+                        {
+                            string toggleLabel = contentW < 100f
+                                ? (!hasLivingSelected ? "无活人" : (armed ? "●右选" : "○右选"))
+                                : (!hasLivingSelected
+                                    ? "○ 暂无存活角色可右键移位"
+                                    : (armed ? "● 右键点击棋盘任意格移位：已开启" : "○ 开启「右键点击棋盘格」快速移位"));
+                            int btnFont = (contentW < 100f || item.Height < 15f) ? Math.Max(8, Math.Min(10, (int)Math.Max(8f, item.Height - 2f))) : 12;
+                            var pickBtn = CreateStyledButton(
+                                toggleLabel,
+                                contentW,
+                                item.Height,
+                                armed ? VioletSoft : BtnBg,
+                                armed ? WithAlpha(Violet, 0.55f) : HairlineStrong,
+                                armed ? Violet : TextPrimary,
+                                () => VirtualBoardPickToggled?.Invoke(capturedOwnerId, !armed, matchGen, layoutGen),
+                                fontSize: btnFont,
+                                radius: RadiusCard);
+                            SetButtonEnabled(pickBtn, hasLivingSelected);
+                            pickBtn.SetXY(0f, y);
+                            _contentHost.AddChild(pickBtn);
+                        }
                         break;
                     }
 
@@ -196,10 +216,11 @@ namespace MonsterPathPredictor.Runtime
                                 touchable = false,
                                 autoSize = AutoSizeType.None,
                                 singleLine = true,
-                                textFormat = new TextFormat { size = item.Height < 14f ? Math.Max(8, (int)item.Height) : 12, bold = true, color = AccentCyan },
+                                verticalAlign = VertAlignType.Middle,
+                                textFormat = new TextFormat { size = item.Height < 14f ? Math.Max(8, (int)item.Height) : 12, bold = true, color = TextSecondary },
                                 text = contentW < 100f
                                     ? (selectedPlayer.SeatTag + "#" + effLand)
-                                    : (selectedPlayer.SeatTag + " 当前格#" + effLand + (neighbors.Count > 0 ? "，点相邻格移动：" : "（无相邻格）"))
+                                    : (selectedPlayer.SeatTag + " 当前格 #" + effLand + (neighbors.Count > 0 ? " · 相邻格" : "（无相邻格）"))
                             };
                             nbTitle.SetXY(2f, y);
                             nbTitle.SetSize(Math.Max(0f, contentW - 4f), item.Height);
@@ -224,16 +245,17 @@ namespace MonsterPathPredictor.Runtime
                                 bool isRealTile = targetTile == selectedPlayer.LandId;
                                 string label = nbW < 54f
                                     ? ((isRealTile ? "回" : "→") + targetTile)
-                                    : (isRealTile ? ("回格#" + targetTile) : ("走→#" + targetTile));
+                                    : (isRealTile ? ("回 #" + targetTile) : ("→ #" + targetTile));
                                 var stepBtn = CreateStyledButton(
                                     label,
                                     nbW,
                                     item.Height,
-                                    isRealTile ? BtnActiveBg : BtnBg,
-                                    isRealTile ? AccentCyan : BtnVioletBorder,
-                                    isRealTile ? AccentCyan : TextPrimary,
+                                    isRealTile ? AccentSoft : new Color(1f, 1f, 1f, 0.04f),
+                                    isRealTile ? WithAlpha(Accent, 0.60f) : WithAlpha(Violet, 0.45f),
+                                    isRealTile ? Accent : TextPrimary,
                                     () => VirtualStepNeighborRequested?.Invoke(capturedPid, effLand, targetTile, matchGen, layoutGen),
-                                    fontSize: nbFont);
+                                    fontSize: nbFont,
+                                    radius: RadiusButton);
                                 stepBtn.SetXY(c * (nbW + nbGap), y);
                                 _contentHost.AddChild(stepBtn);
                             }
@@ -259,18 +281,36 @@ namespace MonsterPathPredictor.Runtime
                             GComponent btn;
                             if (actionIdx == 0)
                             {
-                                btn = CreateStyledButton(aW < 50f ? "撤回" : "撤回一步", aW, item.Height, BtnBg, canUndo ? AccentCyan : new Color(0.28f, 0.34f, 0.42f, 0.6f), canUndo ? TextPrimary : TextMuted, () => VirtualUndoRequested?.Invoke(selId, matchGen, layoutGen), fontSize: aFont);
-                                btn.touchable = canUndo;
+                                btn = CreateGhostButton(
+                                    aW < 50f ? "撤回" : "撤回一步",
+                                    aW, item.Height,
+                                    () => VirtualUndoRequested?.Invoke(selId, matchGen, layoutGen),
+                                    fontSize: aFont,
+                                    textColor: Accent);
+                                SetButtonEnabled(btn, canUndo);
                             }
                             else if (actionIdx == 1)
                             {
-                                btn = CreateStyledButton(aW < 50f ? "重置" : "重置角色", aW, item.Height, BtnBg, selHasState ? AccentGold : new Color(0.28f, 0.34f, 0.42f, 0.6f), selHasState ? AccentGold : TextMuted, () => VirtualResetPlayerRequested?.Invoke(selId, matchGen, layoutGen), fontSize: aFont);
-                                btn.touchable = selHasState;
+                                btn = CreateGhostButton(
+                                    aW < 50f ? "重置" : "重置角色",
+                                    aW, item.Height,
+                                    () => VirtualResetPlayerRequested?.Invoke(selId, matchGen, layoutGen),
+                                    fontSize: aFont,
+                                    textColor: Gold);
+                                SetButtonEnabled(btn, selHasState);
                             }
                             else
                             {
-                                btn = CreateStyledButton(aW < 50f ? "全复" : "全部还原", aW, item.Height, anyState ? BtnVioletBg : BtnBg, anyState ? BtnVioletBorder : new Color(0.28f, 0.34f, 0.42f, 0.6f), anyState ? AccentViolet : TextMuted, () => VirtualResetAllRequested?.Invoke(matchGen, layoutGen), fontSize: aFont);
-                                btn.touchable = anyState;
+                                btn = CreateStyledButton(
+                                    aW < 50f ? "全复" : "全部还原",
+                                    aW, item.Height,
+                                    VioletSoft,
+                                    WithAlpha(Violet, 0.55f),
+                                    Violet,
+                                    () => VirtualResetAllRequested?.Invoke(matchGen, layoutGen),
+                                    fontSize: aFont,
+                                    radius: RadiusButton);
+                                SetButtonEnabled(btn, anyState);
                             }
                             btn.SetXY(c * (aW + aGap), y);
                             _contentHost.AddChild(btn);
@@ -283,6 +323,90 @@ namespace MonsterPathPredictor.Runtime
             }
 
             return Math.Min(maxH, Math.Max(0f, y));
+        }
+
+        private static GComponent BuildSwitchRow(string label, bool on, bool enabled, float w, float h, Action onClick)
+        {
+            var row = new GComponent { touchable = enabled, opaque = true };
+            row.SetSize(w, h);
+            if (!enabled) row.alpha = 0.45f;
+
+            Color fill = on ? VioletSoft : Surface2;
+            Color border = on ? WithAlpha(Violet, 0.50f) : Hairline;
+            Color hoverFill = on ? Lighten(VioletSoft, 0.05f) : Surface2Hover;
+            Color hoverBorder = on ? WithAlpha(Violet, 0.75f) : HairlineStrong;
+
+            var bg = new GGraph { touchable = false };
+            DrawRound(bg, w, h, RadiusCard, fill, border);
+            row.AddChild(bg);
+
+            var lbl = new GTextField
+            {
+                touchable = false,
+                autoSize = AutoSizeType.None,
+                singleLine = true,
+                verticalAlign = VertAlignType.Middle,
+                textFormat = new TextFormat
+                {
+                    size = 12,
+                    bold = on,
+                    color = enabled ? (on ? Violet : TextPrimary) : TextDim
+                },
+                text = label ?? string.Empty
+            };
+            lbl.SetXY(10f, 0f);
+            lbl.SetSize(Math.Max(10f, w - 52f), h);
+            row.AddChild(lbl);
+
+            float trackW = 30f;
+            float trackH = 16f;
+            float trackX = w - 40f;
+            float trackY = (h - trackH) * 0.5f;
+            var track = new GGraph { touchable = false };
+            track.SetXY(trackX, trackY);
+            DrawRound(track, trackW, trackH, 8f, on ? WithAlpha(Violet, 0.90f) : new Color(1f, 1f, 1f, 0.14f), Color.clear);
+            row.AddChild(track);
+
+            var knob = new GGraph { touchable = false };
+            knob.SetXY(trackX + (on ? 16f : 2f), trackY + 2f);
+            DrawCircle(knob, 12f, on ? Color.white : TextSecondary);
+            row.AddChild(knob);
+
+            if (enabled)
+            {
+                row.onRollOver.Add(() => DrawRound(bg, w, h, RadiusCard, hoverFill, hoverBorder));
+                row.onRollOut.Add(() => DrawRound(bg, w, h, RadiusCard, fill, border));
+                row.onClick.Add(() => onClick?.Invoke());
+            }
+            return row;
+        }
+
+        private static void DrawPlayerRowBg(GGraph bg, float w, float h, bool isSelected, bool hasVirt, bool isAlive, bool hovered)
+        {
+            if (bg == null || bg.isDisposed) return;
+            Color fill;
+            Color border;
+            if (isSelected)
+            {
+                fill = hovered ? WithAlpha(Gold, 0.20f) : GoldSoft;
+                border = WithAlpha(Gold, 0.75f);
+            }
+            else if (hasVirt)
+            {
+                fill = hovered ? Surface2Hover : Surface2;
+                border = WithAlpha(Violet, 0.45f);
+            }
+            else if (!isAlive)
+            {
+                fill = RowActedBg;
+                border = Hairline;
+            }
+            else
+            {
+                fill = hovered ? Surface2Hover : Surface2;
+                border = Hairline;
+            }
+            DrawRound(bg, w, h, RadiusCard, fill, border);
         }
 
         private GComponent BuildVirtualPlayerRow(
@@ -300,38 +424,64 @@ namespace MonsterPathPredictor.Runtime
             row.SetSize(rowW, rowH);
 
             var bg = new GGraph { touchable = false };
-            bg.SetSize(rowW, rowH);
-            Color fill = !player.IsAlive ? RowActedBg : (isSelected ? (hasVirt ? BtnVioletBg : RowSelectedBg) : RowNormalBg);
-            Color border = isSelected ? RowSelectedBorder : (hasVirt ? BtnVioletBorder : new Color(0.24f, 0.30f, 0.40f, 0.65f));
-            bg.DrawRect(rowW, rowH, isSelected ? 2 : 1, border, fill);
+            DrawPlayerRowBg(bg, rowW, rowH, isSelected, hasVirt, player.IsAlive, hovered: false);
             row.AddChild(bg);
 
-            PopupPagination.ComputeSplitRowGeometry(rowW, 6f, 0.52f, out float leftX, out float leftW, out float rightX, out float rightW);
-            string selfTag = isLocal ? "(我)" : string.Empty;
-            string pName = string.IsNullOrEmpty(player.Name) ? player.SeatTag : (player.SeatTag + selfTag + " " + player.Name);
-            var nameTf = new GTextField
+            if (rowW >= 200f && rowH >= 22f)
             {
-                touchable = false,
-                autoSize = AutoSizeType.None,
-                singleLine = true,
-                verticalAlign = VertAlignType.Middle,
-                textFormat = new TextFormat
-                {
-                    size = 13,
-                    bold = isSelected || isLocal,
-                    color = !player.IsAlive ? TextMuted : (isSelected ? AccentGold : TextPrimary)
-                },
-                text = (isSelected ? "▶ " : "  ") + pName
-            };
-            nameTf.SetXY(leftX, 0f);
-            nameTf.SetSize(leftW, rowH);
-            row.AddChild(nameTf);
+                float chipW = 26f;
+                float chipH = 18f;
+                float chipY = (rowH - chipH) * 0.5f;
+                Color chipFill = isSelected ? GoldSoft : (hasVirt ? VioletSoft : new Color(1f, 1f, 1f, 0.06f));
+                Color chipTextCol = isSelected ? Gold : (hasVirt ? Violet : TextSecondary);
 
-            if (rightW >= 14f)
-            {
+                var seatBg = new GGraph { touchable = false };
+                seatBg.SetXY(8f, chipY);
+                DrawRound(seatBg, chipW, chipH, RadiusChip, chipFill, Color.clear);
+                row.AddChild(seatBg);
+
+                var seatTf = new GTextField
+                {
+                    touchable = false,
+                    autoSize = AutoSizeType.None,
+                    singleLine = true,
+                    align = AlignType.Center,
+                    verticalAlign = VertAlignType.Middle,
+                    textFormat = new TextFormat { size = 11, bold = true, color = chipTextCol },
+                    text = player.SeatTag ?? string.Empty
+                };
+                seatTf.SetXY(8f, chipY);
+                seatTf.SetSize(chipW, chipH);
+                row.AddChild(seatTf);
+
+                string baseName = string.IsNullOrEmpty(player.Name) ? player.SeatTag : player.Name;
+                string pName = isLocal ? (baseName + " · 我") : baseName;
+                float rightW = Math.Max(64f, rowW * 0.36f);
+                float rightX = rowW - 8f - rightW;
+                float nameX = 42f;
+                float nameW = Math.Max(20f, rightX - nameX - 4f);
+
+                var nameTf = new GTextField
+                {
+                    touchable = false,
+                    autoSize = AutoSizeType.None,
+                    singleLine = true,
+                    verticalAlign = VertAlignType.Middle,
+                    textFormat = new TextFormat
+                    {
+                        size = 13,
+                        bold = isSelected || isLocal,
+                        color = !player.IsAlive ? TextDim : TextPrimary
+                    },
+                    text = pName
+                };
+                nameTf.SetXY(nameX, 0f);
+                nameTf.SetSize(nameW, rowH);
+                row.AddChild(nameTf);
+
                 string posText = !player.IsAlive
                     ? "倒地"
-                    : (hasVirt ? ("格" + player.LandId + " → 虚#" + virtLand) : ("格" + player.LandId));
+                    : (hasVirt ? ("格 " + player.LandId + " → 虚 " + virtLand) : ("格 " + player.LandId));
                 var posTf = new GTextField
                 {
                     touchable = false,
@@ -343,7 +493,7 @@ namespace MonsterPathPredictor.Runtime
                     {
                         size = 12,
                         bold = hasVirt,
-                        color = hasVirt ? AccentViolet : TextMuted
+                        color = !player.IsAlive ? Danger : (hasVirt ? Violet : TextSecondary)
                     },
                     text = posText
                 };
@@ -351,14 +501,62 @@ namespace MonsterPathPredictor.Runtime
                 posTf.SetSize(rightW, rowH);
                 row.AddChild(posTf);
             }
+            else
+            {
+                PopupPagination.ComputeSplitRowGeometry(rowW, 6f, 0.52f, out float leftX, out float leftW, out float rightX, out float rightW);
+                string selfTag = isLocal ? "(我)" : string.Empty;
+                string pName = string.IsNullOrEmpty(player.Name) ? player.SeatTag : (player.SeatTag + selfTag + " " + player.Name);
+                var nameTf = new GTextField
+                {
+                    touchable = false,
+                    autoSize = AutoSizeType.None,
+                    singleLine = true,
+                    verticalAlign = VertAlignType.Middle,
+                    textFormat = new TextFormat
+                    {
+                        size = rowH < 18f ? Math.Max(8, (int)Math.Max(8f, rowH - 2f)) : 12,
+                        bold = isSelected || isLocal,
+                        color = !player.IsAlive ? TextDim : (isSelected ? Gold : TextPrimary)
+                    },
+                    text = (isSelected ? "▶ " : "  ") + pName
+                };
+                nameTf.SetXY(leftX, 0f);
+                nameTf.SetSize(leftW, rowH);
+                row.AddChild(nameTf);
+
+                if (rightW >= 14f)
+                {
+                    string posText = !player.IsAlive
+                        ? "倒地"
+                        : (hasVirt ? ("格" + player.LandId + "→虚#" + virtLand) : ("格" + player.LandId));
+                    var posTf = new GTextField
+                    {
+                        touchable = false,
+                        autoSize = AutoSizeType.None,
+                        singleLine = true,
+                        align = AlignType.Right,
+                        verticalAlign = VertAlignType.Middle,
+                        textFormat = new TextFormat
+                        {
+                            size = rowH < 18f ? Math.Max(8, (int)Math.Max(8f, rowH - 2f)) : 11,
+                            bold = hasVirt,
+                            color = !player.IsAlive ? Danger : (hasVirt ? Violet : TextSecondary)
+                        },
+                        text = posText
+                    };
+                    posTf.SetXY(rightX, 0f);
+                    posTf.SetSize(rightW, rowH);
+                    row.AddChild(posTf);
+                }
+            }
 
             if (player.IsAlive)
             {
                 long capturedId = player.PlayerId;
                 int capturedMatchGen = _currentMatchGen;
                 int capturedLayoutGen = sandbox.LayoutGeneration;
-                row.onRollOver.Add(() => bg.DrawRect(rowW, rowH, isSelected ? 2 : 1, PanelBorder, RowHoverBg));
-                row.onRollOut.Add(() => bg.DrawRect(rowW, rowH, isSelected ? 2 : 1, border, fill));
+                row.onRollOver.Add(() => DrawPlayerRowBg(bg, rowW, rowH, isSelected, hasVirt, player.IsAlive, hovered: true));
+                row.onRollOut.Add(() => DrawPlayerRowBg(bg, rowW, rowH, isSelected, hasVirt, player.IsAlive, hovered: false));
                 row.onClick.Add(() => VirtualPlayerSelected?.Invoke(capturedId, capturedMatchGen, capturedLayoutGen));
             }
             return row;

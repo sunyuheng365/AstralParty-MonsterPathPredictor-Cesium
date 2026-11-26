@@ -20,8 +20,7 @@ namespace MonsterPathPredictor.Runtime
         private static readonly Color VirtualGhostColor = new Color(0.82f, 0.42f, 1.00f, 0.98f);       // Virtual player ghost marker
         private static readonly Color VirtualTetherColor = new Color(0.82f, 0.42f, 1.00f, 0.72f);      // Real -> Virtual dashed tether
         private static readonly Color VirtualInnerDotColor = new Color(0.98f, 0.92f, 1.00f, 0.98f);    // Inner ghost core
-        private static readonly Color BadgeBg = new Color(0.06f, 0.09f, 0.14f, 0.86f);                 // Dark pill
-        private static readonly float[] PillCornerRadii = { 6f, 6f, 6f, 6f };
+        private static readonly Color BadgeBg = new Color(0.05f, 0.07f, 0.10f, 0.84f);                 // Dark pill
 
         private readonly struct RoutePalette
         {
@@ -906,7 +905,9 @@ namespace MonsterPathPredictor.Runtime
 
                 pill.Root.SetSize(w, h);
                 pill.Bg.SetSize(w, h);
-                pill.Bg.DrawRoundRect(w, h, bgColor, PillCornerRadii);
+                float r = Math.Min(6f, Math.Min(h, w) * 0.5f);
+                var pillBorder = new Color(textColor.r, textColor.g, textColor.b, 0.38f * alphaFactor);
+                pill.Bg.shape.DrawRoundRect(1f, pillBorder, bgColor, r, r, r, r);
                 pill.Text.SetXY(
                     (float)Math.Round((w - pill.Text.width) * 0.5f),
                     (float)Math.Round((h - pill.Text.height) * 0.5f));
